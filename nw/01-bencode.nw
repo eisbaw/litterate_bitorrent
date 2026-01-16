@@ -161,6 +161,8 @@ we will add parsing and encoding functions.
 
 <<decode>>
 
+<<encode>>
+
 <<bencode tests>>
 @
 
@@ -1763,9 +1765,459 @@ mod tests {
             panic!("Expected Dict");
         }
     }
+
+    // ========================================
+    // Encoder Tests
+    // ========================================
+
+    #[test]
+    fn encode_positive_integer() {
+        // AC #1: Encodes Integer correctly (42 -> i42e)
+        let result = encode(&BencodeValue::Integer(42));
+        assert_eq!(result, b"i42e");
+    }
+
+    #[test]
+    fn encode_large_positive_integer() {
+        // Large positive integer
+        let result = encode(&BencodeValue::Integer(i64::MAX));
+        assert_eq!(result, b"i9223372036854775807e");
+    }
+
+    #[test]
+    fn encode_negative_integer() {
+        // AC #2: Encodes negative integers
+        let result = encode(&BencodeValue::Integer(-3));
+        assert_eq!(result, b"i-3e");
+    }
+
+    #[test]
+    fn encode_large_negative_integer() {
+        // Large negative integer
+        let result = encode(&BencodeValue::Integer(i64::MIN));
+        assert_eq!(result, b"i-9223372036854775808e");
+    }
+
+    #[test]
+    fn encode_zero() {
+        // AC #2: Encodes zero
+        let result = encode(&BencodeValue::Integer(0));
+        assert_eq!(result, b"i0e");
+    }
+
+    #[test]
+    fn encode_bytes_simple() {
+        // AC #3: Encodes Bytes correctly (vec -> length:bytes)
+        let result = encode(&BencodeValue::Bytes(b"spam".to_vec()));
+        assert_eq!(result, b"4:spam");
+    }
+
+    #[test]
+    fn encode_empty_bytes() {
+        // AC #4: Encodes empty byte strings
+        let result = encode(&BencodeValue::Bytes(vec![]));
+        assert_eq!(result, b"0:");
+    }
+
+    #[test]
+    fn encode_bytes_with_binary_data() {
+        // Byte string with non-UTF8 binary data
+        let result = encode(&BencodeValue::Bytes(vec![0x00, 0xFF, 0x80]));
+        assert_eq!(result, &[b'3', b':', 0x00, 0xFF, 0x80]);
+    }
+
+    #[test]
+    fn encode_bytes_with_colons() {
+        // Byte string containing colons
+        let result = encode(&BencodeValue::Bytes(b"a:b:c".to_vec()));
+        assert_eq!(result, b"5:a:b:c");
+    }
+
+    #[test]
+    fn encode_empty_list() {
+        // AC #5: Encodes List recursively (empty list)
+        let result = encode(&BencodeValue::List(vec![]));
+        assert_eq!(result, b"le");
+    }
+
+    #[test]
+    fn encode_list_single_element() {
+        // List with single element
+        let result = encode(&BencodeValue::List(vec![BencodeValue::Integer(42)]));
+        assert_eq!(result, b"li42ee");
+    }
+
+    #[test]
+    fn encode_list_multiple_elements() {
+        // AC #5: Encodes List recursively (multiple elements)
+        let result = encode(&BencodeValue::List(vec![
+            BencodeValue::Bytes(b"spam".to_vec()),
+            BencodeValue::Integer(42),
+        ]));
+        assert_eq!(result, b"l4:spami42ee");
+    }
+
+    #[test]
+    fn encode_nested_list() {
+        // AC #7: Encodes nested structures correctly
+        let result = encode(&BencodeValue::List(vec![
+            BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+            ]),
+            BencodeValue::List(vec![BencodeValue::Integer(3)]),
+        ]));
+        assert_eq!(result, b"lli1ei2eeli3eee");
+    }
+
+    #[test]
+    fn encode_empty_dict() {
+        // AC #6: Encodes Dict with keys in sorted order (empty dict)
+        let result = encode(&BencodeValue::Dict(std::collections::BTreeMap::new()));
+        assert_eq!(result, b"de");
+    }
+
+    #[test]
+    fn encode_dict_single_entry() {
+        // Dict with single entry
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(b"cow".to_vec(), BencodeValue::Bytes(b"moo".to_vec()));
+        let result = encode(&BencodeValue::Dict(dict));
+        assert_eq!(result, b"d3:cow3:mooe");
+    }
+
+    #[test]
+    fn encode_dict_multiple_entries_sorted() {
+        // AC #6: Dict keys are encoded in sorted byte order
+        // BTreeMap handles this automatically
+        let mut dict = std::collections::BTreeMap::new();
+        // Insert in reverse order to verify sorting
+        dict.insert(b"spam".to_vec(), BencodeValue::Bytes(b"eggs".to_vec()));
+        dict.insert(b"cow".to_vec(), BencodeValue::Bytes(b"moo".to_vec()));
+        let result = encode(&BencodeValue::Dict(dict));
+        // Keys should be sorted: "cow" < "spam"
+        assert_eq!(result, b"d3:cow3:moo4:spam4:eggse");
+    }
+
+    #[test]
+    fn encode_dict_integer_value() {
+        // Dict with integer value
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(b"age".to_vec(), BencodeValue::Integer(25));
+        let result = encode(&BencodeValue::Dict(dict));
+        assert_eq!(result, b"d3:agei25ee");
+    }
+
+    #[test]
+    fn encode_nested_dict() {
+        // AC #7: Encodes nested structures correctly (dict containing dict)
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(b"key".to_vec(), BencodeValue::Bytes(b"value".to_vec()));
+
+        let mut outer = std::collections::BTreeMap::new();
+        outer.insert(b"inner".to_vec(), BencodeValue::Dict(inner));
+
+        let result = encode(&BencodeValue::Dict(outer));
+        assert_eq!(result, b"d5:innerd3:key5:valueee");
+    }
+
+    #[test]
+    fn encode_dict_with_list_value() {
+        // Dict containing a list
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(
+            b"items".to_vec(),
+            BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+                BencodeValue::Integer(3),
+            ]),
+        );
+        let result = encode(&BencodeValue::Dict(dict));
+        assert_eq!(result, b"d5:itemsli1ei2ei3eee");
+    }
+
+    #[test]
+    fn encode_complex_nested_structure() {
+        // AC #7: Complex nested structure (torrent-like)
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        dict.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        dict.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+
+        let result = encode(&BencodeValue::Dict(dict));
+        // Keys sorted: "length" < "name" < "piece length"
+        assert_eq!(
+            result,
+            b"d6:lengthi1024e4:name8:test.txt12:piece lengthi16384ee"
+        );
+    }
+
+    #[test]
+    fn encode_to_appends_to_buffer() {
+        // Test that encode_to appends rather than replaces
+        let mut buf = Vec::new();
+        encode_to(&BencodeValue::Integer(1), &mut buf);
+        encode_to(&BencodeValue::Integer(2), &mut buf);
+        assert_eq!(buf, b"i1ei2e");
+    }
+
+    #[test]
+    fn encode_to_with_existing_content() {
+        // encode_to appends to existing buffer content
+        let mut buf = b"prefix".to_vec();
+        encode_to(&BencodeValue::Bytes(b"data".to_vec()), &mut buf);
+        assert_eq!(buf, b"prefix4:data");
+    }
+
+    #[test]
+    fn roundtrip_integer() {
+        // Verify decode(encode(x)) == x for integers
+        let original = BencodeValue::Integer(42);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_negative_integer() {
+        // Round-trip for negative integer
+        let original = BencodeValue::Integer(-9999);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_bytes() {
+        // Verify decode(encode(x)) == x for bytes
+        let original = BencodeValue::Bytes(b"hello world".to_vec());
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_empty_bytes() {
+        // Round-trip for empty bytes
+        let original = BencodeValue::Bytes(vec![]);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_binary_bytes() {
+        // Round-trip for binary data
+        let original = BencodeValue::Bytes(vec![0x00, 0xFF, 0x80, 0x7F]);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_list() {
+        // Verify decode(encode(x)) == x for lists
+        let original = BencodeValue::List(vec![
+            BencodeValue::Integer(1),
+            BencodeValue::Bytes(b"two".to_vec()),
+            BencodeValue::Integer(3),
+        ]);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_empty_list() {
+        // Round-trip for empty list
+        let original = BencodeValue::List(vec![]);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_dict() {
+        // Verify decode(encode(x)) == x for dicts
+        let mut dict = std::collections::BTreeMap::new();
+        dict.insert(b"key".to_vec(), BencodeValue::Bytes(b"value".to_vec()));
+        dict.insert(b"num".to_vec(), BencodeValue::Integer(42));
+        let original = BencodeValue::Dict(dict);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_empty_dict() {
+        // Round-trip for empty dict
+        let original = BencodeValue::Dict(std::collections::BTreeMap::new());
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn roundtrip_complex_nested() {
+        // Round-trip for complex nested structure
+        let mut inner_dict = std::collections::BTreeMap::new();
+        inner_dict.insert(b"a".to_vec(), BencodeValue::Integer(1));
+        inner_dict.insert(b"b".to_vec(), BencodeValue::Integer(2));
+
+        let mut outer_dict = std::collections::BTreeMap::new();
+        outer_dict.insert(
+            b"list".to_vec(),
+            BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::List(vec![
+                    BencodeValue::Bytes(b"nested".to_vec()),
+                ]),
+            ]),
+        );
+        outer_dict.insert(b"dict".to_vec(), BencodeValue::Dict(inner_dict));
+
+        let original = BencodeValue::Dict(outer_dict);
+        let encoded = encode(&original);
+        let decoded = decode(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
 }
 @
 
 These tests serve as both verification and documentation. Reading through
 them shows exactly what the decoder accepts and rejects, serving as a
 specification complement to the prose description above.
+
+\subsection{Encoding Bencode Values}
+
+Encoding is the inverse of decoding: we traverse a [[BencodeValue]] tree and
+produce a byte sequence following the bencode grammar. Encoding is simpler
+than decoding because we don't need to handle errors---a well-formed
+[[BencodeValue]] always produces valid bencode output.
+
+The encoding rules mirror the grammar:
+
+\begin{description}
+\item[Integers] Write \texttt{i}, the decimal digits, then \texttt{e}.
+\item[Byte strings] Write the length as decimal digits, a colon, then the raw bytes.
+\item[Lists] Write \texttt{l}, encode each element, then write \texttt{e}.
+\item[Dictionaries] Write \texttt{d}, encode each key-value pair (keys are already
+  sorted by [[BTreeMap]]), then write \texttt{e}.
+\end{description}
+
+We provide two functions: [[encode\_to]] writes to an existing buffer for
+efficiency (avoiding allocations when encoding multiple values or when the
+caller wants to control the buffer), and [[encode]] is a convenience wrapper
+that creates a new buffer and returns it.
+
+<<encode>>=
+/// Encodes a `BencodeValue` into the provided buffer.
+///
+/// This is the efficient encoding function that appends to an existing buffer,
+/// avoiding allocation when encoding multiple values or when the caller wants
+/// control over the output buffer.
+///
+/// # Arguments
+///
+/// * `value` - The bencode value to encode
+/// * `out` - The buffer to append the encoded bytes to
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::bencode::{encode_to, BencodeValue};
+///
+/// let mut buf = Vec::new();
+/// encode_to(&BencodeValue::Integer(42), &mut buf);
+/// assert_eq!(buf, b"i42e");
+///
+/// // Append another value
+/// encode_to(&BencodeValue::Bytes(b"spam".to_vec()), &mut buf);
+/// assert_eq!(buf, b"i42e4:spam");
+/// ```
+pub fn encode_to(value: &BencodeValue, out: &mut Vec<u8>) {
+    match value {
+        BencodeValue::Integer(n) => {
+            // Format: i<number>e
+            out.push(b'i');
+            out.extend_from_slice(n.to_string().as_bytes());
+            out.push(b'e');
+        }
+        BencodeValue::Bytes(bytes) => {
+            // Format: <length>:<data>
+            out.extend_from_slice(bytes.len().to_string().as_bytes());
+            out.push(b':');
+            out.extend_from_slice(bytes);
+        }
+        BencodeValue::List(items) => {
+            // Format: l<items>e
+            out.push(b'l');
+            for item in items {
+                encode_to(item, out);
+            }
+            out.push(b'e');
+        }
+        BencodeValue::Dict(entries) => {
+            // Format: d<key><value>...e
+            // BTreeMap iterates in sorted key order, which is exactly what
+            // bencode requires for canonical encoding.
+            out.push(b'd');
+            for (key, val) in entries {
+                // Key is a byte string
+                out.extend_from_slice(key.len().to_string().as_bytes());
+                out.push(b':');
+                out.extend_from_slice(key);
+                // Value can be any type
+                encode_to(val, out);
+            }
+            out.push(b'e');
+        }
+    }
+}
+
+/// Encodes a `BencodeValue` into a new byte vector.
+///
+/// This is a convenience wrapper around [`encode_to`] that allocates a new
+/// buffer and returns it. Use [`encode_to`] directly if you want to control
+/// the buffer or encode multiple values into the same buffer.
+///
+/// # Arguments
+///
+/// * `value` - The bencode value to encode
+///
+/// # Returns
+///
+/// A `Vec<u8>` containing the bencoded representation.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::bencode::{encode, decode, BencodeValue};
+///
+/// // Encode an integer
+/// let encoded = encode(&BencodeValue::Integer(42));
+/// assert_eq!(encoded, b"i42e");
+///
+/// // Round-trip: encode then decode
+/// let original = BencodeValue::Bytes(b"hello".to_vec());
+/// let encoded = encode(&original);
+/// let decoded = decode(&encoded).unwrap();
+/// assert_eq!(decoded, original);
+/// ```
+pub fn encode(value: &BencodeValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode_to(value, &mut out);
+    out
+}
+@
+
+The implementation is straightforward because [[BencodeValue]] already
+represents well-formed data. There's no need for error handling---every
+possible [[BencodeValue]] produces valid bencode output. The recursive
+structure mirrors the decoder: [[encode\_to]] calls itself for nested
+lists and dictionaries.
+
+One important property: because [[BTreeMap]] maintains keys in sorted order,
+dictionary encoding automatically produces canonical output. This is critical
+for computing the info hash, where the exact byte sequence matters.
