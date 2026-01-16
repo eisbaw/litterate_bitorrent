@@ -1,9 +1,10 @@
 ---
 id: task-0074
 title: Verify build pipeline compiles hello-world
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-01-16 21:30'
+updated_date: '2026-01-16 22:57'
 labels:
   - verification
   - phase0
@@ -21,8 +22,8 @@ End-to-end verification that 'just build' successfully compiles the tangled Rust
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Running 'just build' succeeds without errors
-- [ ] #2 Binary is produced at target/debug/literate-bittorrent
-- [ ] #3 Running the binary outputs 'Hello, world\!' or similar
-- [ ] #4 cargo clippy produces no warnings
+- [x] #1 Running 'just build' succeeds without errors
+- [x] #2 Binary is produced at target/debug/literate-bittorrent
+- [x] #3 Running the binary outputs 'Hello, world\!' or similar
+- [x] #4 cargo clippy produces no warnings
 <!-- AC:END -->
