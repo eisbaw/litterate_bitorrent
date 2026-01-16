@@ -105,6 +105,26 @@ fn main() {
 This minimal program serves as a smoke test: if [[notangle]] can extract it
 and [[rustc]] can compile it, our literate programming toolchain is working.
 
+\section{Library Structure}
+
+The BitTorrent client is organized as a library with a thin binary wrapper.
+This allows the core functionality to be tested in isolation and potentially
+reused. The library root re-exports all public modules.
+
+<<lib.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/00-main.nw
+// Regenerate with: just tangle
+
+//! Literate BitTorrent Client
+//!
+//! A pedagogical BitTorrent implementation that prioritizes clarity over
+//! optimization. This library provides all the building blocks for a
+//! functional BitTorrent client.
+
+pub mod bencode;
+@
+
 \section{Next Steps}
 
 The following chapters will be included as they are developed:

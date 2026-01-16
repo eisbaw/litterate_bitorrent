@@ -10,10 +10,12 @@ default:
 # ============================================================================
 
 # Tangle: extract Rust code from noweb source
-# Creates src/ directory and generates src/main.rs from nw/00-main.nw
+# Creates src/ directory and generates all Rust source files from nw/*.nw
 tangle:
     @mkdir -p src
     notangle -Rmain.rs nw/00-main.nw > src/main.rs
+    notangle -Rlib.rs nw/00-main.nw > src/lib.rs
+    notangle -Rbencode.rs nw/01-bencode.nw > src/bencode.rs
 
 # Weave: generate PDF documentation from noweb source
 # Creates doc/ directory and produces doc/literate-bittorrent.pdf

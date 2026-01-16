@@ -1,0 +1,139 @@
+% Bencode: The BitTorrent Encoding Format
+% Chapter 1 of the literate BitTorrent client
+
+\section{Bencode}
+
+Bencode (pronounced ``bee-encode'') is the encoding format used throughout the
+BitTorrent protocol. Every \texttt{.torrent} file is bencoded, tracker responses
+are bencoded, and even some peer protocol extensions use bencode. Understanding
+bencode is therefore our first task.
+
+\subsection{The Bencode Grammar}
+
+Bencode is refreshingly simple. It has exactly four data types:
+
+\begin{description}
+\item[Integers] Encoded as \texttt{i<number>e}. For example, \texttt{i42e}
+  represents 42, and \texttt{i-3e} represents $-3$. Leading zeros are forbidden
+  (except for \texttt{i0e}), and \texttt{i-0e} is invalid.
+
+\item[Byte strings] Encoded as \texttt{<length>:<data>}. The length is a
+  non-negative integer in decimal ASCII, followed by a colon, followed by
+  exactly that many bytes. For example, \texttt{4:spam} represents the bytes
+  ``spam''. Note that byte strings are \emph{not} required to be valid UTF-8.
+
+\item[Lists] Encoded as \texttt{l<items>e}. Items are concatenated with no
+  separator. For example, \texttt{l4:spami42ee} is a list containing the
+  string ``spam'' and the integer 42.
+
+\item[Dictionaries] Encoded as \texttt{d<key><value>...e}. Keys must be byte
+  strings and must appear in sorted order (lexicographic by raw bytes).
+  For example, \texttt{d3:cow3:moo4:spam4:eggse} maps ``cow'' to ``moo''
+  and ``spam'' to ``eggs''.
+\end{description}
+
+The sorted-key requirement for dictionaries is critical: it ensures that
+any two encoders produce identical output for the same logical data. This
+property is essential for computing the info hash, which is a SHA1 hash
+of the bencoded info dictionary.
+
+\subsection{The BencodeValue Type}
+
+We represent bencoded data with a recursive enum. This type mirrors the
+grammar directly---each variant corresponds to one of the four bencode types.
+
+<<bencode types>>=
+/// Represents a bencoded value.
+///
+/// Bencode supports four types: integers, byte strings, lists, and dictionaries.
+/// This enum provides a type-safe representation that can be constructed from
+/// parsing bencoded data or built programmatically for encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BencodeValue {
+    /// A signed 64-bit integer (e.g., `i42e` or `i-3e`)
+    Integer(i64),
+
+    /// A byte string (e.g., `4:spam`)
+    ///
+    /// Note: Byte strings are NOT required to be valid UTF-8. In BitTorrent,
+    /// they often contain binary data such as piece hashes or peer IDs.
+    Bytes(Vec<u8>),
+
+    /// An ordered list of values (e.g., `l4:spami42ee`)
+    List(Vec<BencodeValue>),
+
+    /// A dictionary mapping byte string keys to values (e.g., `d3:cow3:mooe`)
+    ///
+    /// We use `BTreeMap` rather than `HashMap` to maintain sorted key order.
+    /// This is essential for computing canonical encodings, which in turn
+    /// is required for reproducible info hash computation.
+    Dict(std::collections::BTreeMap<Vec<u8>, BencodeValue>),
+}
+@
+
+We use [[BTreeMap]] for dictionaries rather than [[HashMap]] for an important
+reason: the bencode specification requires dictionary keys to be sorted. By
+using a sorted map, we ensure that iteration order matches the required
+encoding order, making encoding straightforward and deterministic.
+
+\subsection{Error Handling}
+
+Parsing bencode can fail in several ways. We define a dedicated error type
+to provide clear feedback about what went wrong and where. Using the
+[[thiserror]] crate gives us ergonomic [[Display]] and [[Error]] implementations.
+
+<<bencode errors>>=
+/// Errors that can occur when parsing bencoded data.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BencodeError {
+    /// The input does not conform to bencode grammar
+    #[error("invalid bencode format: {0}")]
+    InvalidFormat(String),
+
+    /// Unexpected end of input while parsing
+    #[error("unexpected end of input")]
+    UnexpectedEof,
+
+    /// Integer parsing failed (invalid digits, leading zeros, etc.)
+    #[error("invalid integer: {0}")]
+    InvalidInteger(String),
+
+    /// String length prefix is invalid (negative, overflow, etc.)
+    #[error("invalid string length: {0}")]
+    InvalidLength(String),
+}
+@
+
+These error variants cover the main failure modes:
+
+\begin{itemize}
+\item [[InvalidFormat]]: Catch-all for structural problems like missing
+  delimiters or invalid type markers.
+\item [[UnexpectedEof]]: Input ended before a complete value was parsed.
+\item [[InvalidInteger]]: The integer between \texttt{i} and \texttt{e} is
+  malformed (e.g., leading zeros, non-digits).
+\item [[InvalidLength]]: The length prefix of a byte string is invalid.
+\end{itemize}
+
+\subsection{Module Structure}
+
+The bencode module combines the type definitions above. In future sections,
+we will add parsing and encoding functions.
+
+<<bencode.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/01-bencode.nw
+// Regenerate with: just tangle
+
+//! Bencode encoding and decoding.
+//!
+//! Bencode is the serialization format used throughout BitTorrent for
+//! metainfo files (.torrent), tracker responses, and protocol extensions.
+
+<<bencode types>>
+
+<<bencode errors>>
+@
+
+The module is structured to be imported as [[use literate_bittorrent::bencode]],
+exposing [[BencodeValue]] and [[BencodeError]] as the primary public interface.
