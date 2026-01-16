@@ -11,6 +11,11 @@ let
 
   pkgs = import nixpkgs { };
 
+  # Font configuration for LuaLaTeX to find JetBrains Mono
+  fontsConf = pkgs.makeFontsConf {
+    fontDirectories = [ pkgs.jetbrains-mono ];
+  };
+
   # TeX Live with minted support
   texlive = pkgs.texlive.combine {
     inherit (pkgs.texlive)
@@ -76,5 +81,6 @@ in pkgs.mkShell {
   shellHook = ''
     export CARGO_HOME="$PWD/.cargo"
     export PATH="$CARGO_HOME/bin:$PATH"
+    export FONTCONFIG_FILE=${fontsConf}
   '';
 }
