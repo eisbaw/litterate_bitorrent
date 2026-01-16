@@ -1,0 +1,10 @@
+# Generated directories - nw/ is the source of truth
+# These are produced by tangling (src/) and weaving (doc/)
+src/
+doc/
+
+# Cargo build output
+target/
+
+# Keep Cargo.lock for reproducibility
+!Cargo.lock
