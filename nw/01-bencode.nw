@@ -109,6 +109,10 @@ pub enum BencodeError {
     /// Dictionary key is not a byte string
     #[error("dictionary key must be a byte string")]
     InvalidDictKey,
+
+    /// Input contains extra bytes after the decoded value
+    #[error("trailing data: {0} bytes remaining after value")]
+    TrailingData(usize),
 }
 @
 
@@ -123,6 +127,7 @@ These error variants cover the main failure modes:
 \item [[InvalidLength]]: The length prefix of a byte string is invalid.
 \item [[DuplicateKey]]: A dictionary contains the same key twice.
 \item [[InvalidDictKey]]: A dictionary key is not a byte string.
+\item [[TrailingData]]: Extra bytes remain after decoding a complete value.
 \end{itemize}
 
 \subsection{Module Structure}
@@ -153,6 +158,8 @@ we will add parsing and encoding functions.
 <<decode list>>
 
 <<decode dict>>
+
+<<decode>>
 
 <<bencode tests>>
 @
@@ -628,6 +635,62 @@ Note that we explicitly check for non-string keys \emph{before} calling
 ``missing colon in byte string'' (which is what [[decode\_bytes]] would
 report for input like \texttt{di42e3:vale}), we report ``dictionary key
 must be a byte string''.
+
+\subsection{The Public Decode Function}
+
+With all the primitive and compound decoders in place, we can now provide
+the main public API: a [[decode]] function that takes a byte slice and
+returns a [[BencodeValue]]. This function differs from [[decode\_value]]
+in one important way: it ensures that the \emph{entire} input is consumed.
+
+This strictness is important for robustness. If we accepted trailing garbage,
+a torrent file with corrupted or extra bytes at the end would silently
+succeed, potentially masking data corruption. By requiring exact consumption,
+we catch such problems early.
+
+<<decode>>=
+/// Decodes a complete bencoded value from the input.
+///
+/// This is the main entry point for bencode parsing. Unlike [`decode_value`],
+/// which allows partial parsing, this function requires that the entire input
+/// is consumed by exactly one bencoded value.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::bencode::{decode, BencodeValue};
+///
+/// let value = decode(b"i42e").unwrap();
+/// assert_eq!(value, BencodeValue::Integer(42));
+///
+/// // Trailing data causes an error
+/// assert!(decode(b"i42eXXX").is_err());
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The input is empty ([`BencodeError::UnexpectedEof`])
+/// - The first byte doesn't match any bencode type ([`BencodeError::InvalidFormat`])
+/// - The value itself is malformed (various error types)
+/// - There are bytes remaining after the decoded value ([`BencodeError::TrailingData`])
+pub fn decode(input: &[u8]) -> Result<BencodeValue, BencodeError> {
+    let mut pos = 0;
+    let value = decode_value(input, &mut pos)?;
+
+    if pos < input.len() {
+        return Err(BencodeError::TrailingData(input.len() - pos));
+    }
+
+    Ok(value)
+}
+@
+
+The implementation is deliberately minimal: we delegate to [[decode\_value]]
+for the actual parsing, then check if any input remains. This separation of
+concerns keeps the code clean---[[decode\_value]] handles parsing without
+worrying about input boundaries, while [[decode]] enforces the ``exactly one
+value'' contract.
 
 \subsection{Testing Integer Decoding}
 
@@ -1593,6 +1656,112 @@ mod tests {
         expected.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
 
         assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+    }
+
+    // ========================================
+    // Top-level decode() Function Tests
+    // ========================================
+
+    #[test]
+    fn decode_dispatches_to_integer() {
+        // AC #1: decode dispatches correctly for integers (first byte 'i')
+        let result = decode(b"i42e");
+        assert_eq!(result, Ok(BencodeValue::Integer(42)));
+    }
+
+    #[test]
+    fn decode_dispatches_to_bytestring() {
+        // AC #1: decode dispatches correctly for byte strings (first byte 0-9)
+        let result = decode(b"4:spam");
+        assert_eq!(result, Ok(BencodeValue::Bytes(b"spam".to_vec())));
+    }
+
+    #[test]
+    fn decode_dispatches_to_list() {
+        // AC #1: decode dispatches correctly for lists (first byte 'l')
+        let result = decode(b"li1ei2ee");
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+            ]))
+        );
+    }
+
+    #[test]
+    fn decode_dispatches_to_dict() {
+        // AC #1: decode dispatches correctly for dicts (first byte 'd')
+        let result = decode(b"d3:key5:valuee");
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"key".to_vec(), BencodeValue::Bytes(b"value".to_vec()));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+    }
+
+    #[test]
+    fn decode_empty_input_returns_unexpected_eof() {
+        // AC #2: Returns UnexpectedEof for empty input
+        let result = decode(b"");
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn decode_unknown_first_byte_returns_invalid_format() {
+        // AC #3: Returns InvalidFormat for unknown first byte
+        let result = decode(b"xyz");
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        // AC #4: Ensures entire input is consumed (trailing bytes cause error)
+        let result = decode(b"i42eXXX");
+        assert!(matches!(result, Err(BencodeError::TrailingData(3))));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_after_string() {
+        // AC #4: Trailing bytes after byte string
+        let result = decode(b"4:spamextra");
+        assert!(matches!(result, Err(BencodeError::TrailingData(5))));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_after_list() {
+        // AC #4: Trailing bytes after list
+        let result = decode(b"letrailing");
+        assert!(matches!(result, Err(BencodeError::TrailingData(8))));
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_after_dict() {
+        // AC #4: Trailing bytes after dict
+        let result = decode(b"deextra");
+        assert!(matches!(result, Err(BencodeError::TrailingData(5))));
+    }
+
+    #[test]
+    fn decode_accepts_exact_input() {
+        // AC #4: No error when input is exactly consumed
+        assert!(decode(b"i0e").is_ok());
+        assert!(decode(b"0:").is_ok());
+        assert!(decode(b"le").is_ok());
+        assert!(decode(b"de").is_ok());
+    }
+
+    #[test]
+    fn decode_complex_nested_structure() {
+        // AC #6: Verify dispatch works for nested structures
+        // d4:listli1ei2ee4:name4:teste
+        let result = decode(b"d4:listli1ei2ee4:name4:teste");
+        assert!(result.is_ok());
+
+        if let Ok(BencodeValue::Dict(map)) = result {
+            assert!(map.contains_key(b"list".as_ref()));
+            assert!(map.contains_key(b"name".as_ref()));
+        } else {
+            panic!("Expected Dict");
+        }
     }
 }
 @
