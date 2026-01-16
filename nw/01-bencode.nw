@@ -133,7 +133,294 @@ we will add parsing and encoding functions.
 <<bencode types>>
 
 <<bencode errors>>
+
+<<decode integer>>
+
+<<bencode tests>>
 @
 
 The module is structured to be imported as [[use literate_bittorrent::bencode]],
 exposing [[BencodeValue]] and [[BencodeError]] as the primary public interface.
+
+\subsection{Decoding Integers}
+
+Integers are the simplest bencode type to parse, making them an ideal starting
+point for our recursive descent parser. A bencoded integer has the form
+\texttt{i<digits>e}, where the digits form a signed decimal number.
+
+The parsing strategy is straightforward:
+
+\begin{enumerate}
+\item Verify the current byte is \texttt{'i'} (the integer prefix)
+\item Scan forward to find the terminating \texttt{'e'}
+\item Extract the bytes between \texttt{i} and \texttt{e}
+\item Validate the number format (no leading zeros, no negative zero)
+\item Parse the validated string as a 64-bit signed integer
+\item Advance the position past the \texttt{'e'}
+\end{enumerate}
+
+The validation step deserves attention. The bencode specification explicitly
+forbids leading zeros, so \texttt{i03e} is invalid even though it would parse
+as the number 3. The only exception is \texttt{i0e} itself. Similarly,
+negative zero (\texttt{i-0e}) is forbidden---mathematically it equals zero,
+so there's no reason to allow two representations.
+
+<<decode integer>>=
+/// Decodes a bencoded integer starting at the given position.
+///
+/// Expects the input to begin with 'i' at `input[*pos]` and reads until the
+/// terminating 'e'. On success, `*pos` is advanced past the 'e'.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Input doesn't start with 'i'
+/// - No terminating 'e' is found
+/// - The number contains leading zeros (except for "0" itself)
+/// - The number is negative zero ("-0")
+/// - The number cannot be parsed as i64
+pub fn decode_integer(input: &[u8], pos: &mut usize) -> Result<i64, BencodeError> {
+    // Check that we start with 'i'
+    if *pos >= input.len() {
+        return Err(BencodeError::UnexpectedEof);
+    }
+    if input[*pos] != b'i' {
+        return Err(BencodeError::InvalidFormat(format!(
+            "expected 'i' at position {}, found '{}'",
+            *pos, input[*pos] as char
+        )));
+    }
+
+    // Find the terminating 'e'
+    let start = *pos + 1;
+    let end = input[start..]
+        .iter()
+        .position(|&b| b == b'e')
+        .map(|p| start + p)
+        .ok_or(BencodeError::UnexpectedEof)?;
+
+    // Extract the number as a string
+    let num_bytes = &input[start..end];
+    if num_bytes.is_empty() {
+        return Err(BencodeError::InvalidInteger("empty integer".to_string()));
+    }
+
+    let num_str = std::str::from_utf8(num_bytes)
+        .map_err(|_| BencodeError::InvalidInteger("non-ASCII digits".to_string()))?;
+
+    // Validate: reject explicit positive sign (bencode doesn't allow "+42")
+    if num_str.starts_with('+') {
+        return Err(BencodeError::InvalidInteger(format!(
+            "explicit positive sign in '{}'",
+            num_str
+        )));
+    }
+
+    // Validate: reject leading zeros (except for "0" itself)
+    if num_str.len() > 1 && num_str.starts_with('0') {
+        return Err(BencodeError::InvalidInteger(format!(
+            "leading zero in '{}'",
+            num_str
+        )));
+    }
+
+    // Validate: reject "-0"
+    if num_str == "-0" {
+        return Err(BencodeError::InvalidInteger("negative zero".to_string()));
+    }
+
+    // Validate: reject leading zeros after minus sign (e.g., "-03")
+    if num_str.len() > 2 && num_str.starts_with("-0") {
+        return Err(BencodeError::InvalidInteger(format!(
+            "leading zero in '{}'",
+            num_str
+        )));
+    }
+
+    // Parse the integer
+    let value: i64 = num_str
+        .parse()
+        .map_err(|_| BencodeError::InvalidInteger(format!("cannot parse '{}'", num_str)))?;
+
+    // Advance position past the 'e'
+    *pos = end + 1;
+
+    Ok(value)
+}
+@
+
+The function follows a defensive parsing approach: we validate extensively
+before attempting to parse. This ensures we produce clear error messages
+that pinpoint the problem, rather than relying on Rust's integer parsing
+to catch everything.
+
+\subsection{Testing Integer Decoding}
+
+We test each requirement from the bencode specification: valid positive and
+negative integers, zero, and the various invalid forms. Each test verifies
+both the returned value (or error) and that the position is correctly advanced.
+
+<<bencode tests>>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_positive_integer() {
+        let input = b"i42e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(42));
+        assert_eq!(pos, 4); // Position advanced past 'e'
+    }
+
+    #[test]
+    fn decode_large_positive_integer() {
+        let input = b"i9223372036854775807e"; // i64::MAX
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(i64::MAX));
+    }
+
+    #[test]
+    fn decode_negative_integer() {
+        let input = b"i-3e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(-3));
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn decode_large_negative_integer() {
+        let input = b"i-9223372036854775808e"; // i64::MIN
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(i64::MIN));
+    }
+
+    #[test]
+    fn decode_zero() {
+        let input = b"i0e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(0));
+        assert_eq!(pos, 3);
+    }
+
+    #[test]
+    fn reject_leading_zeros() {
+        let input = b"i03e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+        if let Err(BencodeError::InvalidInteger(msg)) = result {
+            assert!(
+                msg.contains("leading zero"),
+                "Error should mention leading zero: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_negative_leading_zeros() {
+        let input = b"i-03e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+    }
+
+    #[test]
+    fn reject_explicit_positive_sign() {
+        let input = b"i+42e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+        if let Err(BencodeError::InvalidInteger(msg)) = result {
+            assert!(
+                msg.contains("positive sign"),
+                "Error should mention positive sign: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_negative_zero() {
+        let input = b"i-0e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+        if let Err(BencodeError::InvalidInteger(msg)) = result {
+            assert!(
+                msg.contains("negative zero"),
+                "Error should mention negative zero: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_missing_i_prefix() {
+        let input = b"42e";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn reject_missing_e_suffix() {
+        let input = b"i42";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_empty_integer() {
+        let input = b"ie";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+    }
+
+    #[test]
+    fn reject_non_numeric_content() {
+        let input = b"iabce";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+    }
+
+    #[test]
+    fn decode_at_nonzero_position() {
+        // Test parsing when pos doesn't start at 0
+        let input = b"XXXi99eYYY";
+        let mut pos = 3;
+        let result = decode_integer(input, &mut pos);
+        assert_eq!(result, Ok(99));
+        assert_eq!(pos, 7); // Points to 'Y'
+    }
+
+    #[test]
+    fn reject_empty_input() {
+        let input = b"";
+        let mut pos = 0;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_position_past_end() {
+        let input = b"i42e";
+        let mut pos = 10;
+        let result = decode_integer(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+}
+@
+
+These tests serve as both verification and documentation. Reading through
+them shows exactly what the decoder accepts and rejects, serving as a
+specification complement to the prose description above.
