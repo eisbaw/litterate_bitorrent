@@ -1,0 +1,36 @@
+[package]
+name = "literate-bittorrent"
+version = "0.1.0"
+edition = "2021"
+description = "A literate BitTorrent client implementation"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
+
+# HTTP client for tracker communication
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# SHA1 hashing for info hash and piece verification
+sha1 = "0.10"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Efficient byte buffer manipulation
+bytes = "1"
+
+# Bit vector for piece/block tracking
+bitvec = "1"
+
+# Ergonomic error types
+thiserror = "2"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Property-based testing
+proptest = "1"
