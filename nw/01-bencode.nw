@@ -138,6 +138,10 @@ we will add parsing and encoding functions.
 
 <<decode bytes>>
 
+<<decode value>>
+
+<<decode list>>
+
 <<bencode tests>>
 @
 
@@ -372,6 +376,134 @@ The function validates strictly: we reject negative lengths (which would
 require a minus sign, failing the digit-only check), leading zeros, and
 lengths that exceed available input. The [[checked\_add]] call protects
 against arithmetic overflow when computing the end position.
+
+\subsection{The Value Dispatcher}
+
+With primitives in place (integers and byte strings), we now need a way to
+decode arbitrary bencode values. The [[decode\_value]] function examines the
+first byte to determine the type and dispatches to the appropriate decoder.
+
+This is the central parsing function that makes recursive structures possible.
+Lists and dictionaries will call [[decode\_value]] for each element, which in
+turn may call back into list or dictionary decoders for nested structures.
+
+<<decode value>>=
+/// Decodes any bencoded value starting at the given position.
+///
+/// Examines the first byte to determine the value type:
+/// - 'i' -> integer
+/// - 'l' -> list
+/// - 'd' -> dictionary
+/// - '0'-'9' -> byte string
+///
+/// On success, `*pos` is advanced past the decoded value.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Input is empty or position is past end
+/// - First byte doesn't match any bencode type marker
+/// - The underlying decoder returns an error
+pub fn decode_value(input: &[u8], pos: &mut usize) -> Result<BencodeValue, BencodeError> {
+    if *pos >= input.len() {
+        return Err(BencodeError::UnexpectedEof);
+    }
+
+    match input[*pos] {
+        b'i' => decode_integer(input, pos).map(BencodeValue::Integer),
+        b'l' => decode_list(input, pos),
+        b'd' => Err(BencodeError::InvalidFormat(
+            "dictionary decoding not yet implemented".to_string(),
+        )),
+        b'0'..=b'9' => decode_bytes(input, pos).map(BencodeValue::Bytes),
+        other => Err(BencodeError::InvalidFormat(format!(
+            "unexpected byte '{}' (0x{:02x}) at position {}",
+            other as char, other, *pos
+        ))),
+    }
+}
+@
+
+The dispatcher is deliberately simple. Each case delegates to a specialized
+decoder that handles the details. The dictionary case is a placeholder that
+returns an error---we'll implement it in the next task.
+
+\subsection{Decoding Lists}
+
+Lists are the first compound type we implement. A bencoded list has the form
+\texttt{l<elements>e}, where elements are any bencode values concatenated
+without separators. For example, \texttt{li42e4:spame} is a list containing
+the integer 42 and the string ``spam''.
+
+The parsing algorithm is straightforward:
+
+\begin{enumerate}
+\item Verify the current byte is \texttt{'l'} (the list marker)
+\item Advance past the \texttt{'l'}
+\item Loop: while the current byte is not \texttt{'e'}, decode a value
+\item Advance past the terminating \texttt{'e'}
+\item Return the collected values
+\end{enumerate}
+
+The recursive call to [[decode\_value]] for each element is what enables
+nested structures. A list can contain other lists, integers, byte strings,
+or dictionaries (once implemented), to arbitrary depth.
+
+<<decode list>>=
+/// Decodes a bencoded list starting at the given position.
+///
+/// Expects the input to begin with 'l' at `input[*pos]` and reads elements
+/// until the terminating 'e'. On success, `*pos` is advanced past the 'e'.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Input doesn't start with 'l'
+/// - No terminating 'e' is found
+/// - Any element fails to decode
+pub fn decode_list(input: &[u8], pos: &mut usize) -> Result<BencodeValue, BencodeError> {
+    // Check that we start with 'l'
+    if *pos >= input.len() {
+        return Err(BencodeError::UnexpectedEof);
+    }
+    if input[*pos] != b'l' {
+        return Err(BencodeError::InvalidFormat(format!(
+            "expected 'l' at position {}, found '{}'",
+            *pos, input[*pos] as char
+        )));
+    }
+
+    // Advance past the 'l'
+    *pos += 1;
+
+    // Collect elements until we hit 'e'
+    let mut elements = Vec::new();
+    loop {
+        // Check for end of input
+        if *pos >= input.len() {
+            return Err(BencodeError::UnexpectedEof);
+        }
+
+        // Check for list terminator
+        if input[*pos] == b'e' {
+            *pos += 1; // Advance past 'e'
+            return Ok(BencodeValue::List(elements));
+        }
+
+        // Decode the next element
+        let element = decode_value(input, pos)?;
+        elements.push(element);
+    }
+}
+@
+
+The loop structure naturally handles empty lists: if the byte immediately
+after \texttt{'l'} is \texttt{'e'}, we return an empty vector without
+entering the element-decoding logic.
+
+Error handling is automatic: if [[decode\_value]] fails for any element, its
+error propagates up via the \texttt{?} operator. This means malformed nested
+structures produce appropriate error messages.
 
 \subsection{Testing Integer Decoding}
 
@@ -724,6 +856,294 @@ mod tests {
         let result = decode_bytes(&input, &mut pos);
         assert_eq!(result, Ok(content.to_vec()));
         assert_eq!(pos, input.len());
+    }
+
+    // ========================================
+    // List Decoding Tests
+    // ========================================
+
+    #[test]
+    fn decode_empty_list() {
+        // AC #1: Decodes empty list (le -> [])
+        let input = b"le";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(result, Ok(BencodeValue::List(vec![])));
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn decode_list_single_integer() {
+        // AC #2: Decodes list with single element (li42ee -> [Integer(42)])
+        let input = b"li42ee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![BencodeValue::Integer(42)]))
+        );
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn decode_list_single_bytes() {
+        // List with single byte string
+        let input = b"l4:spame";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![BencodeValue::Bytes(
+                b"spam".to_vec()
+            )]))
+        );
+        assert_eq!(pos, 8);
+    }
+
+    #[test]
+    fn decode_list_multiple_elements() {
+        // AC #3: Decodes list with multiple elements of different types
+        // l4:spami42ee -> [Bytes("spam"), Integer(42)]
+        let input = b"l4:spami42ee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Bytes(b"spam".to_vec()),
+                BencodeValue::Integer(42),
+            ]))
+        );
+        assert_eq!(pos, 12);
+    }
+
+    #[test]
+    fn decode_list_multiple_integers() {
+        // List with multiple integers
+        // li1ei2ei3ee -> [Integer(1), Integer(2), Integer(3)]
+        let input = b"li1ei2ei3ee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+                BencodeValue::Integer(3),
+            ]))
+        );
+        assert_eq!(pos, 11);
+    }
+
+    #[test]
+    fn decode_nested_list() {
+        // AC #4: Decodes nested lists
+        // lli1ei2eeli3eee -> [[Integer(1), Integer(2)], [Integer(3)]]
+        let input = b"lli1ei2eeli3eee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::List(vec![
+                    BencodeValue::Integer(1),
+                    BencodeValue::Integer(2),
+                ]),
+                BencodeValue::List(vec![BencodeValue::Integer(3)]),
+            ]))
+        );
+        assert_eq!(pos, 15);
+    }
+
+    #[test]
+    fn decode_deeply_nested_list() {
+        // Deeply nested: lllleee -> [[[[]]]]
+        let input = b"lllleeee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![BencodeValue::List(vec![
+                BencodeValue::List(vec![BencodeValue::List(vec![])])
+            ])]))
+        );
+        assert_eq!(pos, 8);
+    }
+
+    #[test]
+    fn decode_list_mixed_nested() {
+        // Mixed nested: li1el4:spamee -> [Integer(1), [Bytes("spam")]]
+        let input = b"li1el4:spamee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::List(vec![BencodeValue::Bytes(b"spam".to_vec())]),
+            ]))
+        );
+        assert_eq!(pos, 13);
+    }
+
+    #[test]
+    fn reject_unclosed_list() {
+        // AC #5: Returns error for unclosed list (missing e)
+        let input = b"li42e";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_unclosed_empty_list() {
+        // Missing 'e' for empty list
+        let input = b"l";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_invalid_element_in_list() {
+        // AC #6: Returns error for invalid element within list
+        // 'x' is not a valid bencode type marker
+        let input = b"lxe";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn reject_malformed_integer_in_list() {
+        // Invalid integer (leading zero) inside list
+        let input = b"li03ee";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidInteger(_))));
+    }
+
+    #[test]
+    fn reject_truncated_element_in_list() {
+        // Byte string that runs past end of input
+        let input = b"l10:shorte";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+    }
+
+    #[test]
+    fn reject_missing_l_prefix() {
+        // Input doesn't start with 'l'
+        let input = b"i42e";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn decode_list_at_nonzero_position() {
+        // Test parsing when pos doesn't start at 0
+        // Input: "XXXli1eli2eeeYYY" -> list containing [Integer(1), [Integer(2)]]
+        // Breakdown: l(i1e)(li2ee)e = list with int 1 and nested list [2]
+        // "li1eli2eee" is 10 characters, so final pos = 3 + 10 = 13
+        let input = b"XXXli1eli2eeeYYY";
+        let mut pos = 3;
+        let result = decode_list(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::List(vec![BencodeValue::Integer(2)]),
+            ]))
+        );
+        assert_eq!(pos, 13);
+    }
+
+    #[test]
+    fn reject_list_empty_input() {
+        let input = b"";
+        let mut pos = 0;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_list_position_past_end() {
+        let input = b"le";
+        let mut pos = 10;
+        let result = decode_list(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    // ========================================
+    // decode_value Dispatcher Tests
+    // ========================================
+
+    #[test]
+    fn decode_value_integer() {
+        let input = b"i42e";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert_eq!(result, Ok(BencodeValue::Integer(42)));
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn decode_value_bytes() {
+        let input = b"4:spam";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert_eq!(result, Ok(BencodeValue::Bytes(b"spam".to_vec())));
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn decode_value_list() {
+        let input = b"li1ei2ee";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+            ]))
+        );
+        assert_eq!(pos, 8);
+    }
+
+    #[test]
+    fn decode_value_dict_placeholder() {
+        // Dictionary decoding not yet implemented, should return error
+        let input = b"de";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+        if let Err(BencodeError::InvalidFormat(msg)) = result {
+            assert!(
+                msg.contains("dictionary") || msg.contains("not yet"),
+                "Error should mention dictionary not implemented: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn decode_value_unknown_type() {
+        // 'x' is not a valid bencode type marker
+        let input = b"xyz";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn decode_value_empty_input() {
+        let input = b"";
+        let mut pos = 0;
+        let result = decode_value(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
     }
 }
 @
