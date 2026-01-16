@@ -3,12 +3,13 @@
 %
 % Build commands:
 %   noweave -delay -index nw/00-main.nw > doc/literate-bittorrent.tex
-%   lualatex doc/literate-bittorrent.tex
+%   xelatex -shell-escape doc/literate-bittorrent.tex
 %   notangle -Rmain.rs nw/00-main.nw > src/main.rs
 
 \documentclass[11pt,a4paper]{article}
 
-% LuaLaTeX with fontspec for modern font handling
+% XeLaTeX with fontspec for modern font handling
+% (XeLaTeX preferred over LuaLaTeX for noweb.sty compatibility)
 \usepackage{fontspec}
 \setmainfont{Latin Modern Roman}
 \setmonofont{JetBrains Mono}[Scale=0.85]

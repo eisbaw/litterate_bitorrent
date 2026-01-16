@@ -11,9 +11,9 @@ let
 
   pkgs = import nixpkgs { };
 
-  # Font configuration for LuaLaTeX to find JetBrains Mono
+  # Font configuration for XeLaTeX/LuaLaTeX to find fonts
   fontsConf = pkgs.makeFontsConf {
-    fontDirectories = [ pkgs.jetbrains-mono ];
+    fontDirectories = [ pkgs.jetbrains-mono pkgs.lmodern ];
   };
 
   # TeX Live with minted support
@@ -63,6 +63,7 @@ in pkgs.mkShell {
 
     # Fonts for PDF generation
     pkgs.jetbrains-mono
+    pkgs.lmodern
 
     # Pygments for minted code highlighting
     pkgs.python3Packages.pygments
@@ -82,5 +83,9 @@ in pkgs.mkShell {
     export CARGO_HOME="$PWD/.cargo"
     export PATH="$CARGO_HOME/bin:$PATH"
     export FONTCONFIG_FILE=${fontsConf}
+    # OSFONTDIR for luaotfload to find system fonts (multiple paths separated by colon)
+    export OSFONTDIR="${pkgs.jetbrains-mono}/share/fonts:${pkgs.lmodern}/share/fonts"
+    # noweb.sty is in the tex output of the noweb package
+    export TEXINPUTS="${pkgs.noweb.tex}/tex/latex/noweb:$TEXINPUTS"
   '';
 }
