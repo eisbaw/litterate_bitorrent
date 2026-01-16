@@ -3,10 +3,10 @@
 
 let
   # Pin nixpkgs to a specific commit for reproducibility
-  # Using nixos-24.11 branch (stable as of 2025)
+  # Using nixos-unstable branch (January 2025) for Rust 1.83+
   nixpkgs = fetchTarball {
-    url = "https://github.com/NixOS/nixpkgs/archive/d3c42f187194c26d9f0309a8ecc469d6c878ce33.tar.gz";
-    sha256 = "0bmnxsn9r4qfslg4mahsl9y9719ykifbazpxxn1fqf47zbbanxkh";
+    url = "https://github.com/NixOS/nixpkgs/archive/a9e2a5b6c8996c1863bacf03b91de9b2e6b90914.tar.gz";
+    sha256 = "0022f3d7bmxjx7sjc69fp8wx380m1bz6f081yhf8hg8iszhgh631";
   };
 
   pkgs = import nixpkgs { };
