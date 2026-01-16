@@ -1,0 +1,11 @@
+# Expected values for ubuntu.torrent test fixture
+# Source: https://releases.ubuntu.com/24.04/ubuntu-24.04.3-live-server-amd64.iso.torrent
+# Downloaded: 2026-01-17
+#
+# These values can be used to verify torrent parsing implementation
+
+INFO_HASH=a1dfefec1a9dd7fa8a041ebeeea271db55126d2f
+PIECE_COUNT=12602
+TOTAL_LENGTH=3303444480
+PIECE_LENGTH=262144
+NAME=ubuntu-24.04.3-live-server-amd64.iso
