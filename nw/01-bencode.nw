@@ -101,6 +101,14 @@ pub enum BencodeError {
     /// String length prefix is invalid (negative, overflow, etc.)
     #[error("invalid string length: {0}")]
     InvalidLength(String),
+
+    /// Dictionary has a duplicate key
+    #[error("duplicate key in dictionary: {0:?}")]
+    DuplicateKey(Vec<u8>),
+
+    /// Dictionary key is not a byte string
+    #[error("dictionary key must be a byte string")]
+    InvalidDictKey,
 }
 @
 
@@ -113,6 +121,8 @@ These error variants cover the main failure modes:
 \item [[InvalidInteger]]: The integer between \texttt{i} and \texttt{e} is
   malformed (e.g., leading zeros, non-digits).
 \item [[InvalidLength]]: The length prefix of a byte string is invalid.
+\item [[DuplicateKey]]: A dictionary contains the same key twice.
+\item [[InvalidDictKey]]: A dictionary key is not a byte string.
 \end{itemize}
 
 \subsection{Module Structure}
@@ -141,6 +151,8 @@ we will add parsing and encoding functions.
 <<decode value>>
 
 <<decode list>>
+
+<<decode dict>>
 
 <<bencode tests>>
 @
@@ -412,9 +424,7 @@ pub fn decode_value(input: &[u8], pos: &mut usize) -> Result<BencodeValue, Benco
     match input[*pos] {
         b'i' => decode_integer(input, pos).map(BencodeValue::Integer),
         b'l' => decode_list(input, pos),
-        b'd' => Err(BencodeError::InvalidFormat(
-            "dictionary decoding not yet implemented".to_string(),
-        )),
+        b'd' => decode_dict(input, pos),
         b'0'..=b'9' => decode_bytes(input, pos).map(BencodeValue::Bytes),
         other => Err(BencodeError::InvalidFormat(format!(
             "unexpected byte '{}' (0x{:02x}) at position {}",
@@ -425,8 +435,7 @@ pub fn decode_value(input: &[u8], pos: &mut usize) -> Result<BencodeValue, Benco
 @
 
 The dispatcher is deliberately simple. Each case delegates to a specialized
-decoder that handles the details. The dictionary case is a placeholder that
-returns an error---we'll implement it in the next task.
+decoder that handles the details.
 
 \subsection{Decoding Lists}
 
@@ -504,6 +513,121 @@ entering the element-decoding logic.
 Error handling is automatic: if [[decode\_value]] fails for any element, its
 error propagates up via the \texttt{?} operator. This means malformed nested
 structures produce appropriate error messages.
+
+\subsection{Decoding Dictionaries}
+
+Dictionaries are the final bencode type, and arguably the most important for
+BitTorrent. A bencoded dictionary has the form \texttt{d<key><value>...e},
+where each key is a byte string followed by any bencode value. Keys must appear
+in sorted lexicographic order (by raw bytes), and the same key cannot appear
+twice.
+
+The sorted-key requirement exists for a critical reason: it ensures that any
+two encoders produce byte-for-byte identical output for the same logical data.
+This property is essential for computing the \emph{info hash}---a SHA1 digest
+of the bencoded info dictionary. If different encoders could produce different
+byte sequences for the same dictionary, peers couldn't agree on the info hash,
+and the torrent would be unusable.
+
+We use [[BTreeMap]] to store dictionary entries because it maintains keys in
+sorted order, making future encoding straightforward. When we iterate over the
+map to encode it, the keys will already be in the correct order.
+
+The parsing algorithm:
+
+\begin{enumerate}
+\item Verify the current byte is \texttt{'d'} (the dict marker)
+\item Advance past the \texttt{'d'}
+\item Loop: while the current byte is not \texttt{'e'}:
+  \begin{enumerate}
+  \item Decode a value (which must be a byte string for the key)
+  \item Verify the key hasn't been seen before (no duplicates)
+  \item Decode another value (the associated value, can be any type)
+  \item Insert the key-value pair into the map
+  \end{enumerate}
+\item Advance past the terminating \texttt{'e'}
+\item Return the populated map
+\end{enumerate}
+
+We don't enforce key ordering during parsing---[[BTreeMap]] will sort them
+regardless. Some implementations reject out-of-order keys, but we take the
+lenient approach of accepting them. However, we do reject duplicate keys,
+which is unambiguously an error.
+
+<<decode dict>>=
+/// Decodes a bencoded dictionary starting at the given position.
+///
+/// Expects the input to begin with 'd' at `input[*pos]` and reads key-value
+/// pairs until the terminating 'e'. Keys must be byte strings.
+/// On success, `*pos` is advanced past the 'e'.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Input doesn't start with 'd'
+/// - No terminating 'e' is found
+/// - Any key is not a byte string
+/// - Any key appears more than once (duplicate keys)
+/// - Any key or value fails to decode
+pub fn decode_dict(input: &[u8], pos: &mut usize) -> Result<BencodeValue, BencodeError> {
+    use std::collections::BTreeMap;
+
+    // Check that we start with 'd'
+    if *pos >= input.len() {
+        return Err(BencodeError::UnexpectedEof);
+    }
+    if input[*pos] != b'd' {
+        return Err(BencodeError::InvalidFormat(format!(
+            "expected 'd' at position {}, found '{}'",
+            *pos, input[*pos] as char
+        )));
+    }
+
+    // Advance past the 'd'
+    *pos += 1;
+
+    // Collect key-value pairs until we hit 'e'
+    let mut entries: BTreeMap<Vec<u8>, BencodeValue> = BTreeMap::new();
+    loop {
+        // Check for end of input
+        if *pos >= input.len() {
+            return Err(BencodeError::UnexpectedEof);
+        }
+
+        // Check for dict terminator
+        if input[*pos] == b'e' {
+            *pos += 1; // Advance past 'e'
+            return Ok(BencodeValue::Dict(entries));
+        }
+
+        // The key must be a byte string (starts with digit)
+        // We check the first byte to provide a better error message
+        if !input[*pos].is_ascii_digit() {
+            return Err(BencodeError::InvalidDictKey);
+        }
+
+        // Decode the key (must be a byte string)
+        let key = decode_bytes(input, pos)?;
+
+        // Check for duplicate keys
+        if entries.contains_key(&key) {
+            return Err(BencodeError::DuplicateKey(key));
+        }
+
+        // Decode the value (can be any bencode type)
+        let value = decode_value(input, pos)?;
+
+        // Insert into the map
+        entries.insert(key, value);
+    }
+}
+@
+
+Note that we explicitly check for non-string keys \emph{before} calling
+[[decode\_bytes]]. This gives us a cleaner error message: instead of
+``missing colon in byte string'' (which is what [[decode\_bytes]] would
+report for input like \texttt{di42e3:vale}), we report ``dictionary key
+must be a byte string''.
 
 \subsection{Testing Integer Decoding}
 
@@ -1114,19 +1238,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_value_dict_placeholder() {
-        // Dictionary decoding not yet implemented, should return error
-        let input = b"de";
+    fn decode_value_dict() {
+        // Dispatcher routes 'd' to decode_dict
+        let input = b"d3:key5:valuee";
         let mut pos = 0;
         let result = decode_value(input, &mut pos);
-        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
-        if let Err(BencodeError::InvalidFormat(msg)) = result {
-            assert!(
-                msg.contains("dictionary") || msg.contains("not yet"),
-                "Error should mention dictionary not implemented: {}",
-                msg
-            );
-        }
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"key".to_vec(), BencodeValue::Bytes(b"value".to_vec()));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+        assert_eq!(pos, 14);
     }
 
     #[test]
@@ -1144,6 +1264,335 @@ mod tests {
         let mut pos = 0;
         let result = decode_value(input, &mut pos);
         assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    // ========================================
+    // Dictionary Decoding Tests
+    // ========================================
+
+    #[test]
+    fn decode_empty_dict() {
+        // AC #1: Decodes empty dict (de -> {})
+        let input = b"de";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert_eq!(
+            result,
+            Ok(BencodeValue::Dict(std::collections::BTreeMap::new()))
+        );
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn decode_dict_single_entry() {
+        // AC #2: Decodes dict with single key-value pair
+        // d3:cow3:mooe -> {"cow": "moo"}
+        let input = b"d3:cow3:mooe";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"cow".to_vec(), BencodeValue::Bytes(b"moo".to_vec()));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+        assert_eq!(pos, 12);
+    }
+
+    #[test]
+    fn decode_dict_integer_value() {
+        // Dict with integer value
+        // d3:agei25ee -> {"age": 25}
+        let input = b"d3:agei25ee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"age".to_vec(), BencodeValue::Integer(25));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+        assert_eq!(pos, 11);
+    }
+
+    #[test]
+    fn decode_dict_multiple_entries() {
+        // AC #3: Decodes dict with multiple entries
+        // d3:cow3:moo4:spam4:eggse -> {"cow": "moo", "spam": "eggs"}
+        let input = b"d3:cow3:moo4:spam4:eggse";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"cow".to_vec(), BencodeValue::Bytes(b"moo".to_vec()));
+        expected.insert(b"spam".to_vec(), BencodeValue::Bytes(b"eggs".to_vec()));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+        assert_eq!(pos, 24);
+    }
+
+    #[test]
+    fn decode_dict_mixed_value_types() {
+        // Dict with mixed value types: string, integer, list
+        // d4:name4:test3:numi42e4:listli1ei2eee
+        let input = b"d4:listli1ei2ee4:name4:test3:numi42ee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(
+            b"list".to_vec(),
+            BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+            ]),
+        );
+        expected.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        expected.insert(b"num".to_vec(), BencodeValue::Integer(42));
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+    }
+
+    #[test]
+    fn decode_nested_dict() {
+        // AC #4: Decodes nested dicts (dict containing dict)
+        // d5:innerd3:key5:valueee -> {"inner": {"key": "value"}}
+        let input = b"d5:innerd3:key5:valueee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        let mut inner = std::collections::BTreeMap::new();
+        inner.insert(b"key".to_vec(), BencodeValue::Bytes(b"value".to_vec()));
+
+        let mut outer = std::collections::BTreeMap::new();
+        outer.insert(b"inner".to_vec(), BencodeValue::Dict(inner));
+
+        assert_eq!(result, Ok(BencodeValue::Dict(outer)));
+        assert_eq!(pos, 23);
+    }
+
+    #[test]
+    fn decode_deeply_nested_dict() {
+        // Deeply nested: d1:ad1:bd1:c1:deee -> {"a": {"b": {"c": "d"}}}
+        let input = b"d1:ad1:bd1:c1:deee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        let mut level3 = std::collections::BTreeMap::new();
+        level3.insert(b"c".to_vec(), BencodeValue::Bytes(b"d".to_vec()));
+
+        let mut level2 = std::collections::BTreeMap::new();
+        level2.insert(b"b".to_vec(), BencodeValue::Dict(level3));
+
+        let mut level1 = std::collections::BTreeMap::new();
+        level1.insert(b"a".to_vec(), BencodeValue::Dict(level2));
+
+        assert_eq!(result, Ok(BencodeValue::Dict(level1)));
+        assert_eq!(pos, 18);
+    }
+
+    #[test]
+    fn reject_non_string_key_integer() {
+        // AC #5: Rejects non-string keys with clear error
+        // di42e3:vale -> key is integer, not string
+        let input = b"di42e3:vale";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidDictKey)));
+    }
+
+    #[test]
+    fn reject_non_string_key_list() {
+        // Key is a list, not a string
+        // dle3:vale -> key is empty list
+        let input = b"dle3:vale";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidDictKey)));
+    }
+
+    #[test]
+    fn reject_non_string_key_dict() {
+        // Key is a dict, not a string
+        // dde3:vale -> key is empty dict
+        let input = b"dde3:vale";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidDictKey)));
+    }
+
+    #[test]
+    fn decode_dict_byte_ordering() {
+        // AC #6: Handles keys with different sorting than ASCII order
+        // Keys with raw bytes that sort differently than ASCII strings might
+        // BTreeMap uses lexicographic byte comparison, which is what bencode requires
+        // Input keys out of order, but BTreeMap will sort them
+        let input = b"d1:b1:21:a1:1e";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"a".to_vec(), BencodeValue::Bytes(b"1".to_vec()));
+        expected.insert(b"b".to_vec(), BencodeValue::Bytes(b"2".to_vec()));
+
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+
+        // Verify iteration order is sorted (a before b)
+        if let Ok(BencodeValue::Dict(map)) = result {
+            let keys: Vec<_> = map.keys().collect();
+            assert_eq!(keys, vec![&b"a".to_vec(), &b"b".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn decode_dict_binary_keys() {
+        // Keys with non-ASCII bytes (raw binary)
+        // These sort by raw byte value, not UTF-8 interpretation
+        let input: &[u8] = &[
+            b'd',
+            b'1', b':', 0xFF, // key: [0xFF]
+            b'1', b':', b'1', // value: "1"
+            b'1', b':', 0x00, // key: [0x00]
+            b'1', b':', b'2', // value: "2"
+            b'e',
+        ];
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        // BTreeMap will sort: 0x00 < 0xFF
+        if let Ok(BencodeValue::Dict(map)) = &result {
+            let keys: Vec<_> = map.keys().collect();
+            assert_eq!(keys[0], &vec![0x00u8]);
+            assert_eq!(keys[1], &vec![0xFFu8]);
+        } else {
+            panic!("Expected Dict, got {:?}", result);
+        }
+    }
+
+    #[test]
+    fn reject_unclosed_dict() {
+        // AC #7: Returns error for unclosed dict
+        let input = b"d3:key5:value";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_unclosed_empty_dict() {
+        // Missing 'e' for empty dict
+        let input = b"d";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_duplicate_keys() {
+        // AC #8: Returns error for duplicate keys
+        // d3:key5:val013:key5:val02e -> key "key" appears twice
+        let input = b"d3:key5:val013:key5:val02e";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::DuplicateKey(_))));
+        if let Err(BencodeError::DuplicateKey(key)) = result {
+            assert_eq!(key, b"key".to_vec());
+        }
+    }
+
+    #[test]
+    fn reject_missing_value() {
+        // Key without a value
+        let input = b"d3:keye";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        // Should fail because 'e' is not a valid value start
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn reject_invalid_value_in_dict() {
+        // Invalid value (unknown type marker)
+        let input = b"d3:keyxe";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn reject_malformed_key() {
+        // Key with invalid length prefix
+        let input = b"d03:key5:valuee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        // Leading zero in length should fail
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+    }
+
+    #[test]
+    fn reject_missing_d_prefix() {
+        // Input doesn't start with 'd'
+        let input = b"3:key5:valuee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn decode_dict_at_nonzero_position() {
+        // Test parsing when pos doesn't start at 0
+        let input = b"XXXd1:a1:bee";
+        let mut pos = 3;
+        let result = decode_dict(input, &mut pos);
+
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"a".to_vec(), BencodeValue::Bytes(b"b".to_vec()));
+
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+        assert_eq!(pos, 11);
+    }
+
+    #[test]
+    fn reject_dict_empty_input() {
+        let input = b"";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_dict_position_past_end() {
+        let input = b"de";
+        let mut pos = 10;
+        let result = decode_dict(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn decode_dict_list_in_value() {
+        // Dict containing a list value
+        // d5:itemsli1ei2ei3eee -> {"items": [1, 2, 3]}
+        let input = b"d5:itemsli1ei2ei3eee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(
+            b"items".to_vec(),
+            BencodeValue::List(vec![
+                BencodeValue::Integer(1),
+                BencodeValue::Integer(2),
+                BencodeValue::Integer(3),
+            ]),
+        );
+
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
+    }
+
+    #[test]
+    fn decode_torrent_like_dict() {
+        // A dict structure similar to a torrent file's info dict
+        // d6:lengthi1024e4:name8:test.txt12:piece lengthi16384ee
+        let input = b"d6:lengthi1024e4:name8:test.txt12:piece lengthi16384ee";
+        let mut pos = 0;
+        let result = decode_dict(input, &mut pos);
+
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        expected.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        expected.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+
+        assert_eq!(result, Ok(BencodeValue::Dict(expected)));
     }
 }
 @
