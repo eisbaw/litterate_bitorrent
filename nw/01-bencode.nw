@@ -136,6 +136,8 @@ we will add parsing and encoding functions.
 
 <<decode integer>>
 
+<<decode bytes>>
+
 <<bencode tests>>
 @
 
@@ -253,6 +255,123 @@ The function follows a defensive parsing approach: we validate extensively
 before attempting to parse. This ensures we produce clear error messages
 that pinpoint the problem, rather than relying on Rust's integer parsing
 to catch everything.
+
+\subsection{Decoding Byte Strings}
+
+Byte strings are the second fundamental bencode type. Unlike integers which are
+delimited by \texttt{i} and \texttt{e}, byte strings use a length prefix:
+\texttt{<length>:<content>}. The length is a sequence of decimal ASCII digits,
+followed by a colon, followed by exactly that many raw bytes.
+
+This length-prefixed format is elegant for binary data because we don't need
+escape sequences---the length tells us exactly how many bytes to consume,
+regardless of what those bytes contain. This is essential for BitTorrent,
+where byte strings often contain SHA1 hashes (20 bytes of arbitrary binary data)
+or peer IDs.
+
+The parsing strategy mirrors our integer decoder:
+
+\begin{enumerate}
+\item Scan for the colon separator
+\item Extract and validate the length prefix (must be non-negative decimal digits)
+\item Verify sufficient bytes remain after the colon
+\item Copy exactly that many bytes
+\item Advance the position past the content
+\end{enumerate}
+
+One subtlety: the length prefix must not have leading zeros (except for ``0''
+itself), matching the integer format's strictness. While the official bencode
+specification is somewhat ambiguous on this point, we follow the stricter
+interpretation to ensure canonical encoding.
+
+<<decode bytes>>=
+/// Decodes a bencoded byte string starting at the given position.
+///
+/// Expects the input to begin with decimal digits at `input[*pos]` representing
+/// the length, followed by ':', followed by exactly that many bytes.
+/// On success, `*pos` is advanced past the last byte of the string.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Input is empty or position is past end
+/// - No colon separator is found
+/// - The length prefix is empty, contains non-digits, or has leading zeros
+/// - The length exceeds available input after the colon
+/// - The length cannot be parsed as usize (overflow)
+pub fn decode_bytes(input: &[u8], pos: &mut usize) -> Result<Vec<u8>, BencodeError> {
+    // Check we have input
+    if *pos >= input.len() {
+        return Err(BencodeError::UnexpectedEof);
+    }
+
+    // Find the colon separator
+    let colon_pos = input[*pos..]
+        .iter()
+        .position(|&b| b == b':')
+        .map(|p| *pos + p)
+        .ok_or_else(|| BencodeError::InvalidFormat("missing colon in byte string".to_string()))?;
+
+    // Extract the length prefix
+    let len_bytes = &input[*pos..colon_pos];
+    if len_bytes.is_empty() {
+        return Err(BencodeError::InvalidLength("empty length prefix".to_string()));
+    }
+
+    // Validate: all characters must be ASCII digits
+    for &b in len_bytes {
+        if !b.is_ascii_digit() {
+            return Err(BencodeError::InvalidLength(format!(
+                "non-digit character '{}' in length prefix",
+                b as char
+            )));
+        }
+    }
+
+    // Convert to string for parsing
+    let len_str = std::str::from_utf8(len_bytes)
+        .map_err(|_| BencodeError::InvalidLength("non-ASCII length prefix".to_string()))?;
+
+    // Validate: reject leading zeros (except for "0" itself)
+    if len_str.len() > 1 && len_str.starts_with('0') {
+        return Err(BencodeError::InvalidLength(format!(
+            "leading zero in length '{}'",
+            len_str
+        )));
+    }
+
+    // Parse the length
+    let len: usize = len_str
+        .parse()
+        .map_err(|_| BencodeError::InvalidLength(format!("cannot parse length '{}'", len_str)))?;
+
+    // Check we have enough bytes after the colon
+    let content_start = colon_pos + 1;
+    let content_end = content_start.checked_add(len)
+        .ok_or_else(|| BencodeError::InvalidLength("length overflow".to_string()))?;
+
+    if content_end > input.len() {
+        return Err(BencodeError::InvalidLength(format!(
+            "length {} exceeds available input (only {} bytes after colon)",
+            len,
+            input.len() - content_start
+        )));
+    }
+
+    // Extract the bytes
+    let bytes = input[content_start..content_end].to_vec();
+
+    // Advance position past the content
+    *pos = content_end;
+
+    Ok(bytes)
+}
+@
+
+The function validates strictly: we reject negative lengths (which would
+require a minus sign, failing the digit-only check), leading zeros, and
+lengths that exceed available input. The [[checked\_add]] call protects
+against arithmetic overflow when computing the end position.
 
 \subsection{Testing Integer Decoding}
 
@@ -417,6 +536,194 @@ mod tests {
         let mut pos = 10;
         let result = decode_integer(input, &mut pos);
         assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    // ========================================
+    // Byte String Decoding Tests
+    // ========================================
+
+    #[test]
+    fn decode_simple_byte_string() {
+        // AC #1: Decodes simple byte strings (4:spam -> [115, 112, 97, 109])
+        let input = b"4:spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(vec![115, 112, 97, 109])); // s, p, a, m
+        assert_eq!(pos, 6); // Position advanced past content
+    }
+
+    #[test]
+    fn decode_empty_byte_string() {
+        // AC #2: Decodes empty byte strings (0: -> [])
+        let input = b"0:";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(vec![]));
+        assert_eq!(pos, 2);
+    }
+
+    #[test]
+    fn decode_binary_data() {
+        // AC #3: Handles binary data (non-UTF8 bytes)
+        // This includes bytes that are not valid UTF-8
+        let input: &[u8] = &[b'5', b':', 0x00, 0xFF, 0x80, 0xFE, 0x01];
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(vec![0x00, 0xFF, 0x80, 0xFE, 0x01]));
+        assert_eq!(pos, 7);
+    }
+
+    #[test]
+    fn decode_byte_string_with_colon_in_content() {
+        // Byte strings can contain any bytes, including colons
+        let input = b"5:a:b:c";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(b"a:b:c".to_vec()));
+        assert_eq!(pos, 7);
+    }
+
+    #[test]
+    fn decode_byte_string_with_digits_in_content() {
+        // Content can contain digits that look like length prefixes
+        let input = b"4:1234";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(b"1234".to_vec()));
+        assert_eq!(pos, 6);
+    }
+
+    #[test]
+    fn reject_length_exceeds_input() {
+        // AC #4: Returns error for length exceeding available input
+        let input = b"10:short";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+        if let Err(BencodeError::InvalidLength(msg)) = result {
+            assert!(
+                msg.contains("exceeds"),
+                "Error should mention length exceeds input: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_negative_length() {
+        // AC #5: Returns error for negative length prefix
+        // Negative numbers start with '-', which is not a digit
+        let input = b"-4:spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+        if let Err(BencodeError::InvalidLength(msg)) = result {
+            assert!(
+                msg.contains("non-digit"),
+                "Error should mention non-digit character: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_non_numeric_length() {
+        // AC #5: Returns error for non-numeric length prefix
+        let input = b"abc:spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+    }
+
+    #[test]
+    fn reject_missing_colon() {
+        // AC #6: Returns error for missing colon separator
+        let input = b"4spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidFormat(_))));
+        if let Err(BencodeError::InvalidFormat(msg)) = result {
+            assert!(
+                msg.contains("colon"),
+                "Error should mention missing colon: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_empty_length_prefix() {
+        // No length before colon
+        let input = b":spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+        if let Err(BencodeError::InvalidLength(msg)) = result {
+            assert!(
+                msg.contains("empty"),
+                "Error should mention empty length: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn reject_leading_zeros_in_length() {
+        // Leading zeros are forbidden (except for "0" itself)
+        let input = b"04:spam";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::InvalidLength(_))));
+        if let Err(BencodeError::InvalidLength(msg)) = result {
+            assert!(
+                msg.contains("leading zero"),
+                "Error should mention leading zero: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn decode_bytes_at_nonzero_position() {
+        // Test parsing when pos doesn't start at 0
+        // Input: "XXX4:testYYY" with indices 0-11
+        // Starting at pos=3 ('4'), we parse "4:test" (6 bytes)
+        // Final pos should be 3 + 6 = 9 (pointing to first 'Y')
+        let input = b"XXX4:testYYY";
+        let mut pos = 3;
+        let result = decode_bytes(input, &mut pos);
+        assert_eq!(result, Ok(b"test".to_vec()));
+        assert_eq!(pos, 9);
+    }
+
+    #[test]
+    fn reject_bytes_empty_input() {
+        let input = b"";
+        let mut pos = 0;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn reject_bytes_position_past_end() {
+        let input = b"4:spam";
+        let mut pos = 10;
+        let result = decode_bytes(input, &mut pos);
+        assert!(matches!(result, Err(BencodeError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn decode_long_byte_string() {
+        // Test a longer string to ensure we handle multi-digit lengths
+        let content = b"hello world, this is a longer string!";
+        let len = content.len();
+        let mut input = format!("{}:", len).into_bytes();
+        input.extend_from_slice(content);
+
+        let mut pos = 0;
+        let result = decode_bytes(&input, &mut pos);
+        assert_eq!(result, Ok(content.to_vec()));
+        assert_eq!(pos, input.len());
     }
 }
 @
