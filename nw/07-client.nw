@@ -83,6 +83,255 @@ pub fn generate_peer_id() -> [u8; 20] {
 Using alphanumeric characters in the random portion ensures the peer ID is
 printable, which aids debugging when examining protocol traces.
 
+\subsection{Request Queue Backpressure}
+
+When downloading from a peer, BitTorrent clients pipeline multiple block
+requests to maximize throughput. Without pipelining, each request would incur
+a full round-trip latency before the next could be sent. With pipelining, the
+network stays saturated as responses flow back continuously.
+
+However, unbounded pipelining creates problems:
+
+\begin{enumerate}
+\item \textbf{Memory pressure}: Each outstanding request consumes memory both
+  locally (tracking state) and on the peer (queued response data).
+
+\item \textbf{Peer overwhelm}: Peers may throttle or disconnect clients that
+  send too many requests too fast.
+
+\item \textbf{Timeout complexity}: Too many outstanding requests makes timeout
+  detection and retry logic more complex.
+
+\item \textbf{Fairness}: A peer that accepts unlimited requests may starve
+  other peers waiting for upload bandwidth.
+\end{enumerate}
+
+The solution is a \emph{bounded request queue} per peer. By limiting the queue
+to a fixed size (typically 10--16 requests), we achieve good pipelining while
+providing natural backpressure. When the queue is full, the scheduler must
+wait for responses before sending more requests to that peer.
+
+The [[PeerRequestQueue]] struct implements this bounded queue. Each request
+is wrapped in [[TimestampedRequest]] to record when it was sent, enabling
+timeout detection. The queue operates in FIFO order for fairness.
+
+<<peer request queue>>=
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use crate::pieces::BlockRequest;
+
+/// Default maximum pending requests per peer.
+///
+/// Typically 10-16 for good pipelining without overwhelming peers.
+/// This value represents a balance between throughput (more requests
+/// keep the pipe full) and resource usage (each request consumes memory
+/// and peer attention).
+///
+/// The BitTorrent Economics Paper suggests 10 requests as a reasonable
+/// default. Some clients use up to 16 for high-latency connections.
+pub const DEFAULT_MAX_REQUESTS_PER_PEER: usize = 16;
+
+/// A request with timestamp for timeout detection.
+///
+/// Wraps a [`BlockRequest`] with the instant it was sent. This enables:
+/// - Timeout detection by comparing `sent_at` to current time
+/// - Latency measurement for peer performance tracking
+/// - FIFO ordering verification in debugging
+#[derive(Debug, Clone)]
+pub struct TimestampedRequest {
+    /// The underlying block request.
+    pub request: BlockRequest,
+    /// When this request was added to the queue.
+    pub sent_at: Instant,
+}
+
+/// Bounded queue of in-flight block requests for a single peer.
+///
+/// Provides backpressure by rejecting requests when at capacity.
+/// Tracks request timestamps for timeout detection.
+///
+/// # Design
+///
+/// The queue uses [`VecDeque`] for O(1) push/pop at both ends. While
+/// `remove` is O(n), this operation is only needed when a block response
+/// arrives out of order, which is relatively rare. The typical flow is:
+/// FIFO---push requests at the back, receive responses for front requests.
+///
+/// # Backpressure
+///
+/// When `is_full()` returns true, the caller should stop requesting from
+/// this peer until space becomes available. This creates natural flow
+/// control: fast peers drain their queues quickly and receive more work,
+/// while slow peers remain at capacity.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::{PeerRequestQueue, DEFAULT_MAX_REQUESTS_PER_PEER};
+/// use literate_bittorrent::pieces::BlockRequest;
+///
+/// let mut queue = PeerRequestQueue::new(2);
+/// let peer_id = *b"-LB0001-test12345678";
+///
+/// // Add requests until full
+/// assert!(queue.push(BlockRequest::new(0, 0, 16384, peer_id)));
+/// assert!(queue.push(BlockRequest::new(0, 16384, 16384, peer_id)));
+/// assert!(queue.is_full());
+///
+/// // Further pushes are rejected
+/// assert!(!queue.push(BlockRequest::new(1, 0, 16384, peer_id)));
+///
+/// // Remove a request to make room
+/// let removed = queue.remove(0, 0);
+/// assert!(removed.is_some());
+/// assert!(!queue.is_full());
+/// ```
+#[derive(Debug)]
+pub struct PeerRequestQueue {
+    /// Pending requests in FIFO order.
+    requests: VecDeque<TimestampedRequest>,
+    /// Maximum queue size.
+    max_size: usize,
+}
+
+impl PeerRequestQueue {
+    /// Creates a new queue with the specified maximum size.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_size` - Maximum number of concurrent requests to allow
+    ///
+    /// # Panics
+    ///
+    /// Does not panic, but a `max_size` of 0 means all pushes will fail.
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            requests: VecDeque::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Creates a new queue with default max size (16 requests).
+    ///
+    /// This is the recommended constructor for most use cases.
+    pub fn with_default_size() -> Self {
+        Self::new(DEFAULT_MAX_REQUESTS_PER_PEER)
+    }
+
+    /// Adds a request to the queue if not full.
+    ///
+    /// Returns `true` if the request was added, `false` if the queue
+    /// is at capacity and the request was rejected.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The block request to enqueue
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerRequestQueue;
+    /// use literate_bittorrent::pieces::BlockRequest;
+    ///
+    /// let mut queue = PeerRequestQueue::new(1);
+    /// let peer_id = *b"-LB0001-test12345678";
+    ///
+    /// assert!(queue.push(BlockRequest::new(0, 0, 16384, peer_id)));
+    /// assert!(!queue.push(BlockRequest::new(0, 16384, 16384, peer_id))); // rejected
+    /// ```
+    pub fn push(&mut self, request: BlockRequest) -> bool {
+        if self.requests.len() >= self.max_size {
+            return false;
+        }
+        self.requests.push_back(TimestampedRequest {
+            request,
+            sent_at: Instant::now(),
+        });
+        true
+    }
+
+    /// Removes a request matching the given piece_index and offset.
+    ///
+    /// Returns the request if found, `None` otherwise. This is used when
+    /// a block response arrives and we need to remove the corresponding
+    /// request from the queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index to match
+    /// * `offset` - The byte offset within the piece to match
+    ///
+    /// # Performance
+    ///
+    /// This is O(n) in the queue length. For the typical queue size of
+    /// 10-16, this is negligible. If responses arrive in FIFO order,
+    /// the matching request is at the front and removal is O(1).
+    pub fn remove(&mut self, piece_index: u32, offset: u32) -> Option<TimestampedRequest> {
+        let pos = self.requests.iter().position(|r| {
+            r.request.piece_index == piece_index && r.request.offset == offset
+        })?;
+        self.requests.remove(pos)
+    }
+
+    /// Returns true if the queue is at capacity.
+    ///
+    /// When this returns `true`, further `push` calls will return `false`.
+    /// The caller should wait for responses or timeouts before sending
+    /// more requests to this peer.
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.requests.len() >= self.max_size
+    }
+
+    /// Returns the number of pending requests.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.requests.len()
+    }
+
+    /// Returns true if the queue is empty.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    /// Returns an iterator over pending requests (for timeout checking).
+    ///
+    /// The iterator yields requests in FIFO order. This is useful for
+    /// checking timeouts: older requests appear first, so timeout
+    /// checking can stop early once a non-timed-out request is found.
+    pub fn iter(&self) -> impl Iterator<Item = &TimestampedRequest> {
+        self.requests.iter()
+    }
+
+    /// Returns requests that have been pending longer than the given duration.
+    ///
+    /// This collects all timed-out requests into a vector. The caller
+    /// can then decide what to do: cancel and re-request from another
+    /// peer, mark the peer as slow, or disconnect entirely.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Duration after which a request is considered timed out
+    pub fn timed_out(&self, timeout: Duration) -> Vec<TimestampedRequest> {
+        self.requests
+            .iter()
+            .filter(|r| r.sent_at.elapsed() > timeout)
+            .cloned()
+            .collect()
+    }
+
+    /// Clears all pending requests, returning them.
+    ///
+    /// This is used when a peer chokes us---all outstanding requests
+    /// are effectively cancelled and should be re-queued for other peers.
+    pub fn drain(&mut self) -> impl Iterator<Item = TimestampedRequest> + '_ {
+        self.requests.drain(..)
+    }
+}
+@
+
 \subsection{Client State}
 
 The [[Client]] struct holds all state for a single torrent download. In the
@@ -91,12 +340,11 @@ one per torrent.
 
 <<client struct>>=
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::net::SocketAddr;
 
 use crate::metainfo::Metainfo;
-use crate::pieces::{PieceManager, BlockRequest};
+use crate::pieces::PieceManager;
 
 /// Central orchestration point for a BitTorrent download.
 ///
@@ -1569,6 +1817,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<peer id generation>>
 
+<<peer request queue>>
+
 <<shutdown controller>>
 
 <<signal handler setup>>
@@ -1598,6 +1848,8 @@ The client module exports the [[Client]] struct and associated types.
 <<framed message reading tests>>
 
 <<framed message writing tests>>
+
+<<peer request queue tests>>
 @
 
 \subsection{Testing}
@@ -3094,7 +3346,6 @@ The shutdown announce has special requirements compared to regular announces:
 \end{enumerate}
 
 <<shutdown announce>>=
-use std::time::Duration;
 use tracing::{debug, info, warn};
 use crate::tracker::{TrackerRequest, TrackerEvent, build_announce_url, TrackerError};
 
@@ -5520,8 +5771,6 @@ a zero-length message (four zero bytes). If no messages have been sent for
 active.
 
 <<framed message writing>>=
-use std::time::Instant;
-
 /// Keep-alive interval in seconds. Connection is considered idle after this.
 ///
 /// Per BEP 3, peers should send keep-alives every two minutes to prevent
@@ -5684,6 +5933,135 @@ mod framed_message_writing_tests {
             // This verifies the function exists and is in scope
             send_keep_alive_if_needed;
         }
+    }
+}
+@
+
+\subsection{Peer Request Queue Tests}
+
+The [[PeerRequestQueue]] must correctly enforce its capacity limit and maintain
+FIFO ordering. These tests verify the core operations.
+
+<<peer request queue tests>>=
+#[cfg(test)]
+mod peer_request_queue_tests {
+    use super::*;
+    use crate::pieces::BlockRequest;
+
+    fn make_request(piece_index: u32, offset: u32) -> BlockRequest {
+        let peer_id = *b"-LB0001-test12345678";
+        BlockRequest::new(piece_index, offset, 16384, peer_id)
+    }
+
+    #[test]
+    fn peer_request_queue_rejects_when_full() {
+        let mut queue = PeerRequestQueue::new(2);
+        assert!(queue.push(make_request(0, 0)));
+        assert!(queue.push(make_request(0, 16384)));
+        assert!(!queue.push(make_request(1, 0))); // rejected
+        assert!(queue.is_full());
+    }
+
+    #[test]
+    fn peer_request_queue_remove_finds_matching() {
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+        queue.push(make_request(1, 0));
+
+        let removed = queue.remove(1, 0);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().request.piece_index, 1);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn peer_request_queue_remove_returns_none_for_missing() {
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+
+        let removed = queue.remove(99, 0);
+        assert!(removed.is_none());
+        assert_eq!(queue.len(), 1); // queue unchanged
+    }
+
+    #[test]
+    fn peer_request_queue_maintains_fifo() {
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+        queue.push(make_request(1, 0));
+        queue.push(make_request(2, 0));
+
+        let reqs: Vec<_> = queue.iter().map(|r| r.request.piece_index).collect();
+        assert_eq!(reqs, vec![0, 1, 2]); // FIFO order
+    }
+
+    #[test]
+    fn peer_request_queue_default_size() {
+        let queue = PeerRequestQueue::with_default_size();
+        assert!(!queue.is_full()); // not full when empty
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn peer_request_queue_default_constant_is_16() {
+        assert_eq!(DEFAULT_MAX_REQUESTS_PER_PEER, 16);
+    }
+
+    #[test]
+    fn peer_request_queue_drain_clears_and_returns_all() {
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+        queue.push(make_request(1, 0));
+        queue.push(make_request(2, 0));
+
+        let drained: Vec<_> = queue.drain().collect();
+        assert_eq!(drained.len(), 3);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn peer_request_queue_remove_makes_room_for_new_request() {
+        let mut queue = PeerRequestQueue::new(2);
+        queue.push(make_request(0, 0));
+        queue.push(make_request(0, 16384));
+        assert!(queue.is_full());
+
+        // Remove one
+        queue.remove(0, 0);
+        assert!(!queue.is_full());
+
+        // Now we can push again
+        assert!(queue.push(make_request(1, 0)));
+        assert!(queue.is_full());
+    }
+
+    #[test]
+    fn timestamped_request_records_time() {
+        let mut queue = PeerRequestQueue::new(10);
+        let before = std::time::Instant::now();
+        queue.push(make_request(0, 0));
+        let after = std::time::Instant::now();
+
+        let req = queue.iter().next().unwrap();
+        assert!(req.sent_at >= before);
+        assert!(req.sent_at <= after);
+    }
+
+    #[test]
+    fn peer_request_queue_timed_out_returns_old_requests() {
+        use std::time::Duration;
+
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+
+        // With 0 duration timeout, everything is timed out
+        let timed_out = queue.timed_out(Duration::from_secs(0));
+        assert_eq!(timed_out.len(), 1);
+
+        // With very long timeout, nothing is timed out
+        let timed_out = queue.timed_out(Duration::from_secs(3600));
+        assert_eq!(timed_out.len(), 0);
     }
 }
 @
