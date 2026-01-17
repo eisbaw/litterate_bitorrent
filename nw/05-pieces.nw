@@ -143,6 +143,294 @@ pub enum PieceError {
 }
 @
 
+\subsection{Piece State Machine}
+
+Each piece in a torrent download progresses through a state machine that tracks
+its download status. Understanding these states and their transitions is
+fundamental to correct piece management.
+
+A piece begins in the [[Missing]] state, indicating we have not yet received
+any blocks for it. Once the first block arrives, the piece transitions to
+[[InProgress]]. The [[InProgress]] state carries a [[BitVec]] that tracks which
+blocks have been received---this enables two important behaviors:
+
+\begin{enumerate}
+\item \textbf{Resumption}: If a peer disconnects mid-piece, we can resume
+  downloading from another peer without re-requesting blocks we already have.
+\item \textbf{Duplicate detection}: If two peers send the same block (due to
+  overlapping requests or reconnection scenarios), we can detect and ignore
+  the duplicate.
+\end{enumerate}
+
+When all blocks have been received, we compute the SHA1 hash and compare it
+against the expected hash from the metainfo. If the hashes match, the piece
+transitions to [[Verified]]---it has been written to disk and is complete.
+If the hashes do not match, the piece transitions to [[Failed]].
+
+The [[Failed]] state is deliberately distinct from [[Missing]]. While a failed
+piece will be re-downloaded, we may want to track which pieces have failed
+verification (and from which peers) to detect malicious or buggy peers. A piece
+in [[Failed]] state can transition back to [[InProgress]] when we retry the
+download.
+
+\begin{verbatim}
+                                 +----------+
+                                 |  Missing |
+                                 +----+-----+
+                                      |
+                             first block received
+                                      |
+                                      v
+                               +------+------+
+                          +--->| InProgress  |<---+
+                          |    +------+------+    |
+                          |           |           |
+                       retry     all blocks      retry
+                          |      received         |
+                          |           |           |
+                          |           v           |
+                          |     hash check        |
+                          |      /      \         |
+                          |    ok        fail     |
+                          |    /            \     |
+                          |   v              v    |
+                       +--+---+          +---+--+ |
+                       |Verified|        |Failed+-+
+                       +-------+         +------+
+\end{verbatim}
+
+<<piece state>>=
+use bitvec::prelude::*;
+
+/// The download state of a single piece.
+///
+/// This enum models the state machine for piece downloads. Each piece starts
+/// as [`Missing`](PieceState::Missing), progresses through
+/// [`InProgress`](PieceState::InProgress) as blocks are received, and ends
+/// in either [`Verified`](PieceState::Verified) (success) or
+/// [`Failed`](PieceState::Failed) (hash mismatch).
+///
+/// # State Transitions
+///
+/// - `Missing` -> `InProgress`: First block of the piece is received
+/// - `InProgress` -> `Verified`: All blocks received and hash matches
+/// - `InProgress` -> `Failed`: All blocks received but hash does not match
+/// - `Failed` -> `InProgress`: Retry download after failure
+///
+/// # Design Notes
+///
+/// The `InProgress` variant carries a `BitVec` rather than a simple block
+/// count because we need to track *which* blocks have been received, not just
+/// how many. This is essential for:
+///
+/// 1. **Resumption**: If a connection drops, we can continue from where we
+///    left off by requesting only the missing blocks.
+/// 2. **Deduplication**: Multiple peers might send the same block; we can
+///    detect and ignore duplicates.
+/// 3. **Request scheduling**: We can request different blocks from different
+///    peers to parallelize downloads.
+///
+/// The `Failed` state is separate from `Missing` to support tracking of
+/// verification failures. This enables:
+///
+/// 1. **Peer reputation**: Track which peers contributed to failed pieces
+/// 2. **Retry limits**: Avoid infinite retry loops on corrupted data
+/// 3. **Debugging**: Log which pieces repeatedly fail verification
+#[derive(Debug, Clone)]
+pub enum PieceState {
+    /// The piece has not been downloaded and no blocks have been received.
+    ///
+    /// This is the initial state for all pieces when a download begins, or
+    /// after resuming a download that had no partial data for this piece.
+    Missing,
+
+    /// The piece is being downloaded; some blocks have been received.
+    ///
+    /// The contained `BitVec` tracks which blocks have been received, with
+    /// one bit per block. The bit at index `i` is set if block `i` has been
+    /// received. The length of the `BitVec` equals the total number of blocks
+    /// in this piece.
+    ///
+    /// # Block Indexing
+    ///
+    /// Blocks are indexed from 0 to `num_blocks - 1`. For a standard 256 KiB
+    /// piece with 16 KiB blocks, there are 16 blocks indexed 0..16. The last
+    /// piece of a torrent may have fewer blocks if the file size is not
+    /// evenly divisible.
+    InProgress {
+        /// Bit vector tracking which blocks have been received.
+        /// `blocks_received[i]` is `true` if block `i` has been received.
+        blocks_received: BitVec<u8, Msb0>,
+    },
+
+    /// The piece has been fully downloaded and verified against its hash.
+    ///
+    /// A piece in this state has been:
+    /// 1. Completely downloaded (all blocks received)
+    /// 2. Hash-verified (computed SHA1 matches expected hash)
+    /// 3. Written to disk
+    ///
+    /// Once verified, a piece does not need to be re-downloaded unless the
+    /// on-disk data becomes corrupted (detected on read).
+    Verified,
+
+    /// The piece failed hash verification and needs to be re-downloaded.
+    ///
+    /// This state indicates that all blocks were received but the computed
+    /// SHA1 hash did not match the expected hash from the metainfo. The piece
+    /// data has been discarded and must be re-downloaded.
+    ///
+    /// # Retry Behavior
+    ///
+    /// A failed piece will transition to `InProgress` when retry begins.
+    /// The download manager may choose to:
+    /// - Request blocks from different peers than before
+    /// - Blacklist peers that contributed to the failed piece
+    /// - Implement retry limits to avoid infinite loops
+    Failed,
+}
+
+impl PieceState {
+    /// Returns `true` if the piece is in the `Missing` state.
+    #[inline]
+    pub fn is_missing(&self) -> bool {
+        matches!(self, PieceState::Missing)
+    }
+
+    /// Returns `true` if the piece is in the `InProgress` state.
+    #[inline]
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, PieceState::InProgress { .. })
+    }
+
+    /// Returns `true` if the piece is in the `Verified` state.
+    #[inline]
+    pub fn is_verified(&self) -> bool {
+        matches!(self, PieceState::Verified)
+    }
+
+    /// Returns `true` if the piece is in the `Failed` state.
+    #[inline]
+    pub fn is_failed(&self) -> bool {
+        matches!(self, PieceState::Failed)
+    }
+
+    /// Returns `true` if the piece needs to be downloaded (Missing or Failed).
+    ///
+    /// This is useful for piece selection: when choosing which piece to
+    /// request next, we consider both pieces we've never started and pieces
+    /// that failed verification.
+    #[inline]
+    pub fn needs_download(&self) -> bool {
+        matches!(self, PieceState::Missing | PieceState::Failed)
+    }
+
+    /// Creates a new `InProgress` state with the given number of blocks.
+    ///
+    /// All blocks are initially marked as not received (bits set to false).
+    ///
+    /// # Arguments
+    ///
+    /// * `num_blocks` - The total number of blocks in this piece
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceState;
+    ///
+    /// // A 256 KiB piece with 16 KiB blocks has 16 blocks
+    /// let state = PieceState::new_in_progress(16);
+    /// assert!(state.is_in_progress());
+    /// ```
+    pub fn new_in_progress(num_blocks: usize) -> Self {
+        PieceState::InProgress {
+            blocks_received: bitvec![u8, Msb0; 0; num_blocks],
+        }
+    }
+
+    /// Marks a block as received. Returns `true` if this was a new block.
+    ///
+    /// If the piece is not in `InProgress` state, this method returns `false`
+    /// without modifying the state. This handles the edge case where a late
+    /// block arrives after the piece has already been verified or marked as
+    /// failed.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_index` - The index of the block that was received
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the block was newly received (was not previously set)
+    /// * `false` if the block was already received, or if the state is not
+    ///   `InProgress`, or if `block_index` is out of bounds
+    pub fn mark_block_received(&mut self, block_index: usize) -> bool {
+        if let PieceState::InProgress { blocks_received } = self {
+            if block_index < blocks_received.len() {
+                let was_missing = !blocks_received[block_index];
+                blocks_received.set(block_index, true);
+                return was_missing;
+            }
+        }
+        false
+    }
+
+    /// Returns the number of blocks received so far.
+    ///
+    /// Returns 0 if the piece is in `Missing` or `Failed` state.
+    /// Returns the total block count if in `Verified` state (conceptually
+    /// all blocks have been received and verified).
+    ///
+    /// # Note
+    ///
+    /// For `Verified` pieces, this method cannot return the actual count
+    /// since we don't store the block count after verification. Callers
+    /// should typically check `is_verified()` separately.
+    pub fn blocks_received_count(&self) -> usize {
+        match self {
+            PieceState::InProgress { blocks_received } => {
+                blocks_received.count_ones()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Returns the total number of blocks in this piece.
+    ///
+    /// Returns `None` if the piece is not in `InProgress` state.
+    pub fn total_blocks(&self) -> Option<usize> {
+        match self {
+            PieceState::InProgress { blocks_received } => Some(blocks_received.len()),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if all blocks have been received.
+    ///
+    /// This is only meaningful for `InProgress` pieces. Returns `false` for
+    /// all other states.
+    pub fn all_blocks_received(&self) -> bool {
+        match self {
+            PieceState::InProgress { blocks_received } => blocks_received.all(),
+            _ => false,
+        }
+    }
+
+    /// Checks if a specific block has been received.
+    ///
+    /// Returns `false` if the piece is not in `InProgress` state or if the
+    /// block index is out of bounds.
+    pub fn has_block(&self, block_index: usize) -> bool {
+        match self {
+            PieceState::InProgress { blocks_received } => {
+                block_index < blocks_received.len() && blocks_received[block_index]
+            }
+            _ => false,
+        }
+    }
+}
+@
+
 The error enum demonstrates several important design choices:
 
 \begin{itemize}
@@ -258,6 +546,8 @@ The pieces module combines the error types and helpers.
 //! piece has a SHA1 hash in the torrent metadata, and downloaded data must
 //! match this hash before being written to disk.
 
+<<piece state>>
+
 <<piece errors>>
 
 <<piece error helpers>>
@@ -266,6 +556,8 @@ The pieces module combines the error types and helpers.
 mod tests {
     use super::*;
     use std::io;
+
+    <<piece state tests>>
 
     <<piece error display tests>>
 
@@ -464,5 +756,147 @@ fn disk_write_helper_accepts_pathbuf() {
         }
         _ => panic!("wrong variant"),
     }
+}
+@
+
+\subsection{Piece State Tests}
+
+We test the [[PieceState]] enum and its methods thoroughly. These tests verify
+the state machine transitions and helper methods work correctly.
+
+<<piece state tests>>=
+#[test]
+fn piece_state_missing_is_initial_state() {
+    let state = PieceState::Missing;
+    assert!(state.is_missing());
+    assert!(!state.is_in_progress());
+    assert!(!state.is_verified());
+    assert!(!state.is_failed());
+    assert!(state.needs_download());
+}
+
+#[test]
+fn piece_state_new_in_progress_creates_empty_bitvec() {
+    let state = PieceState::new_in_progress(16);
+    assert!(state.is_in_progress());
+    assert_eq!(state.total_blocks(), Some(16));
+    assert_eq!(state.blocks_received_count(), 0);
+    assert!(!state.all_blocks_received());
+}
+
+#[test]
+fn piece_state_verified_state_checks() {
+    let state = PieceState::Verified;
+    assert!(state.is_verified());
+    assert!(!state.is_missing());
+    assert!(!state.is_in_progress());
+    assert!(!state.is_failed());
+    assert!(!state.needs_download());
+}
+
+#[test]
+fn piece_state_failed_state_checks() {
+    let state = PieceState::Failed;
+    assert!(state.is_failed());
+    assert!(!state.is_missing());
+    assert!(!state.is_in_progress());
+    assert!(!state.is_verified());
+    assert!(state.needs_download()); // Failed pieces need re-download
+}
+
+#[test]
+fn piece_state_mark_block_received_sets_bit() {
+    let mut state = PieceState::new_in_progress(8);
+
+    // First marking should return true (new block)
+    assert!(state.mark_block_received(0));
+    assert!(state.has_block(0));
+    assert_eq!(state.blocks_received_count(), 1);
+
+    // Second marking of same block should return false (duplicate)
+    assert!(!state.mark_block_received(0));
+    assert_eq!(state.blocks_received_count(), 1);
+}
+
+#[test]
+fn piece_state_mark_block_out_of_bounds_returns_false() {
+    let mut state = PieceState::new_in_progress(4);
+    assert!(!state.mark_block_received(10));
+    assert_eq!(state.blocks_received_count(), 0);
+}
+
+#[test]
+fn piece_state_mark_block_on_non_in_progress_returns_false() {
+    let mut missing = PieceState::Missing;
+    assert!(!missing.mark_block_received(0));
+
+    let mut verified = PieceState::Verified;
+    assert!(!verified.mark_block_received(0));
+
+    let mut failed = PieceState::Failed;
+    assert!(!failed.mark_block_received(0));
+}
+
+#[test]
+fn piece_state_all_blocks_received_when_complete() {
+    let mut state = PieceState::new_in_progress(3);
+
+    assert!(!state.all_blocks_received());
+    state.mark_block_received(0);
+    assert!(!state.all_blocks_received());
+    state.mark_block_received(1);
+    assert!(!state.all_blocks_received());
+    state.mark_block_received(2);
+    assert!(state.all_blocks_received());
+}
+
+#[test]
+fn piece_state_has_block_checks_specific_block() {
+    let mut state = PieceState::new_in_progress(4);
+
+    assert!(!state.has_block(1));
+    state.mark_block_received(1);
+    assert!(state.has_block(1));
+    assert!(!state.has_block(0));
+    assert!(!state.has_block(2));
+}
+
+#[test]
+fn piece_state_has_block_on_non_in_progress_returns_false() {
+    let missing = PieceState::Missing;
+    assert!(!missing.has_block(0));
+
+    let verified = PieceState::Verified;
+    assert!(!verified.has_block(0));
+}
+
+#[test]
+fn piece_state_implements_clone() {
+    let state = PieceState::new_in_progress(8);
+    let cloned = state.clone();
+    assert!(cloned.is_in_progress());
+    assert_eq!(cloned.total_blocks(), Some(8));
+}
+
+#[test]
+fn piece_state_implements_debug() {
+    let state = PieceState::new_in_progress(4);
+    let debug_str = format!("{:?}", state);
+    assert!(debug_str.contains("InProgress"));
+    assert!(debug_str.contains("blocks_received"));
+}
+
+#[test]
+fn piece_state_total_blocks_returns_none_for_non_in_progress() {
+    assert_eq!(PieceState::Missing.total_blocks(), None);
+    assert_eq!(PieceState::Verified.total_blocks(), None);
+    assert_eq!(PieceState::Failed.total_blocks(), None);
+}
+
+#[test]
+fn piece_state_blocks_received_count_returns_zero_for_non_in_progress() {
+    assert_eq!(PieceState::Missing.blocks_received_count(), 0);
+    assert_eq!(PieceState::Verified.blocks_received_count(), 0);
+    assert_eq!(PieceState::Failed.blocks_received_count(), 0);
 }
 @
