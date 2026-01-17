@@ -1,11 +1,11 @@
 ---
 id: task-0016
 title: Write Bencode chapter prose
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:27'
-updated_date: '2026-01-17 23:29'
+updated_date: '2026-01-17 23:37'
 labels: []
 dependencies: []
 priority: high
@@ -19,9 +19,19 @@ Bencode is the foundational data format used throughout BitTorrent. The chapter 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Explains why BitTorrent uses Bencode instead of JSON/XML (canonical encoding, simplicity)
-- [ ] #2 Formal grammar definition is provided and explained
-- [ ] #3 Decoder implementation walkthrough explains each parsing step and error cases
-- [ ] #4 Encoder implementation shows symmetric structure to decoder
-- [ ] #5 Round-trip property is demonstrated and its importance for hashing explained
+- [x] #1 Explains why BitTorrent uses Bencode instead of JSON/XML (canonical encoding, simplicity)
+- [x] #2 Formal grammar definition is provided and explained
+- [x] #3 Decoder implementation walkthrough explains each parsing step and error cases
+- [x] #4 Encoder implementation shows symmetric structure to decoder
+- [x] #5 Round-trip property is demonstrated and its importance for hashing explained
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added comprehensive prose to Bencode chapter:
+- Why Not JSON/XML section explaining canonical encoding necessity
+- Formal EBNF grammar with 4-constraint explanation
+- Encoder/decoder symmetry table
+- Round-trip property and info hash computation explanation
+<!-- SECTION:NOTES:END -->

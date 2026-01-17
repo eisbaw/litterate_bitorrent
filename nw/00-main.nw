@@ -35,6 +35,10 @@
 \usepackage{geometry}
 \geometry{margin=1in}
 
+% TikZ for diagrams
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, shapes.geometric, fit, backgrounds}
+
 % Document metadata
 \title{Literate BitTorrent Client}
 \author{A pedagogical implementation in Rust}
@@ -57,34 +61,235 @@ the protocol and literate programming methodology.
 
 \section{Introduction}
 
-BitTorrent is a peer-to-peer file sharing protocol designed for efficient
-distribution of large files. Unlike traditional client-server downloads where
-a single server bears the entire load, BitTorrent distributes the burden among
-all participants: each peer both downloads and uploads pieces of the file.
+This document presents a complete BitTorrent client implemented as a literate
+program in Rust. The goal is twofold: to explain the BitTorrent protocol from
+first principles, and to demonstrate how literate programming can make complex
+network protocols accessible. By the end, you will understand not just how
+BitTorrent works, but why it was designed the way it was.
 
-This document implements a BitTorrent client from scratch. We will cover:
+\subsection{What is BitTorrent?}
+
+BitTorrent is a peer-to-peer file sharing protocol designed for efficient
+distribution of large files across the Internet. Unlike traditional downloads
+where a single server sends data to many clients, BitTorrent distributes both
+the content and the bandwidth burden across all participants.
+
+\paragraph{The Problem with Traditional Downloads.}
+Consider a scenario where a software vendor releases a 4 GB update and a
+million users want to download it simultaneously. With a traditional
+client-server model, the vendor's server must send 4 petabytes of data---the
+same bytes, over and over, to each client. The server becomes the bottleneck:
+as more users arrive, everyone's download slows to a crawl. This is
+fundamentally inefficient because each user downloads data and then does
+nothing with it.
+
+\paragraph{The BitTorrent Solution.}
+BitTorrent inverts this model. Instead of one server feeding many clients,
+every participant both downloads \emph{and uploads}. When you download a file
+via BitTorrent, you simultaneously upload the pieces you've already received
+to other users who need them. The more popular a file becomes, the more
+bandwidth becomes available to distribute it---the exact opposite of the
+traditional model.
+
+\paragraph{Key Concepts.}
+To understand BitTorrent, you need to grasp four fundamental concepts:
+
+\begin{description}
+\item[Pieces] Files are divided into fixed-size chunks called \emph{pieces},
+  typically 256 KB to 4 MB each. Each piece is identified by its SHA1 hash,
+  which serves both as verification (ensuring data integrity) and as a unique
+  identifier (so peers can request specific pieces).
+
+\item[Swarms] All the peers sharing a particular torrent form a \emph{swarm}.
+  Within a swarm, every peer can potentially connect to every other peer.
+  The swarm is the fundamental unit of coordination---there is no central
+  server distributing data, only peers exchanging pieces with each other.
+
+\item[Seeders and Leechers] A peer who has the complete file is a
+  \emph{seeder}---they only upload, never download. A peer still downloading
+  is a \emph{leecher}. Healthy torrents have a good ratio of seeders to
+  leechers. When you finish downloading, you become a seeder yourself (unless
+  you disconnect), contributing back to the swarm.
+
+\item[Trackers] While peers exchange data directly, they need a way to find
+  each other. A \emph{tracker} is a server that maintains a list of peers for
+  each torrent. When you start a download, your client contacts the tracker
+  to get a list of IP addresses to connect to. The tracker never sees the
+  actual content---it only facilitates introductions.
+\end{description}
+
+\paragraph{Why BitTorrent Succeeds.}
+Several design choices make BitTorrent remarkably effective:
 
 \begin{itemize}
-\item \textbf{Bencode}: The encoding format used for torrent metadata
-\item \textbf{Metainfo files}: The structure of \texttt{.torrent} files
-\item \textbf{Tracker protocol}: How peers discover each other
-\item \textbf{Peer wire protocol}: How peers exchange data
-\item \textbf{Piece management}: Tracking and verifying downloaded content
-\item \textbf{Download strategy}: Choosing what to request from whom
+\item \textbf{No single point of failure.} If one peer leaves, others continue
+  sharing. If the tracker goes down temporarily, already-connected peers can
+  continue exchanging data.
+
+\item \textbf{Scalability through participation.} Each new peer brings
+  bandwidth to the swarm. Popular content becomes faster to download, not
+  slower.
+
+\item \textbf{Incentive alignment.} The ``tit-for-tat'' algorithm preferentially
+  uploads to peers who upload back. This discourages free-riding and encourages
+  contribution.
+
+\item \textbf{Verification built-in.} Every piece is verified against its hash
+  before being accepted. Corrupted or malicious data is detected and discarded
+  automatically.
 \end{itemize}
+
+\subsection{How BitTorrent Works}
+
+Before diving into code, let's trace the lifecycle of a typical BitTorrent
+download. Understanding this flow will provide context for every chapter that
+follows.
+
+\begin{center}
+\begin{tikzpicture}[
+    node distance=1.5cm and 2.5cm,
+    server/.style={rectangle, draw=black, thick, minimum width=2cm, minimum height=1cm, fill=gray!20},
+    peer/.style={circle, draw=black, thick, minimum size=1.2cm, fill=blue!15},
+    file/.style={rectangle, draw=black, thick, rounded corners, minimum width=1.5cm, minimum height=0.8cm, fill=green!15},
+    arrow/.style={-{Stealth[length=2.5mm]}, thick},
+    bidiarrow/.style={{Stealth[length=2.5mm]}-{Stealth[length=2.5mm]}, thick},
+    label/.style={font=\footnotesize}
+]
+
+% Tracker
+\node[server] (tracker) {Tracker};
+
+% Peers in the swarm
+\node[peer, below left=2cm and 1.5cm of tracker] (peer1) {Peer A};
+\node[peer, below=2.5cm of tracker] (peer2) {Peer B};
+\node[peer, below right=2cm and 1.5cm of tracker] (peer3) {Peer C};
+
+% Our client
+\node[peer, below=2cm of peer2, fill=orange!25] (client) {You};
+
+% Torrent file (positioned near the client, since parsing happens locally)
+\node[file, left=2cm of client] (torrent) {.torrent};
+
+% Step 1: Read torrent file (client parses it locally)
+\draw[arrow] (torrent) -- node[above, label] {1. Parse} (client);
+
+% Step 2: Announce to tracker
+\draw[arrow] (client) -- node[left, label, pos=0.3] {2. Announce} (tracker);
+
+% Step 3: Tracker returns peer list
+\draw[arrow, dashed] (tracker) -- node[right, label, pos=0.3] {3. Peer list} (client);
+
+% Step 4: Peer connections (pieces exchanged)
+\draw[bidiarrow] (client) -- node[below left, label] {4. Pieces} (peer1);
+\draw[bidiarrow] (client) -- node[right, label] {4. Pieces} (peer2);
+\draw[bidiarrow] (client) -- node[below right, label] {4. Pieces} (peer3);
+
+% Inter-peer connections
+\draw[bidiarrow, gray!50] (peer1) -- (peer2);
+\draw[bidiarrow, gray!50] (peer2) -- (peer3);
+\draw[bidiarrow, gray!50] (peer1) to[bend left=30] (peer3);
+
+% Legend
+\begin{scope}[on background layer]
+\node[draw=gray, dashed, rounded corners, fit=(peer1)(peer2)(peer3)(client), inner sep=0.5cm, label={[font=\footnotesize]below:The Swarm}] {};
+\end{scope}
+
+\end{tikzpicture}
+\end{center}
+
+\paragraph{Step 1: Obtain and Parse the Torrent File.}
+Everything starts with a \texttt{.torrent} file (or a magnet link, which we
+won't cover here). This small file, typically a few kilobytes, contains:
+\begin{itemize}
+\item The tracker URL(s) where peers can be found
+\item Metadata about the file(s): names, sizes, directory structure
+\item The piece length and SHA1 hashes of every piece
+\end{itemize}
+The torrent file uses a simple encoding called \emph{bencode}. Parsing this
+file is our first task.
+
+\paragraph{Step 2: Announce to the Tracker.}
+With the torrent parsed, we contact the tracker to announce ourselves. Our
+request includes:
+\begin{itemize}
+\item The \emph{info hash}: a SHA1 hash of the torrent's metadata, uniquely
+  identifying this content
+\item Our \emph{peer ID}: a unique identifier for our client
+\item Our IP address and port where we'll accept connections
+\item How much we've downloaded/uploaded so far
+\end{itemize}
+
+\paragraph{Step 3: Receive the Peer List.}
+The tracker responds with a list of other peers in the swarm---their IP
+addresses and ports. We now know who to talk to, but we haven't yet
+connected to anyone or downloaded any data.
+
+\paragraph{Step 4: Connect to Peers and Exchange Pieces.}
+This is where the real work happens. For each peer:
+\begin{enumerate}
+\item Establish a TCP connection and perform a \emph{handshake} to verify
+  we're both interested in the same torrent
+\item Exchange \emph{bitfields}---bitmaps indicating which pieces each side has
+\item Express \emph{interest} in pieces the peer has that we don't
+\item Request specific \emph{blocks} (sub-piece units, typically 16 KB)
+\item Receive blocks, assemble them into pieces, and verify SHA1 hashes
+\item Upload pieces we have to peers who request them
+\end{enumerate}
+
+This continues until we have all pieces. At that point, we become a seeder,
+uploading to others without needing to download anything ourselves.
 
 \subsection{Document Roadmap}
 
-The implementation follows the data flow of a typical download:
+This document is organized to follow the logical structure of the protocol,
+building from simple foundations to the complete client. Each chapter adds
+one layer of functionality, and the code chunks accumulate into a working
+implementation.
 
-\begin{enumerate}
-\item Parse the torrent file (requires understanding Bencode)
-\item Contact the tracker to get a list of peers
-\item Connect to peers and negotiate what pieces they have
-\item Request and receive blocks, assembling them into pieces
-\item Verify piece integrity via SHA1 hashes
-\item Write completed pieces to disk
-\end{enumerate}
+\begin{description}
+\item[Chapter 1: Bencode] introduces the encoding format used throughout
+  BitTorrent. Bencode is simple---just integers, strings, lists, and
+  dictionaries---but its canonical encoding property is essential for
+  computing consistent info hashes. We implement a complete encoder and
+  decoder.
+
+\item[Chapter 2: Metainfo Files] builds on bencode to parse \texttt{.torrent}
+  files. We extract tracker URLs, file metadata, piece lengths, and piece
+  hashes. The crucial info hash computation happens here.
+
+\item[Chapter 3: Tracker Protocol] implements HTTP tracker communication.
+  We construct announce requests, parse responses, and handle both compact
+  and dictionary-format peer lists. Error handling covers network failures,
+  tracker rejections, and malformed responses.
+
+\item[Chapter 4: Peer Wire Protocol] defines the messages peers exchange:
+  handshakes, bitfields, interested/choke state, and piece requests. We
+  implement serialization and deserialization for all message types.
+
+\item[Chapter 5: Piece Management] tracks download progress. The piece
+  manager knows which pieces we have, which are in progress, and which are
+  verified. It coordinates block requests across multiple peer connections.
+
+\item[Chapter 6: Command-Line Interface] provides the user-facing entry
+  point. We use Rust's \texttt{clap} crate to parse arguments and configure
+  the download: torrent file, output directory, port, and verbosity.
+
+\item[Chapter 7: The Client] brings everything together. The client struct
+  owns all state and orchestrates the download: tracker announces, peer
+  connections, piece assembly, and progress reporting.
+
+\item[Chapter 8: Disk I/O] handles file creation and storage. We create
+  sparse files for efficient disk usage and write verified pieces to the
+  correct offsets within the file structure.
+
+\item[Appendix] provides references to the official BitTorrent Enhancement
+  Proposals (BEPs) and other resources for further reading.
+\end{description}
+
+By following these chapters in order, you will build a complete understanding
+of the BitTorrent protocol and a working client implementation. The literate
+programming format means you can read this as documentation, study the code
+in context, or extract the implementation to compile and run.
 
 \section{The Main Program}
 
