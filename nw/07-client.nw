@@ -430,6 +430,57 @@ impl PeerRequestQueue {
         self.timed_out(timeout)
     }
 
+    /// Removes and returns all requests for a specific piece.
+    ///
+    /// This is used when a piece is completed---any pending requests for
+    /// blocks of that piece to other peers should be cancelled. The returned
+    /// requests can be used to generate `Cancel` messages.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index to remove requests for
+    ///
+    /// # Returns
+    ///
+    /// A vector of all removed requests for the piece. Empty if no requests
+    /// for that piece were pending.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerRequestQueue;
+    /// use literate_bittorrent::pieces::BlockRequest;
+    ///
+    /// let mut queue = PeerRequestQueue::new(10);
+    /// let peer_id = *b"-LB0001-test12345678";
+    ///
+    /// // Add requests for pieces 0 and 1
+    /// queue.push(BlockRequest::new(0, 0, 16384, peer_id));
+    /// queue.push(BlockRequest::new(0, 16384, 16384, peer_id));
+    /// queue.push(BlockRequest::new(1, 0, 16384, peer_id));
+    ///
+    /// // Remove all requests for piece 0
+    /// let removed = queue.remove_for_piece(0);
+    ///
+    /// assert_eq!(removed.len(), 2);
+    /// assert_eq!(queue.len(), 1); // Only piece 1 request remains
+    /// ```
+    pub fn remove_for_piece(&mut self, piece_index: u32) -> Vec<TimestampedRequest> {
+        let mut removed = Vec::new();
+        let mut i = 0;
+        while i < self.requests.len() {
+            if self.requests[i].request.piece_index == piece_index {
+                if let Some(req) = self.requests.remove(i) {
+                    removed.push(req);
+                }
+                // Don't increment i since we removed an element
+            } else {
+                i += 1;
+            }
+        }
+        removed
+    }
+
     /// Clears all pending requests, returning them.
     ///
     /// This is used when a peer chokes us---all outstanding requests
@@ -1949,6 +2000,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<request timeout handling>>
 
+<<piece cancel handling>>
+
 <<peer connection manager>>
 
 <<event loop>>
@@ -1974,6 +2027,8 @@ The client module exports the [[Client]] struct and associated types.
 <<request pipelining tests>>
 
 <<request timeout handling tests>>
+
+<<piece cancel handling tests>>
 
 <<event loop tests>>
 
@@ -7305,6 +7360,309 @@ mod timeout_handling_tests {
         let result = find_alternative_peer(0, exclude_addr, &peers);
 
         assert!(result.is_none(), "Should return None for empty peers map");
+    }
+}
+@
+
+\subsection{Piece Completion Cancellation}
+
+When a piece is completed (all blocks received and hash verified), we must cancel
+any pending requests for blocks of that piece from other peers. This is important
+for two reasons:
+
+\begin{enumerate}
+\item \textbf{Bandwidth conservation}: Receiving duplicate blocks wastes bandwidth.
+  The peer is transmitting data we already have, and we cannot use that bandwidth
+  for blocks we still need.
+
+\item \textbf{Peer resources}: The remote peer allocates upload bandwidth and
+  buffer space for our request. Cancelling promptly lets them serve other clients
+  or our own future requests more efficiently.
+\end{enumerate}
+
+The completing peer (the one that sent the final block) is excluded from
+cancellation---they have already fulfilled their request, so there is nothing
+to cancel.
+
+<<piece cancel handling>>=
+/// Cancels all pending requests for a completed piece from all peers except
+/// the one that completed it.
+///
+/// When a piece is verified as complete, any outstanding block requests for
+/// that piece to other peers become unnecessary. This function:
+///
+/// 1. Iterates over all peer request queues
+/// 2. Skips the completing peer (they already delivered)
+/// 3. Removes all pending requests for the piece from each queue
+/// 4. Returns `(peer_addr, Cancel)` pairs for the caller to send
+///
+/// # Arguments
+///
+/// * `piece_index` - The index of the completed piece
+/// * `completing_peer` - Address of the peer that delivered the final block
+/// * `request_queues` - Mutable map of all peer request queues
+///
+/// # Returns
+///
+/// A vector of `(SocketAddr, Message)` pairs. Each entry represents a cancel
+/// message that should be sent to the peer at the given address. The caller
+/// is responsible for actually sending these messages.
+///
+/// # Example
+///
+/// ```ignore
+/// // Piece 5 was just completed by peer at addr1
+/// let cancels = cancel_piece_requests(5, addr1, &mut request_queues);
+///
+/// for (peer_addr, cancel_msg) in cancels {
+///     send_message(peer_addr, cancel_msg).await;
+/// }
+/// ```
+pub fn cancel_piece_requests(
+    piece_index: u32,
+    completing_peer: SocketAddr,
+    request_queues: &mut HashMap<SocketAddr, PeerRequestQueue>,
+) -> Vec<(SocketAddr, Message)> {
+    let mut cancels = Vec::new();
+
+    for (addr, queue) in request_queues.iter_mut() {
+        // Remove all requests for this piece from this peer's queue
+        let removed = queue.remove_for_piece(piece_index);
+
+        // Skip generating Cancel messages for the completing peer---they already
+        // delivered the piece, so there's nothing to cancel. We still clean up
+        // their queue above to avoid stale state.
+        if *addr == completing_peer {
+            debug!(
+                peer = %addr,
+                piece_index,
+                removed_count = removed.len(),
+                "cleaned up completing peer queue (no cancel messages needed)"
+            );
+            continue;
+        }
+
+        debug!(
+            peer = %addr,
+            piece_index,
+            cancel_count = removed.len(),
+            "generating cancel messages for piece"
+        );
+
+        // Convert each removed request into a Cancel message
+        for timestamped in removed {
+            let cancel = Message::Cancel {
+                index: timestamped.request.piece_index,
+                begin: timestamped.request.offset,
+                length: timestamped.request.length,
+            };
+            cancels.push((*addr, cancel));
+        }
+    }
+
+    cancels
+}
+@
+
+We test the piece cancellation logic to verify:
+\begin{itemize}
+\item Cancel messages are generated for all pending requests from other peers
+\item The completing peer is excluded from cancellation
+\item The function handles the case where no other peers had pending requests
+\item Requests are actually removed from the queues
+\end{itemize}
+
+<<piece cancel handling tests>>=
+#[cfg(test)]
+mod piece_cancel_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use crate::pieces::BlockRequest;
+
+    fn test_peer_id() -> [u8; 20] {
+        *b"-LB0001-test12345678"
+    }
+
+    #[test]
+    fn cancel_piece_requests_cancels_from_multiple_peers() {
+        // AC #5: Unit test: cancels requests from multiple peers correctly
+        let addr1: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:6882".parse().unwrap();
+        let addr3: SocketAddr = "127.0.0.1:6883".parse().unwrap();
+        let completing_peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Peer 1 has requests for piece 0 (two blocks)
+        let mut queue1 = PeerRequestQueue::new(10);
+        queue1.push(BlockRequest::new(0, 0, 16384, test_peer_id()));
+        queue1.push(BlockRequest::new(0, 16384, 16384, test_peer_id()));
+        request_queues.insert(addr1, queue1);
+
+        // Peer 2 has one request for piece 0
+        let mut queue2 = PeerRequestQueue::new(10);
+        queue2.push(BlockRequest::new(0, 32768, 16384, test_peer_id()));
+        request_queues.insert(addr2, queue2);
+
+        // Peer 3 has request for a different piece (piece 1)
+        let mut queue3 = PeerRequestQueue::new(10);
+        queue3.push(BlockRequest::new(1, 0, 16384, test_peer_id()));
+        request_queues.insert(addr3, queue3);
+
+        // Cancel piece 0 requests
+        let cancels = cancel_piece_requests(0, completing_peer, &mut request_queues);
+
+        // Should have 3 cancels (2 from peer1, 1 from peer2)
+        assert_eq!(cancels.len(), 3, "Should cancel 3 requests total");
+
+        // Verify all cancels are for piece 0
+        for (_, msg) in &cancels {
+            match msg {
+                Message::Cancel { index, .. } => {
+                    assert_eq!(*index, 0, "All cancels should be for piece 0");
+                }
+                _ => panic!("Expected Cancel message"),
+            }
+        }
+
+        // Verify peer 3's request for piece 1 is untouched
+        assert_eq!(request_queues.get(&addr3).unwrap().len(), 1);
+
+        // Verify peer 1 and 2 have empty queues now
+        assert!(request_queues.get(&addr1).unwrap().is_empty());
+        assert!(request_queues.get(&addr2).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancel_piece_requests_excludes_completing_peer() {
+        // AC #6: Unit test: excludes the completing peer from cancellation
+        let completing_peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let other_peer: SocketAddr = "127.0.0.1:6882".parse().unwrap();
+
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Completing peer has a pending request for the completed piece
+        // (this can happen in endgame mode where we request from multiple peers)
+        let mut completing_queue = PeerRequestQueue::new(10);
+        completing_queue.push(BlockRequest::new(0, 0, 16384, test_peer_id()));
+        request_queues.insert(completing_peer, completing_queue);
+
+        // Other peer also has a request for the same piece
+        let mut other_queue = PeerRequestQueue::new(10);
+        other_queue.push(BlockRequest::new(0, 16384, 16384, test_peer_id()));
+        request_queues.insert(other_peer, other_queue);
+
+        // Cancel piece 0, completed by completing_peer
+        let cancels = cancel_piece_requests(0, completing_peer, &mut request_queues);
+
+        // Should only cancel from other_peer, not completing_peer
+        assert_eq!(cancels.len(), 1, "Should only cancel from non-completing peer");
+        assert_eq!(cancels[0].0, other_peer, "Cancel should be for other peer");
+
+        // Completing peer's queue should be cleaned up (requests removed to avoid
+        // stale state), but no Cancel messages generated for them
+        assert!(
+            request_queues.get(&completing_peer).unwrap().is_empty(),
+            "Completing peer's queue should be cleaned up"
+        );
+
+        // Other peer's queue should be empty
+        assert!(
+            request_queues.get(&other_peer).unwrap().is_empty(),
+            "Other peer's queue should be empty after cancel"
+        );
+    }
+
+    #[test]
+    fn cancel_piece_requests_handles_no_pending_requests() {
+        // AC #7: Unit test: handles case where no other peers had pending requests
+        let completing_peer: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let other_peer: SocketAddr = "127.0.0.1:6882".parse().unwrap();
+
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Completing peer has the only request for piece 0
+        let mut completing_queue = PeerRequestQueue::new(10);
+        completing_queue.push(BlockRequest::new(0, 0, 16384, test_peer_id()));
+        request_queues.insert(completing_peer, completing_queue);
+
+        // Other peer has request for a different piece
+        let mut other_queue = PeerRequestQueue::new(10);
+        other_queue.push(BlockRequest::new(1, 0, 16384, test_peer_id()));
+        request_queues.insert(other_peer, other_queue);
+
+        // Cancel piece 0 - only completing peer had requests for it
+        let cancels = cancel_piece_requests(0, completing_peer, &mut request_queues);
+
+        // Should have no cancels (completing peer is excluded, other peer didn't have piece 0)
+        assert!(cancels.is_empty(), "Should have no cancels when no other peer had requests");
+
+        // Completing peer's queue should be cleaned up (their piece 0 request removed)
+        assert!(request_queues.get(&completing_peer).unwrap().is_empty());
+        // Other peer's queue should be unchanged (they had piece 1, not piece 0)
+        assert_eq!(request_queues.get(&other_peer).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cancel_piece_requests_removes_requests_from_queues() {
+        // AC #3: Removes cancelled requests from each peer's queue
+        let addr1: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let completing_peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Peer has mixed requests for piece 0 and piece 1
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(BlockRequest::new(0, 0, 16384, test_peer_id()));
+        queue.push(BlockRequest::new(1, 0, 16384, test_peer_id()));
+        queue.push(BlockRequest::new(0, 16384, 16384, test_peer_id()));
+        queue.push(BlockRequest::new(1, 16384, 16384, test_peer_id()));
+        request_queues.insert(addr1, queue);
+
+        assert_eq!(request_queues.get(&addr1).unwrap().len(), 4);
+
+        // Cancel piece 0 requests
+        let cancels = cancel_piece_requests(0, completing_peer, &mut request_queues);
+
+        // Should have cancelled 2 requests (both piece 0 blocks)
+        assert_eq!(cancels.len(), 2);
+
+        // Queue should now have 2 requests (both piece 1 blocks)
+        let remaining_queue = request_queues.get(&addr1).unwrap();
+        assert_eq!(remaining_queue.len(), 2);
+
+        // Verify remaining requests are for piece 1
+        for req in remaining_queue.iter() {
+            assert_eq!(req.request.piece_index, 1);
+        }
+    }
+
+    #[test]
+    fn cancel_piece_requests_returns_correct_cancel_messages() {
+        // AC #2: Returns list of (peer_addr, Message::Cancel) pairs
+        let addr1: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let completing_peer: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(BlockRequest::new(5, 32768, 16384, test_peer_id()));
+        request_queues.insert(addr1, queue);
+
+        let cancels = cancel_piece_requests(5, completing_peer, &mut request_queues);
+
+        assert_eq!(cancels.len(), 1);
+        let (cancel_addr, cancel_msg) = &cancels[0];
+
+        assert_eq!(*cancel_addr, addr1);
+        match cancel_msg {
+            Message::Cancel { index, begin, length } => {
+                assert_eq!(*index, 5);
+                assert_eq!(*begin, 32768);
+                assert_eq!(*length, 16384);
+            }
+            _ => panic!("Expected Cancel message"),
+        }
     }
 }
 @
