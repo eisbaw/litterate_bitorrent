@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:30'
-updated_date: '2026-01-17 22:23'
+updated_date: '2026-01-17 22:25'
 labels:
   - phase-6
   - recovery
@@ -50,36 +50,5 @@ Handles peer disconnections during download. When peers disconnect (network issu
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Summary
-
-Implemented comprehensive peer disconnect recovery in handle_peer_disconnected().
-
-## Changes
-
-- Enhanced handle_peer_disconnected() to drain pending requests from disconnecting peer
-- Added request reassignment logic using find_alternative_peer()
-- Requests are re-queued to alternative peers that have the piece and are not choking
-- Added connections_map() method to PeerConnectionManager for read-only access during reassignment
-- Added all-peers-disconnected warning log that signals waiting for re-announce
-- Logs cleanup statistics (pending, reassigned, dropped counts)
-
-## Testing
-
-Added 13 unit tests in peer_disconnect_tests module:
-- Queue drain behavior tests
-- Connection manager map access tests  
-- Alternative peer finding with choking/piece filtering
-- Full disconnect cleanup verification
-- Integration test for request reassignment flow
-- Integration test for available pool maintenance
-
-## Files Modified
-
-- nw/07-client.nw: Enhanced handle_peer_disconnected(), added connections_map(), added tests
-
-## Notes
-
-- Pre-existing CLI logging test failures are unrelated to this change
-- The connection manager signals needs_more_connections() after disconnect
-- External code is responsible for actually connecting replacement peers
+Full disconnect recovery with request reassignment. 13 unit tests added. Alternative peer selection is simple (first match) - can be enhanced later for load balancing.
 <!-- SECTION:NOTES:END -->

@@ -5924,6 +5924,15 @@ active.
 /// tracking.
 pub const KEEP_ALIVE_INTERVAL_SECS: u64 = 120;
 
+/// Idle timeout in seconds. Peers that haven't sent any message in this time
+/// are disconnected.
+///
+/// Per the PRD, if no messages (including keep-alives) are received from a peer
+/// within 180 seconds, the connection is considered dead and should be closed.
+/// This is longer than the keep-alive interval (120s) to allow for network jitter
+/// and delayed keep-alives.
+pub const PEER_IDLE_TIMEOUT_SECS: u64 = 180;
+
 /// Writes a message to the TCP stream.
 ///
 /// Serializes the message using `Message::to_bytes()` which includes
@@ -6043,6 +6052,20 @@ mod framed_message_writing_tests {
     #[test]
     fn keep_alive_interval_is_120_seconds() {
         assert_eq!(KEEP_ALIVE_INTERVAL_SECS, 120);
+    }
+
+    #[test]
+    fn peer_idle_timeout_is_180_seconds() {
+        assert_eq!(PEER_IDLE_TIMEOUT_SECS, 180);
+    }
+
+    #[test]
+    fn idle_timeout_greater_than_keep_alive_interval() {
+        // The idle timeout must be greater than the keep-alive interval
+        // to allow for network jitter and delayed keep-alives.
+        // Otherwise, peers could be disconnected before they have a chance
+        // to send their keep-alive.
+        assert!(PEER_IDLE_TIMEOUT_SECS > KEEP_ALIVE_INTERVAL_SECS);
     }
 
     #[tokio::test]
@@ -8104,13 +8127,15 @@ Send keep-alives to peers that haven't received data recently:
 <<event loop>>=
 /// Handles the keep-alive check timer.
 ///
-/// Iterates through all peer connections and sends keep-alives to those
-/// that haven't had any messages sent recently.
+/// Performs two functions:
+/// 1. Disconnects peers that haven't sent any message in PEER_IDLE_TIMEOUT_SECS
+/// 2. Sends keep-alives to peers that haven't received data in KEEP_ALIVE_INTERVAL_SECS
 async fn handle_keep_alives(
     ctx: &mut EventLoopContext<'_>,
 ) -> EventLoopAction {
-    trace!("checking for keep-alives");
+    trace!("checking for keep-alives and idle peers");
 
+    let idle_timeout = Duration::from_secs(PEER_IDLE_TIMEOUT_SECS);
     let keep_alive_threshold = Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS);
 
     // Collect addresses to avoid borrowing issues
@@ -8119,7 +8144,30 @@ async fn handle_keep_alives(
         .map(|(addr, _)| *addr)
         .collect();
 
-    for addr in peer_addrs {
+    // First pass: identify and disconnect idle peers
+    let mut idle_peers: Vec<SocketAddr> = Vec::new();
+    for &addr in &peer_addrs {
+        if let Some(conn) = ctx.connection_manager.get_connection(&addr) {
+            if conn.last_recv_time.elapsed() >= idle_timeout {
+                idle_peers.push(addr);
+            }
+        }
+    }
+
+    // Disconnect idle peers
+    for addr in idle_peers {
+        info!(peer = %addr, "disconnecting idle peer (no messages in {} seconds)", PEER_IDLE_TIMEOUT_SECS);
+        handle_peer_disconnected(addr, "idle timeout", ctx).await;
+    }
+
+    // Second pass: send keep-alives to remaining peers that need them
+    // Re-collect addresses since some peers may have been disconnected
+    let remaining_addrs: Vec<SocketAddr> = ctx.connection_manager
+        .connections()
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    for addr in remaining_addrs {
         if let Some(conn) = ctx.connection_manager.get_connection_mut(&addr) {
             if conn.last_send_time.elapsed() >= keep_alive_threshold {
                 match write_message(&mut conn.stream, &Message::KeepAlive).await {
@@ -8311,6 +8359,23 @@ mod event_loop_tests {
         // Pipeline length should allow good throughput
         assert!(DEFAULT_MAX_PIPELINE_LENGTH >= 5);
         assert!(DEFAULT_MAX_PIPELINE_LENGTH <= 20);
+    }
+
+    #[test]
+    fn keep_alive_timing_allows_peer_response() {
+        // The idle timeout must be strictly greater than the keep-alive interval.
+        // This ensures peers have time to respond with their own keep-alive
+        // before being disconnected for idleness.
+        //
+        // Timeline for a healthy idle connection:
+        // - T=0: Connection established
+        // - T=120s: Peer A sends keep-alive (KEEP_ALIVE_INTERVAL_SECS)
+        // - T=120s: Peer B receives, resets idle timer
+        // - T=180s: If B never responded, A would disconnect (PEER_IDLE_TIMEOUT_SECS)
+        //
+        // The 60-second gap allows for network delays and asymmetric timing.
+        assert!(PEER_IDLE_TIMEOUT_SECS > KEEP_ALIVE_INTERVAL_SECS);
+        assert_eq!(PEER_IDLE_TIMEOUT_SECS - KEEP_ALIVE_INTERVAL_SECS, 60);
     }
 
     #[tokio::test]
