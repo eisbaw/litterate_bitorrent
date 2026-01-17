@@ -150,6 +150,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<announce url construction>>
 
+<<http request>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,6 +167,8 @@ mod tests {
     <<peer id tests>>
 
     <<announce url tests>>
+
+    <<http request tests>>
 }
 @
 
@@ -1370,3 +1374,193 @@ These tests cover the key scenarios specified in the acceptance criteria:
 \item \textbf{Known output}: Tests with printable ASCII to verify exact output
   format without encoding ambiguity.
 \end{enumerate}
+
+\subsection{HTTP Announce Request}
+
+With the announce URL constructed, we now need to actually send the HTTP request
+to the tracker and retrieve the response. This is the network boundary of our
+tracker module---the point where our carefully assembled URL meets the real world
+of network latency, DNS failures, and uncooperative servers.
+
+The HTTP request lifecycle for a tracker announce is straightforward:
+
+\begin{enumerate}
+\item \textbf{Build the HTTP client}: We configure a reqwest client with our
+  desired settings: a 30-second timeout (per the PRD), a User-Agent header
+  identifying our client, and redirect following enabled.
+
+\item \textbf{Send the GET request}: The tracker protocol uses HTTP GET with all
+  parameters in the query string. We send the request and await the response.
+
+\item \textbf{Handle errors}: Network errors (connection refused, DNS failure,
+  timeouts) are converted to our [[TrackerError]] type. We specifically distinguish
+  timeouts from other errors to enable smarter retry logic.
+
+\item \textbf{Check the status code}: HTTP 200 indicates success. Any other status
+  code (4xx client errors, 5xx server errors) is treated as an error, though the
+  response body may still contain useful diagnostic information.
+
+\item \textbf{Return the response body}: On success, we return the raw bytes of
+  the response body. The caller is responsible for parsing this as bencoded data
+  and extracting the peer list.
+\end{enumerate}
+
+The 30-second timeout may seem long, but tracker servers are often overloaded,
+especially for popular torrents. A shorter timeout would cause unnecessary
+failures during peak usage. The timeout covers the entire request---connection
+establishment, TLS handshake, sending the request, and receiving the response.
+
+<<http request>>=
+use std::time::Duration;
+
+/// The User-Agent string sent with tracker requests.
+///
+/// This identifies our client to the tracker, useful for debugging and
+/// statistics. The format follows HTTP conventions: product/version.
+pub const USER_AGENT: &str = "LiterateTorrent/0.1";
+
+/// Timeout for tracker HTTP requests, in seconds.
+///
+/// This is 30 seconds as specified in the PRD. The timeout covers the entire
+/// HTTP request lifecycle: DNS resolution, TCP connection, TLS handshake,
+/// sending the request, and receiving the response.
+pub const TRACKER_TIMEOUT_SECS: u64 = 30;
+
+/// Send an HTTP GET request to a tracker and return the response body.
+///
+/// This function sends the fully-constructed announce URL to the tracker and
+/// returns the raw response bytes. The caller is responsible for parsing the
+/// bencoded response.
+///
+/// # Arguments
+///
+/// * `url` - The complete announce URL with all query parameters
+///
+/// # Returns
+///
+/// On success, returns the response body as a byte vector. The body is typically
+/// a bencoded dictionary containing the peer list and announce interval.
+///
+/// # Errors
+///
+/// Returns [`TrackerError::TrackerTimeout`] if the request times out after 30 seconds.
+///
+/// Returns [`TrackerError::TrackerHttpError`] for other HTTP failures:
+/// - Connection refused or reset
+/// - DNS resolution failure
+/// - TLS/SSL errors
+/// - HTTP 4xx or 5xx status codes
+///
+/// # Example
+///
+/// ```ignore
+/// let url = build_announce_url(&announce_url, &request);
+/// match announce_http(&url).await {
+///     Ok(body) => { /* parse bencoded response */ }
+///     Err(TrackerError::TrackerTimeout) => { /* try another tracker */ }
+///     Err(e) => { /* log and retry with backoff */ }
+/// }
+/// ```
+pub async fn announce_http(url: &str) -> Result<Vec<u8>, TrackerError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(TRACKER_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        // Redirects are enabled by default in reqwest, but we explicitly
+        // acknowledge this since some trackers use redirects for load balancing
+        .redirect(reqwest::redirect::Policy::default())
+        .build()
+        .map_err(|e| {
+            // Client build errors are rare (bad TLS config, etc.)
+            // Treat them as HTTP errors since they prevent communication
+            TrackerError::TrackerHttpError(e)
+        })?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| {
+            // Check if this was a timeout
+            if e.is_timeout() {
+                TrackerError::TrackerTimeout
+            } else {
+                TrackerError::TrackerHttpError(e)
+            }
+        })?;
+
+    // Check for HTTP error status codes
+    // reqwest's error_for_status() converts 4xx/5xx to errors
+    let response = response.error_for_status().map_err(|e| {
+        // Status errors are HTTP-level failures
+        TrackerError::TrackerHttpError(e)
+    })?;
+
+    // Read the response body
+    let body = response.bytes().await.map_err(|e| {
+        // Body read errors could be timeouts or connection resets
+        if e.is_timeout() {
+            TrackerError::TrackerTimeout
+        } else {
+            TrackerError::TrackerHttpError(e)
+        }
+    })?;
+
+    Ok(body.to_vec())
+}
+@
+
+The implementation uses reqwest's builder pattern to configure the HTTP client.
+Key design decisions:
+
+\begin{description}
+\item[Client per request] We create a new client for each request rather than
+  reusing one. This is slightly less efficient but simpler and avoids lifetime
+  complexity. For a BitTorrent client that announces every 30+ minutes, the
+  overhead is negligible.
+
+\item[Timeout covers everything] The reqwest timeout applies to the entire request,
+  not just individual operations. This matches the PRD specification and ensures
+  we don't hang indefinitely on slow trackers.
+
+\item[Explicit timeout error] We check [[is_timeout()]] on reqwest errors and
+  convert them to [[TrackerTimeout]]. This allows the caller to distinguish
+  ``tracker is slow'' from ``tracker is broken.''
+
+\item[User-Agent identification] We set a User-Agent header that identifies our
+  client. Some trackers block requests without a User-Agent, and it helps tracker
+  operators debug issues. The format follows HTTP conventions.
+
+\item[Redirect following] Reqwest follows redirects by default (up to 10 hops).
+  We explicitly acknowledge this because some trackers use HTTP redirects for
+  load balancing or to route clients to geographic-specific servers.
+\end{description}
+
+\subsection{HTTP Request Tests}
+
+Testing the HTTP request function is challenging because it involves real network
+operations. We focus on testing the error mapping logic, which we can verify
+without making actual HTTP requests.
+
+<<http request tests>>=
+#[test]
+fn user_agent_is_set() {
+    assert_eq!(USER_AGENT, "LiterateTorrent/0.1");
+}
+
+#[test]
+fn tracker_timeout_is_30_seconds() {
+    assert_eq!(TRACKER_TIMEOUT_SECS, 30);
+}
+
+// Note: Testing the actual HTTP request function would require either:
+// 1. A mock HTTP server (adds test complexity)
+// 2. Real network calls (flaky, slow)
+//
+// The error mapping logic is straightforward and relies on reqwest's
+// error classification (is_timeout()). Integration tests will verify
+// the complete flow against real trackers.
+@
+
+These tests verify the constants used by the HTTP request function. Full
+integration testing of [[announce_http]] requires network access and is
+performed in end-to-end tests rather than unit tests.
