@@ -287,6 +287,12 @@ a foundation.
 
 <<handshake impl>>
 
+<<message id constants>>
+
+<<message enum>>
+
+<<message impl>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +303,8 @@ mod tests {
     <<peer error trait tests>>
 
     <<handshake tests>>
+
+    <<message tests>>
 }
 @
 
@@ -1371,14 +1379,592 @@ These tests verify:
 \item Edge cases (all zeros, all ones) work correctly
 \end{itemize}
 
+\subsection{Peer Wire Protocol Messages}
+
+After completing the handshake, peers communicate using length-prefixed messages.
+Each message (except keep-alive) has a one-byte type identifier followed by a
+payload whose structure depends on the message type. The BitTorrent protocol
+defines nine message types with IDs 0--8, plus a special keep-alive message
+that has no ID (it's just a zero-length message).
+
+\subsubsection{Message ID Constants}
+
+BEP 3 assigns specific numeric IDs to each message type. We define these as
+constants to avoid magic numbers throughout the codebase and to document the
+protocol specification clearly.
+
+<<message id constants>>=
+/// Message ID for the `choke` message.
+///
+/// A peer sends choke (ID 0) to indicate it will not fulfill any pending
+/// requests from the receiver. The receiver should not send any more
+/// requests until it receives an unchoke. Choking is the primary mechanism
+/// for upload bandwidth management in BitTorrent.
+pub const MSG_CHOKE: u8 = 0;
+
+/// Message ID for the `unchoke` message.
+///
+/// A peer sends unchoke (ID 1) to indicate it is now willing to fulfill
+/// requests from the receiver. After receiving unchoke, a peer may begin
+/// sending request messages for blocks.
+pub const MSG_UNCHOKE: u8 = 1;
+
+/// Message ID for the `interested` message.
+///
+/// A peer sends interested (ID 2) to indicate it wants pieces that the
+/// remote peer has. This is used by the remote peer's choking algorithm
+/// to decide whom to unchoke. A peer should send interested when it sees
+/// the remote has pieces it needs, and not interested when the remote has
+/// nothing it wants.
+pub const MSG_INTERESTED: u8 = 2;
+
+/// Message ID for the `not interested` message.
+///
+/// A peer sends not interested (ID 3) to indicate it does not want any
+/// pieces the remote peer currently has. This helps the remote peer
+/// prioritize connections with peers that actually need data.
+pub const MSG_NOT_INTERESTED: u8 = 3;
+
+/// Message ID for the `have` message.
+///
+/// A peer sends have (ID 4) after successfully downloading and verifying
+/// a piece to announce that it now has that piece available. The payload
+/// is the 4-byte big-endian piece index.
+pub const MSG_HAVE: u8 = 4;
+
+/// Message ID for the `bitfield` message.
+///
+/// A peer sends bitfield (ID 5) immediately after the handshake (and
+/// before any other messages) to indicate which pieces it has. The
+/// payload is a bitfield where bit i (from the high bit of byte 0) is
+/// set if the peer has piece i. The bitfield must be the correct length
+/// for the torrent (ceil(num_pieces / 8) bytes), with spare bits at the
+/// end set to zero.
+pub const MSG_BITFIELD: u8 = 5;
+
+/// Message ID for the `request` message.
+///
+/// A peer sends request (ID 6) to ask for a block of data. The payload
+/// is 12 bytes: piece index (4 bytes), byte offset within piece (4 bytes),
+/// and block length (4 bytes). All values are big-endian unsigned integers.
+/// The typical block size is 16KB (2^14 bytes).
+pub const MSG_REQUEST: u8 = 6;
+
+/// Message ID for the `piece` message.
+///
+/// A peer sends piece (ID 7) in response to a request, delivering the
+/// actual data. The payload is: piece index (4 bytes), byte offset (4
+/// bytes), and the block data (variable length, typically 16KB). This
+/// is the only message that transfers actual file content.
+pub const MSG_PIECE: u8 = 7;
+
+/// Message ID for the `cancel` message.
+///
+/// A peer sends cancel (ID 8) to cancel a previously sent request. The
+/// payload format is identical to request: piece index, byte offset,
+/// and length. Cancellation is useful during endgame mode when the same
+/// block may be requested from multiple peers.
+pub const MSG_CANCEL: u8 = 8;
+
+/// The standard block size for BitTorrent data transfer.
+///
+/// By convention, peers request data in 16KB (2^14 = 16384 byte) blocks.
+/// This is not mandated by the protocol but is a de facto standard that
+/// all implementations respect. Using a different block size might cause
+/// compatibility issues with some peers.
+///
+/// The last block in a piece may be smaller than this if the piece length
+/// is not a multiple of BLOCK_SIZE.
+pub const BLOCK_SIZE: u32 = 16384; // 2^14 = 16 KiB
+@
+
+Note that keep-alive has no message ID constant because it has no ID byte at
+all---it's simply a message with length zero. The message ID constants use a
+[[MSG_]] prefix to clearly identify them as message type identifiers.
+
+\subsubsection{The Message Enum}
+
+We represent all peer wire protocol messages as variants of a single enum.
+This provides several benefits:
+
+\begin{itemize}
+\item \textbf{Type safety}: The compiler ensures all message types are handled
+  in match expressions, preventing accidental omissions.
+
+\item \textbf{Clear payload structure}: Each variant's fields document exactly
+  what data that message type carries.
+
+\item \textbf{Ergonomic pattern matching}: Message handlers can destructure
+  messages directly in match arms.
+\end{itemize}
+
+<<message enum>>=
+/// A peer wire protocol message.
+///
+/// This enum represents all message types defined in BEP 3. After the initial
+/// handshake, all peer communication uses these length-prefixed messages.
+///
+/// # Wire Format
+///
+/// Messages are transmitted as: `<length><id><payload>` where:
+/// - `length` is a 4-byte big-endian integer (total bytes after length field)
+/// - `id` is a 1-byte message type identifier (omitted for keep-alive)
+/// - `payload` varies by message type (may be empty)
+///
+/// # Keep-Alive
+///
+/// The `KeepAlive` variant represents a zero-length message (no ID, no payload).
+/// Peers should send keep-alives every 2 minutes to prevent timeout disconnection.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::{Message, MSG_CHOKE, MSG_HAVE};
+///
+/// // Create messages
+/// let keepalive = Message::KeepAlive;
+/// let choke = Message::Choke;
+/// let have = Message::Have(42);
+///
+/// // Get message IDs
+/// assert_eq!(keepalive.id(), None);  // Keep-alive has no ID
+/// assert_eq!(choke.id(), Some(MSG_CHOKE));
+/// assert_eq!(have.id(), Some(MSG_HAVE));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    /// Keep-alive message (length = 0, no ID).
+    ///
+    /// Peers should send keep-alive messages at least once every 2 minutes
+    /// to prevent the connection from being closed due to inactivity.
+    /// Keep-alives have no payload and no message ID---they're just a
+    /// 4-byte length prefix of zero.
+    KeepAlive,
+
+    /// Choke message (ID = 0, no payload).
+    ///
+    /// Indicates this peer will not respond to requests from the remote peer.
+    /// When choked, the remote peer should stop sending requests until it
+    /// receives an `Unchoke` message. Pending requests should be considered
+    /// discarded.
+    Choke,
+
+    /// Unchoke message (ID = 1, no payload).
+    ///
+    /// Indicates this peer is now willing to respond to requests. The remote
+    /// peer may begin sending `Request` messages after receiving `Unchoke`.
+    Unchoke,
+
+    /// Interested message (ID = 2, no payload).
+    ///
+    /// Indicates this peer is interested in pieces the remote peer has.
+    /// A peer should send `Interested` when it discovers the remote peer
+    /// has pieces it needs, and `NotInterested` otherwise. This information
+    /// helps peers decide whom to unchoke.
+    Interested,
+
+    /// Not Interested message (ID = 3, no payload).
+    ///
+    /// Indicates this peer is not interested in any pieces the remote peer
+    /// currently has. This may change as the remote peer acquires new pieces
+    /// or as this peer's needs change.
+    NotInterested,
+
+    /// Have message (ID = 4, payload = piece index).
+    ///
+    /// Announces that this peer has successfully downloaded and verified
+    /// the piece at the given index. Peers send `Have` after completing a
+    /// piece to update the swarm about their availability.
+    ///
+    /// The contained value is the zero-based piece index.
+    Have(u32),
+
+    /// Bitfield message (ID = 5, payload = bitfield).
+    ///
+    /// Sent immediately after the handshake (before any other messages) to
+    /// indicate which pieces this peer has. Bit i (counting from the high
+    /// bit of byte 0) is set if piece i is available.
+    ///
+    /// The bitfield must have the correct length: `ceil(num_pieces / 8)` bytes.
+    /// Any spare bits at the end must be zero.
+    ///
+    /// A peer that has no pieces may either send an empty bitfield or skip
+    /// the bitfield message entirely.
+    Bitfield(Vec<u8>),
+
+    /// Request message (ID = 6, payload = index + begin + length).
+    ///
+    /// Requests a block of data from a piece. The block is identified by:
+    /// - `index`: the piece index (0-based)
+    /// - `begin`: byte offset within the piece
+    /// - `length`: number of bytes requested (typically 16KB)
+    ///
+    /// Requests should only be sent when not choked by the remote peer.
+    /// The remote peer may respond with `Piece` or ignore the request.
+    Request {
+        /// The piece index (0-based).
+        index: u32,
+        /// Byte offset within the piece where the block starts.
+        begin: u32,
+        /// Number of bytes to send (typically `BLOCK_SIZE`).
+        length: u32,
+    },
+
+    /// Piece message (ID = 7, payload = index + begin + data).
+    ///
+    /// Delivers a block of data in response to a `Request`. The block is
+    /// identified by piece index and byte offset; the data follows.
+    ///
+    /// This is the only message type that transfers actual file content.
+    /// The receiver should write the data to the appropriate location and,
+    /// once a complete piece is assembled, verify its hash.
+    Piece {
+        /// The piece index (0-based).
+        index: u32,
+        /// Byte offset within the piece where this block belongs.
+        begin: u32,
+        /// The actual block data.
+        data: Vec<u8>,
+    },
+
+    /// Cancel message (ID = 8, payload = index + begin + length).
+    ///
+    /// Cancels a previously sent request. The payload is identical to
+    /// `Request`: piece index, byte offset, and length.
+    ///
+    /// Cancellation is primarily used during "endgame mode" when the last
+    /// few blocks are requested from multiple peers simultaneously. Once
+    /// a block arrives from one peer, cancel requests to others.
+    Cancel {
+        /// The piece index (0-based).
+        index: u32,
+        /// Byte offset within the piece.
+        begin: u32,
+        /// Length of the block that was requested.
+        length: u32,
+    },
+}
+@
+
+The [[Message]] enum uses different representations for its variants:
+
+\begin{itemize}
+\item \textbf{Unit variants} ([[KeepAlive]], [[Choke]], [[Unchoke]], etc.) for
+  messages with no payload.
+
+\item \textbf{Tuple variant} ([[Have(u32)]]) for messages with a single simple
+  payload.
+
+\item \textbf{Tuple variant with Vec} ([[Bitfield(Vec<u8>)]]) for variable-length
+  payloads where the data is opaque.
+
+\item \textbf{Struct variants} ([[Request]], [[Piece]], [[Cancel]]) for messages
+  with multiple named fields, improving readability when constructing or
+  destructuring these messages.
+\end{itemize}
+
+\subsubsection{Message ID Method}
+
+Each message type (except keep-alive) has an associated ID byte. We provide a
+method to retrieve this ID, which is essential for serialization and for
+protocol handling code that needs to identify message types.
+
+<<message impl>>=
+impl Message {
+    /// Returns the message type ID, or `None` for keep-alive.
+    ///
+    /// The message ID is the single byte that identifies the message type
+    /// in the wire protocol. Keep-alive messages have no ID because they
+    /// have no content at all (length = 0 means no ID byte follows).
+    ///
+    /// # Returns
+    ///
+    /// - `Some(id)` for messages with an ID (0-8)
+    /// - `None` for `KeepAlive`
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::messages::{Message, MSG_CHOKE, MSG_REQUEST};
+    ///
+    /// assert_eq!(Message::KeepAlive.id(), None);
+    /// assert_eq!(Message::Choke.id(), Some(MSG_CHOKE));
+    /// assert_eq!(Message::Unchoke.id(), Some(1));
+    /// assert_eq!(Message::Interested.id(), Some(2));
+    /// assert_eq!(Message::NotInterested.id(), Some(3));
+    /// assert_eq!(Message::Have(0).id(), Some(4));
+    /// assert_eq!(Message::Bitfield(vec![]).id(), Some(5));
+    /// assert_eq!(Message::Request { index: 0, begin: 0, length: 0 }.id(), Some(MSG_REQUEST));
+    /// assert_eq!(Message::Piece { index: 0, begin: 0, data: vec![] }.id(), Some(7));
+    /// assert_eq!(Message::Cancel { index: 0, begin: 0, length: 0 }.id(), Some(8));
+    /// ```
+    #[must_use]
+    pub fn id(&self) -> Option<u8> {
+        match self {
+            Message::KeepAlive => None,
+            Message::Choke => Some(MSG_CHOKE),
+            Message::Unchoke => Some(MSG_UNCHOKE),
+            Message::Interested => Some(MSG_INTERESTED),
+            Message::NotInterested => Some(MSG_NOT_INTERESTED),
+            Message::Have(_) => Some(MSG_HAVE),
+            Message::Bitfield(_) => Some(MSG_BITFIELD),
+            Message::Request { .. } => Some(MSG_REQUEST),
+            Message::Piece { .. } => Some(MSG_PIECE),
+            Message::Cancel { .. } => Some(MSG_CANCEL),
+        }
+    }
+}
+@
+
+The [[id()]] method returns [[Option<u8>]] rather than [[u8]] to accurately
+represent that keep-alive has no ID. This forces callers to handle the keep-alive
+case explicitly, preventing bugs where code assumes all messages have IDs.
+
+\subsubsection{Message Tests}
+
+We test the [[Message]] enum to verify correct construction and the [[id()]]
+method returns the expected values per BEP 3.
+
+<<message tests>>=
+#[test]
+fn message_id_constants_match_bep3() {
+    // Verify our constants match BEP 3 specification
+    assert_eq!(MSG_CHOKE, 0);
+    assert_eq!(MSG_UNCHOKE, 1);
+    assert_eq!(MSG_INTERESTED, 2);
+    assert_eq!(MSG_NOT_INTERESTED, 3);
+    assert_eq!(MSG_HAVE, 4);
+    assert_eq!(MSG_BITFIELD, 5);
+    assert_eq!(MSG_REQUEST, 6);
+    assert_eq!(MSG_PIECE, 7);
+    assert_eq!(MSG_CANCEL, 8);
+}
+
+#[test]
+fn block_size_is_16kb() {
+    assert_eq!(BLOCK_SIZE, 16384);
+    assert_eq!(BLOCK_SIZE, 1 << 14); // 2^14
+}
+
+#[test]
+fn keepalive_has_no_id() {
+    assert_eq!(Message::KeepAlive.id(), None);
+}
+
+#[test]
+fn choke_has_id_0() {
+    assert_eq!(Message::Choke.id(), Some(0));
+    assert_eq!(Message::Choke.id(), Some(MSG_CHOKE));
+}
+
+#[test]
+fn unchoke_has_id_1() {
+    assert_eq!(Message::Unchoke.id(), Some(1));
+    assert_eq!(Message::Unchoke.id(), Some(MSG_UNCHOKE));
+}
+
+#[test]
+fn interested_has_id_2() {
+    assert_eq!(Message::Interested.id(), Some(2));
+    assert_eq!(Message::Interested.id(), Some(MSG_INTERESTED));
+}
+
+#[test]
+fn not_interested_has_id_3() {
+    assert_eq!(Message::NotInterested.id(), Some(3));
+    assert_eq!(Message::NotInterested.id(), Some(MSG_NOT_INTERESTED));
+}
+
+#[test]
+fn have_has_id_4() {
+    assert_eq!(Message::Have(0).id(), Some(4));
+    assert_eq!(Message::Have(42).id(), Some(MSG_HAVE));
+    assert_eq!(Message::Have(u32::MAX).id(), Some(MSG_HAVE));
+}
+
+#[test]
+fn bitfield_has_id_5() {
+    assert_eq!(Message::Bitfield(vec![]).id(), Some(5));
+    assert_eq!(Message::Bitfield(vec![0xFF]).id(), Some(MSG_BITFIELD));
+    assert_eq!(Message::Bitfield(vec![0; 100]).id(), Some(MSG_BITFIELD));
+}
+
+#[test]
+fn request_has_id_6() {
+    let msg = Message::Request {
+        index: 0,
+        begin: 0,
+        length: BLOCK_SIZE,
+    };
+    assert_eq!(msg.id(), Some(6));
+    assert_eq!(msg.id(), Some(MSG_REQUEST));
+}
+
+#[test]
+fn piece_has_id_7() {
+    let msg = Message::Piece {
+        index: 0,
+        begin: 0,
+        data: vec![0; 100],
+    };
+    assert_eq!(msg.id(), Some(7));
+    assert_eq!(msg.id(), Some(MSG_PIECE));
+}
+
+#[test]
+fn cancel_has_id_8() {
+    let msg = Message::Cancel {
+        index: 0,
+        begin: 0,
+        length: BLOCK_SIZE,
+    };
+    assert_eq!(msg.id(), Some(8));
+    assert_eq!(msg.id(), Some(MSG_CANCEL));
+}
+
+#[test]
+fn message_is_cloneable() {
+    let messages = vec![
+        Message::KeepAlive,
+        Message::Choke,
+        Message::Unchoke,
+        Message::Interested,
+        Message::NotInterested,
+        Message::Have(42),
+        Message::Bitfield(vec![0xFF, 0x00]),
+        Message::Request { index: 1, begin: 0, length: BLOCK_SIZE },
+        Message::Piece { index: 1, begin: 0, data: vec![1, 2, 3] },
+        Message::Cancel { index: 1, begin: 0, length: BLOCK_SIZE },
+    ];
+
+    for msg in &messages {
+        let cloned = msg.clone();
+        assert_eq!(msg, &cloned);
+    }
+}
+
+#[test]
+fn message_equality() {
+    // Same messages are equal
+    assert_eq!(Message::Choke, Message::Choke);
+    assert_eq!(Message::Have(42), Message::Have(42));
+    assert_eq!(
+        Message::Request { index: 1, begin: 2, length: 3 },
+        Message::Request { index: 1, begin: 2, length: 3 }
+    );
+
+    // Different messages are not equal
+    assert_ne!(Message::Choke, Message::Unchoke);
+    assert_ne!(Message::Have(1), Message::Have(2));
+    assert_ne!(
+        Message::Request { index: 1, begin: 0, length: BLOCK_SIZE },
+        Message::Request { index: 2, begin: 0, length: BLOCK_SIZE }
+    );
+}
+
+#[test]
+fn message_debug_output() {
+    // Verify Debug is implemented and produces reasonable output
+    let msg = Message::Request {
+        index: 5,
+        begin: 16384,
+        length: BLOCK_SIZE,
+    };
+    let debug = format!("{:?}", msg);
+    assert!(debug.contains("Request"));
+    assert!(debug.contains("index"));
+    assert!(debug.contains("5"));
+}
+
+#[test]
+fn have_stores_piece_index() {
+    let msg = Message::Have(12345);
+    if let Message::Have(index) = msg {
+        assert_eq!(index, 12345);
+    } else {
+        panic!("expected Have variant");
+    }
+}
+
+#[test]
+fn bitfield_stores_data() {
+    let data = vec![0xFF, 0x80, 0x00, 0x01];
+    let msg = Message::Bitfield(data.clone());
+    if let Message::Bitfield(bitfield) = msg {
+        assert_eq!(bitfield, data);
+    } else {
+        panic!("expected Bitfield variant");
+    }
+}
+
+#[test]
+fn request_stores_fields() {
+    let msg = Message::Request {
+        index: 42,
+        begin: 16384,
+        length: BLOCK_SIZE,
+    };
+    if let Message::Request { index, begin, length } = msg {
+        assert_eq!(index, 42);
+        assert_eq!(begin, 16384);
+        assert_eq!(length, BLOCK_SIZE);
+    } else {
+        panic!("expected Request variant");
+    }
+}
+
+#[test]
+fn piece_stores_fields() {
+    let block_data = vec![0xAB; 1024];
+    let msg = Message::Piece {
+        index: 10,
+        begin: 32768,
+        data: block_data.clone(),
+    };
+    if let Message::Piece { index, begin, data } = msg {
+        assert_eq!(index, 10);
+        assert_eq!(begin, 32768);
+        assert_eq!(data, block_data);
+    } else {
+        panic!("expected Piece variant");
+    }
+}
+
+#[test]
+fn cancel_stores_fields() {
+    let msg = Message::Cancel {
+        index: 99,
+        begin: 0,
+        length: 8192,
+    };
+    if let Message::Cancel { index, begin, length } = msg {
+        assert_eq!(index, 99);
+        assert_eq!(begin, 0);
+        assert_eq!(length, 8192);
+    } else {
+        panic!("expected Cancel variant");
+    }
+}
+@
+
+These tests verify:
+\begin{itemize}
+\item All message ID constants match BEP 3 specification
+\item [[BLOCK_SIZE]] is correctly set to 16384 (2\^{}14)
+\item Each message variant returns the correct ID from [[id()]]
+\item Keep-alive returns [[None]] from [[id()]]
+\item Messages are cloneable and comparable
+\item Debug output is reasonable
+\item Message variants correctly store their payloads
+\end{itemize}
+
 \subsection{Next Steps}
 
-With the handshake struct, serialization, and parsing complete, the messages
-module is ready for:
+With the Message enum complete, the messages module is ready for:
 \begin{enumerate}
-\item Message enum with the nine message types (keep-alive through cancel)
-\item Length-prefix framing helpers for reading/writing messages
-\item Async I/O wrappers for handshake exchange
+\item Message serialization ([[to_bytes]]) for sending messages
+\item Message parsing ([[from_bytes]]) for receiving messages
+\item Async I/O wrappers for framed message exchange
 \end{enumerate}
 
 These will be added in subsequent development as we build out the peer
