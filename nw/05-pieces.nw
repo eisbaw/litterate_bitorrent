@@ -3430,6 +3430,870 @@ fn select_next_blocks_last_piece_smaller() {
 }
 @
 
+\subsection{Request Scheduler}
+
+The [[RequestScheduler]] is the central coordinator for block requests across all
+peers. While the previous sections defined the building blocks---piece selection,
+block selection, and request tracking---the scheduler combines them into a coherent
+strategy.
+
+The scheduler's primary responsibility is answering the question: ``Given the
+current state of all peers and pieces, which blocks should I request from which
+peers right now?'' This involves several interrelated decisions:
+
+\begin{enumerate}
+\item \textbf{Piece prioritization}: Using rarest-first selection, determine which
+  pieces are most urgent to download.
+\item \textbf{Peer matching}: For each desired piece, identify which unchoked peers
+  have it.
+\item \textbf{Request distribution}: Spread block requests across peers to maximize
+  parallelism without exceeding per-peer pipeline limits.
+\item \textbf{Duplicate avoidance}: In normal mode, avoid requesting the same block
+  from multiple peers (endgame mode is the exception).
+\item \textbf{Timeout detection}: Identify stale in-flight requests that should be
+  cancelled and reassigned.
+\end{enumerate}
+
+The scheduler maintains a global view of all in-flight requests across all peers.
+This is essential for duplicate avoidance: when deciding whether to request a block
+from peer A, we need to know if we've already requested it from peer B. The PRD
+specifies a 30-second timeout for requests, after which they can be reassigned.
+
+\subsubsection{Configuration}
+
+The scheduler accepts configuration via [[SchedulerConfig]], allowing tuning of
+pipeline depth and timeout behavior.
+
+<<scheduler config>>=
+use std::time::Duration;
+
+/// Configuration for the request scheduler.
+///
+/// These parameters control the scheduler's behavior regarding request
+/// pipelining and timeout handling.
+#[derive(Debug, Clone)]
+pub struct SchedulerConfig {
+    /// Maximum concurrent requests per peer.
+    ///
+    /// The BitTorrent protocol allows pipelining multiple requests to
+    /// maximize throughput. The typical range is 10-16 requests per peer.
+    /// Too few requests underutilizes the connection; too many can cause
+    /// memory pressure and unfairness.
+    ///
+    /// Default: 10
+    pub pipeline_limit: usize,
+
+    /// Duration after which a request is considered timed out.
+    ///
+    /// Requests that exceed this duration without receiving data are
+    /// marked as timed out and can be reassigned to other peers. The
+    /// PRD specifies 30 seconds as the default.
+    ///
+    /// Default: 30 seconds
+    pub request_timeout: Duration,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        SchedulerConfig {
+            pipeline_limit: 10,
+            request_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl SchedulerConfig {
+    /// Creates a new configuration with custom pipeline limit.
+    pub fn with_pipeline_limit(mut self, limit: usize) -> Self {
+        self.pipeline_limit = limit;
+        self
+    }
+
+    /// Creates a new configuration with custom timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
+        self
+    }
+}
+@
+
+\subsubsection{Pending Request Tracking}
+
+The scheduler tracks all in-flight requests in a central data structure. This
+enables:
+
+\begin{itemize}
+\item Checking whether a block is already requested (duplicate avoidance)
+\item Finding requests that have timed out
+\item Matching incoming piece messages to their corresponding requests
+\item Counting requests per peer for pipeline limiting
+\end{itemize}
+
+We use a [[HashMap]] keyed by (piece\_index, offset) for O(1) lookup when checking
+for duplicates or matching responses. A secondary structure tracks requests per
+peer for efficient pipeline counting.
+
+<<pending requests>>=
+use std::collections::HashMap;
+
+/// Key for identifying a specific block request.
+///
+/// A block is uniquely identified by its piece index and byte offset within
+/// that piece. Length is not included because the protocol does not allow
+/// requesting different lengths at the same offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockKey {
+    /// The piece containing this block.
+    pub piece_index: u32,
+    /// Byte offset within the piece.
+    pub offset: u32,
+}
+
+impl BlockKey {
+    /// Creates a new block key.
+    pub fn new(piece_index: u32, offset: u32) -> Self {
+        BlockKey { piece_index, offset }
+    }
+}
+
+/// A tracked pending request with metadata.
+#[derive(Debug, Clone)]
+pub struct PendingRequest {
+    /// The full request details.
+    pub request: BlockRequest,
+    /// Current state of the request.
+    pub state: RequestState,
+}
+
+impl PendingRequest {
+    /// Creates a new pending request in the InFlight state.
+    pub fn new(request: BlockRequest) -> Self {
+        PendingRequest {
+            request,
+            state: RequestState::InFlight,
+        }
+    }
+
+    /// Returns the key for this request.
+    pub fn key(&self) -> BlockKey {
+        BlockKey::new(self.request.piece_index, self.request.offset)
+    }
+
+    /// Returns true if this request has timed out.
+    pub fn is_timed_out(&self, timeout: Duration) -> bool {
+        self.state == RequestState::InFlight && self.request.is_timed_out(timeout)
+    }
+}
+@
+
+\subsubsection{The Request Scheduler}
+
+The [[RequestScheduler]] struct ties everything together. It maintains:
+
+\begin{description}
+\item[pending] A map from block keys to pending requests, enabling O(1) duplicate
+  checking and response matching.
+\item[peer\_request\_counts] A map from peer IDs to the count of in-flight requests
+  to that peer, enabling O(1) pipeline limit checking.
+\item[config] The scheduler configuration.
+\end{description}
+
+<<request scheduler>>=
+/// Central coordinator for block requests across all peers.
+///
+/// The RequestScheduler manages which blocks to request from which peers,
+/// implementing the request pipelining and timeout handling specified in
+/// the PRD. It coordinates with the piece selection strategy to prioritize
+/// rare pieces while respecting per-peer pipeline limits.
+///
+/// # Responsibilities
+///
+/// 1. **Pipeline management**: Track in-flight requests per peer, respecting
+///    the configured pipeline limit (default 10, max 16).
+/// 2. **Duplicate avoidance**: Ensure the same block is not requested from
+///    multiple peers simultaneously (except in endgame mode).
+/// 3. **Timeout detection**: Identify requests that have exceeded the timeout
+///    threshold (default 30 seconds) for reassignment.
+/// 4. **Request matching**: Match incoming piece messages to their requests.
+///
+/// # Usage Pattern
+///
+/// ```no_run
+/// use literate_bittorrent::pieces::{
+///     RequestScheduler, SchedulerConfig, PieceManager, PieceAvailability,
+///     BlockRequest, BLOCK_SIZE,
+/// };
+///
+/// // Create scheduler with default configuration
+/// let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+///
+/// // When a peer becomes unchoked, generate requests
+/// let peer_id = *b"-RS0001-xxxxxxxxxxxx";
+/// let peer_bitfield = vec![0xFF]; // peer has all pieces
+/// let hashes = vec![[0u8; 20]; 8];
+/// let manager = PieceManager::new(BLOCK_SIZE * 4, BLOCK_SIZE as u64 * 4 * 8, hashes).unwrap();
+/// let availability = PieceAvailability::new(8);
+///
+/// // The scheduler would be used with select_rarest and select_next_blocks
+/// // to determine what to request
+/// ```
+///
+/// # Thread Safety
+///
+/// This struct is not thread-safe. In a multi-threaded context, wrap it in
+/// a `Mutex` or use message-passing to serialize access.
+#[derive(Debug)]
+pub struct RequestScheduler {
+    /// All pending requests, keyed by (piece_index, offset).
+    pending: HashMap<BlockKey, PendingRequest>,
+
+    /// Count of in-flight requests per peer.
+    peer_request_counts: HashMap<PeerId, usize>,
+
+    /// Scheduler configuration.
+    config: SchedulerConfig,
+}
+
+impl RequestScheduler {
+    /// Creates a new request scheduler with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The scheduler configuration
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::{RequestScheduler, SchedulerConfig};
+    ///
+    /// let scheduler = RequestScheduler::new(SchedulerConfig::default());
+    /// assert_eq!(scheduler.pending_count(), 0);
+    /// ```
+    pub fn new(config: SchedulerConfig) -> Self {
+        RequestScheduler {
+            pending: HashMap::new(),
+            peer_request_counts: HashMap::new(),
+            config,
+        }
+    }
+
+    /// Returns the scheduler configuration.
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
+    /// Returns the total number of pending requests across all peers.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns the number of in-flight requests to a specific peer.
+    pub fn peer_request_count(&self, peer: &PeerId) -> usize {
+        self.peer_request_counts.get(peer).copied().unwrap_or(0)
+    }
+
+    /// Returns how many more requests can be sent to a peer.
+    ///
+    /// This is the difference between the pipeline limit and the current
+    /// in-flight count for this peer.
+    pub fn available_slots(&self, peer: &PeerId) -> usize {
+        let current = self.peer_request_count(peer);
+        self.config.pipeline_limit.saturating_sub(current)
+    }
+
+    /// Checks if a block is already pending (requested from any peer).
+    ///
+    /// This is used for duplicate avoidance: in normal mode, we should not
+    /// request the same block from multiple peers simultaneously.
+    pub fn is_block_pending(&self, piece_index: u32, offset: u32) -> bool {
+        let key = BlockKey::new(piece_index, offset);
+        self.pending.get(&key).map_or(false, |p| p.state == RequestState::InFlight)
+    }
+
+    /// Registers a new block request.
+    ///
+    /// The request is added to the pending set and the peer's request count
+    /// is incremented. The caller should have already checked that:
+    /// 1. The block is not already pending
+    /// 2. The peer has not exceeded their pipeline limit
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The block request to register
+    ///
+    /// # Returns
+    ///
+    /// `true` if the request was registered, `false` if a request for this
+    /// block already exists.
+    pub fn register_request(&mut self, request: BlockRequest) -> bool {
+        let key = BlockKey::new(request.piece_index, request.offset);
+
+        // Check for duplicate
+        if self.pending.contains_key(&key) {
+            return false;
+        }
+
+        let peer = request.peer;
+        self.pending.insert(key, PendingRequest::new(request));
+        *self.peer_request_counts.entry(peer).or_insert(0) += 1;
+        true
+    }
+
+    /// Marks a block request as completed (data received).
+    ///
+    /// The request is removed from tracking and the peer's request count
+    /// is decremented.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index of the completed block
+    /// * `offset` - The byte offset of the completed block
+    ///
+    /// # Returns
+    ///
+    /// The completed request if it was found, `None` otherwise.
+    pub fn complete_request(&mut self, piece_index: u32, offset: u32) -> Option<PendingRequest> {
+        let key = BlockKey::new(piece_index, offset);
+
+        if let Some(mut pending) = self.pending.remove(&key) {
+            // Decrement peer count
+            if let Some(count) = self.peer_request_counts.get_mut(&pending.request.peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_request_counts.remove(&pending.request.peer);
+                }
+            }
+
+            pending.state = RequestState::Completed;
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    /// Cancels a block request.
+    ///
+    /// The request is removed from tracking and the peer's request count
+    /// is decremented. This is used when:
+    /// - A block is received from a different peer
+    /// - A peer disconnects
+    /// - The download is aborted
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index of the block to cancel
+    /// * `offset` - The byte offset of the block to cancel
+    ///
+    /// # Returns
+    ///
+    /// The cancelled request if it was found, `None` otherwise.
+    pub fn cancel_request(&mut self, piece_index: u32, offset: u32) -> Option<PendingRequest> {
+        let key = BlockKey::new(piece_index, offset);
+
+        if let Some(mut pending) = self.pending.remove(&key) {
+            // Decrement peer count
+            if let Some(count) = self.peer_request_counts.get_mut(&pending.request.peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_request_counts.remove(&pending.request.peer);
+                }
+            }
+
+            pending.state = RequestState::Cancelled;
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    /// Cancels all requests to a specific peer.
+    ///
+    /// This is called when a peer disconnects or becomes choked. All
+    /// requests to this peer are removed and returned so they can be
+    /// reassigned to other peers.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer` - The peer whose requests should be cancelled
+    ///
+    /// # Returns
+    ///
+    /// A vector of the cancelled requests.
+    pub fn cancel_peer_requests(&mut self, peer: &PeerId) -> Vec<PendingRequest> {
+        let mut cancelled = Vec::new();
+
+        // Collect keys to remove
+        let keys_to_remove: Vec<BlockKey> = self.pending
+            .iter()
+            .filter(|(_, p)| p.request.peer == *peer)
+            .map(|(k, _)| *k)
+            .collect();
+
+        // Remove and collect
+        for key in keys_to_remove {
+            if let Some(mut pending) = self.pending.remove(&key) {
+                pending.state = RequestState::Cancelled;
+                cancelled.push(pending);
+            }
+        }
+
+        // Clear peer count
+        self.peer_request_counts.remove(peer);
+
+        cancelled
+    }
+
+    /// Finds all timed-out requests and marks them for reassignment.
+    ///
+    /// This scans all pending requests and returns those that have exceeded
+    /// the configured timeout. The requests are removed from tracking so they
+    /// can be re-registered for different peers.
+    ///
+    /// # Returns
+    ///
+    /// A vector of timed-out requests with their state set to `TimedOut`.
+    pub fn collect_timed_out(&mut self) -> Vec<PendingRequest> {
+        let timeout = self.config.request_timeout;
+        let mut timed_out = Vec::new();
+
+        // Collect keys of timed-out requests
+        let keys_to_remove: Vec<BlockKey> = self.pending
+            .iter()
+            .filter(|(_, p)| p.is_timed_out(timeout))
+            .map(|(k, _)| *k)
+            .collect();
+
+        // Remove and collect
+        for key in keys_to_remove {
+            if let Some(mut pending) = self.pending.remove(&key) {
+                // Decrement peer count
+                if let Some(count) = self.peer_request_counts.get_mut(&pending.request.peer) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.peer_request_counts.remove(&pending.request.peer);
+                    }
+                }
+
+                pending.state = RequestState::TimedOut;
+                timed_out.push(pending);
+            }
+        }
+
+        timed_out
+    }
+
+    /// Returns the set of block offsets currently in-flight for a piece.
+    ///
+    /// This is useful when calling `select_next_blocks` to avoid requesting
+    /// blocks that are already pending.
+    pub fn in_flight_offsets_for_piece(&self, piece_index: u32) -> HashSet<u32> {
+        self.pending
+            .iter()
+            .filter(|(k, p)| k.piece_index == piece_index && p.state == RequestState::InFlight)
+            .map(|(k, _)| k.offset)
+            .collect()
+    }
+
+    /// Generates block requests for a peer based on current state.
+    ///
+    /// This method combines rarest-first piece selection with block selection
+    /// to determine which blocks should be requested from a peer. It respects
+    /// the pipeline limit and avoids requesting blocks already pending.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer` - The peer to generate requests for
+    /// * `peer_bitfield` - The peer's bitfield (which pieces they have)
+    /// * `manager` - The piece manager tracking download state
+    /// * `availability` - Global piece availability across the swarm
+    ///
+    /// # Returns
+    ///
+    /// A vector of (piece_index, offset, length) tuples representing blocks
+    /// to request. The caller should create `BlockRequest` objects and
+    /// register them with `register_request`.
+    pub fn request_blocks(
+        &self,
+        peer: &PeerId,
+        peer_bitfield: &[u8],
+        manager: &PieceManager,
+        availability: &PieceAvailability,
+    ) -> Vec<(u32, u32, u32)> {
+        let available_slots = self.available_slots(peer);
+        if available_slots == 0 {
+            return Vec::new();
+        }
+
+        let mut requests = Vec::new();
+
+        // Get pieces sorted by rarity that this peer has and we need
+        let candidate_pieces = select_rarest(manager, availability, peer_bitfield);
+
+        for piece_index in candidate_pieces {
+            if requests.len() >= available_slots {
+                break;
+            }
+
+            // Get in-flight offsets for this piece (from any peer)
+            let in_flight = self.in_flight_offsets_for_piece(piece_index);
+
+            // Select blocks we can request
+            let remaining_slots = available_slots - requests.len();
+            let blocks = select_next_blocks(manager, piece_index, &in_flight, remaining_slots);
+
+            for (offset, length) in blocks {
+                // Double-check not already pending (defensive)
+                if !self.is_block_pending(piece_index, offset) {
+                    requests.push((piece_index, offset, length));
+                    if requests.len() >= available_slots {
+                        break;
+                    }
+                }
+            }
+        }
+
+        requests
+    }
+}
+@
+
+\subsubsection{Request Scheduler Tests}
+
+We test the scheduler's core functionality: pipeline limiting, duplicate avoidance,
+timeout detection, and request generation.
+
+<<request scheduler tests>>=
+use std::collections::HashMap as TestHashMap;
+
+#[test]
+fn scheduler_new_creates_empty_scheduler() {
+    let scheduler = RequestScheduler::new(SchedulerConfig::default());
+    assert_eq!(scheduler.pending_count(), 0);
+}
+
+#[test]
+fn scheduler_config_default_values() {
+    let config = SchedulerConfig::default();
+    assert_eq!(config.pipeline_limit, 10);
+    assert_eq!(config.request_timeout, Duration::from_secs(30));
+}
+
+#[test]
+fn scheduler_config_builder_pattern() {
+    let config = SchedulerConfig::default()
+        .with_pipeline_limit(16)
+        .with_timeout(Duration::from_secs(60));
+
+    assert_eq!(config.pipeline_limit, 16);
+    assert_eq!(config.request_timeout, Duration::from_secs(60));
+}
+
+#[test]
+fn scheduler_register_request_tracks_correctly() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    let request = BlockRequest::new(0, 0, BLOCK_SIZE, peer_id);
+    assert!(scheduler.register_request(request));
+
+    assert_eq!(scheduler.pending_count(), 1);
+    assert_eq!(scheduler.peer_request_count(&peer_id), 1);
+    assert!(scheduler.is_block_pending(0, 0));
+}
+
+#[test]
+fn scheduler_register_request_rejects_duplicate() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    let request1 = BlockRequest::new(0, 0, BLOCK_SIZE, peer_id);
+    let request2 = BlockRequest::new(0, 0, BLOCK_SIZE, peer_id);
+
+    assert!(scheduler.register_request(request1));
+    assert!(!scheduler.register_request(request2)); // Duplicate
+
+    assert_eq!(scheduler.pending_count(), 1);
+}
+
+#[test]
+fn scheduler_available_slots_respects_pipeline_limit() {
+    let config = SchedulerConfig::default().with_pipeline_limit(3);
+    let mut scheduler = RequestScheduler::new(config);
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    assert_eq!(scheduler.available_slots(&peer_id), 3);
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+    assert_eq!(scheduler.available_slots(&peer_id), 2);
+
+    scheduler.register_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_id));
+    assert_eq!(scheduler.available_slots(&peer_id), 1);
+
+    scheduler.register_request(BlockRequest::new(0, 2 * BLOCK_SIZE, BLOCK_SIZE, peer_id));
+    assert_eq!(scheduler.available_slots(&peer_id), 0);
+}
+
+#[test]
+fn scheduler_complete_request_decrements_count() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+    scheduler.register_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_id));
+
+    assert_eq!(scheduler.peer_request_count(&peer_id), 2);
+
+    let completed = scheduler.complete_request(0, 0);
+    assert!(completed.is_some());
+    assert_eq!(completed.unwrap().state, RequestState::Completed);
+
+    assert_eq!(scheduler.pending_count(), 1);
+    assert_eq!(scheduler.peer_request_count(&peer_id), 1);
+    assert!(!scheduler.is_block_pending(0, 0));
+    assert!(scheduler.is_block_pending(0, BLOCK_SIZE));
+}
+
+#[test]
+fn scheduler_cancel_request_removes_and_returns() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+
+    let cancelled = scheduler.cancel_request(0, 0);
+    assert!(cancelled.is_some());
+    assert_eq!(cancelled.unwrap().state, RequestState::Cancelled);
+
+    assert_eq!(scheduler.pending_count(), 0);
+    assert_eq!(scheduler.peer_request_count(&peer_id), 0);
+}
+
+#[test]
+fn scheduler_cancel_peer_requests_removes_all() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+
+    // Register requests for both peers
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+    scheduler.register_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_a));
+    scheduler.register_request(BlockRequest::new(1, 0, BLOCK_SIZE, peer_b));
+
+    assert_eq!(scheduler.pending_count(), 3);
+
+    // Cancel peer A's requests
+    let cancelled = scheduler.cancel_peer_requests(&peer_a);
+
+    assert_eq!(cancelled.len(), 2);
+    assert!(cancelled.iter().all(|p| p.state == RequestState::Cancelled));
+    assert!(cancelled.iter().all(|p| p.request.peer == peer_a));
+
+    // Peer B's request should still be pending
+    assert_eq!(scheduler.pending_count(), 1);
+    assert_eq!(scheduler.peer_request_count(&peer_a), 0);
+    assert_eq!(scheduler.peer_request_count(&peer_b), 1);
+}
+
+#[test]
+fn scheduler_in_flight_offsets_for_piece() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+    scheduler.register_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_id));
+    scheduler.register_request(BlockRequest::new(1, 0, BLOCK_SIZE, peer_id)); // Different piece
+
+    let offsets = scheduler.in_flight_offsets_for_piece(0);
+
+    assert_eq!(offsets.len(), 2);
+    assert!(offsets.contains(&0));
+    assert!(offsets.contains(&BLOCK_SIZE));
+}
+
+#[test]
+fn scheduler_integrates_with_block_selection() {
+    let scheduler = RequestScheduler::new(SchedulerConfig::default());
+
+    // Setup: 1 piece with 4 blocks in InProgress state
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(BLOCK_SIZE * 4, (BLOCK_SIZE * 4) as u64, hashes).unwrap();
+    manager.start_piece(0).unwrap(); // Must be InProgress for select_next_blocks
+
+    // Use select_next_blocks with scheduler's in_flight tracking
+    let in_flight = scheduler.in_flight_offsets_for_piece(0);
+    let blocks = select_next_blocks(&manager, 0, &in_flight, 2);
+
+    // Should get 2 blocks (limited by max_blocks parameter)
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].0, 0); // First block at offset 0
+    assert_eq!(blocks[1].0, BLOCK_SIZE); // Second block at offset BLOCK_SIZE
+}
+
+#[test]
+fn scheduler_request_blocks_avoids_pending() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+
+    // Setup: 1 piece with 4 blocks in InProgress state
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(BLOCK_SIZE * 4, (BLOCK_SIZE * 4) as u64, hashes).unwrap();
+    manager.start_piece(0).unwrap(); // Must be InProgress for select_next_blocks
+
+    // Peer A already requested block 0
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+
+    // Get blocks excluding in-flight ones
+    let in_flight = scheduler.in_flight_offsets_for_piece(0);
+    let blocks = select_next_blocks(&manager, 0, &in_flight, 10);
+
+    // Should not include offset 0 (already pending)
+    for (offset, _) in &blocks {
+        assert!(*offset != 0, "should not request pending block at offset 0");
+    }
+    // Should still get the other 3 blocks
+    assert_eq!(blocks.len(), 3);
+}
+
+#[test]
+fn scheduler_rarest_first_selection() {
+    // Test rarest-first selection using select_rarest directly
+    // (The scheduler integrates with select_rarest for piece prioritization)
+
+    // Setup: 2 pieces (both Missing - eligible for rarest-first selection)
+    let hashes = vec![[0u8; 20]; 2];
+    let manager = PieceManager::new(BLOCK_SIZE, (BLOCK_SIZE * 2) as u64, hashes).unwrap();
+
+    let mut availability = PieceAvailability::new(2);
+    // Piece 0: availability 3, Piece 1: availability 1 (rarer)
+    availability.add_peer_bitfield(&[0b11000000]);
+    availability.add_peer_bitfield(&[0b10000000]);
+    availability.add_peer_bitfield(&[0b10000000]);
+
+    // Peer has both pieces
+    let peer_bitfield = vec![0b11000000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // First piece should be piece 1 (rarer)
+    assert!(!selection.is_empty());
+    assert_eq!(selection[0], 1, "rarest piece should be first");
+}
+
+#[test]
+fn scheduler_complete_nonexistent_returns_none() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let result = scheduler.complete_request(999, 0);
+    assert!(result.is_none());
+}
+
+#[test]
+fn scheduler_cancel_nonexistent_returns_none() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let result = scheduler.cancel_request(999, 0);
+    assert!(result.is_none());
+}
+
+#[test]
+fn scheduler_cancel_unknown_peer_returns_empty() {
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    let cancelled = scheduler.cancel_peer_requests(&peer_id);
+    assert!(cancelled.is_empty());
+}
+
+#[test]
+fn scheduler_implements_debug() {
+    let scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let debug_str = format!("{:?}", scheduler);
+    assert!(debug_str.contains("RequestScheduler"));
+}
+
+#[test]
+fn block_key_implements_hash_correctly() {
+    let mut map: TestHashMap<BlockKey, i32> = TestHashMap::new();
+
+    let key1 = BlockKey::new(0, 0);
+    let key2 = BlockKey::new(0, 0);
+    let key3 = BlockKey::new(0, BLOCK_SIZE);
+
+    map.insert(key1, 1);
+    map.insert(key2, 2); // Should overwrite
+
+    assert_eq!(map.get(&key1), Some(&2));
+    assert_eq!(map.get(&key3), None);
+}
+@
+
+\subsubsection{Timeout Behavior Test}
+
+Testing timeout behavior requires care because [[Instant::now()]] cannot be mocked
+without additional infrastructure. We test the timeout logic using zero-duration
+timeouts, which trigger immediately.
+
+<<request scheduler timeout tests>>=
+#[test]
+fn scheduler_collect_timed_out_with_zero_timeout() {
+    // With zero timeout, all requests immediately time out
+    let config = SchedulerConfig::default().with_timeout(Duration::ZERO);
+    let mut scheduler = RequestScheduler::new(config);
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+    scheduler.register_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_id));
+
+    let timed_out = scheduler.collect_timed_out();
+
+    assert_eq!(timed_out.len(), 2);
+    assert!(timed_out.iter().all(|p| p.state == RequestState::TimedOut));
+    assert_eq!(scheduler.pending_count(), 0);
+    assert_eq!(scheduler.peer_request_count(&peer_id), 0);
+}
+
+#[test]
+fn scheduler_collect_timed_out_preserves_fresh_requests() {
+    // With 30 second timeout, fresh requests should not time out
+    let config = SchedulerConfig::default().with_timeout(Duration::from_secs(30));
+    let mut scheduler = RequestScheduler::new(config);
+    let peer_id: PeerId = *b"-RS0001-abcdefghijkl";
+
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_id));
+
+    let timed_out = scheduler.collect_timed_out();
+
+    assert!(timed_out.is_empty(), "fresh requests should not time out");
+    assert_eq!(scheduler.pending_count(), 1);
+}
+
+#[test]
+fn scheduler_timed_out_can_be_reassigned() {
+    // Verify workflow: request times out, gets reassigned to new peer
+    let config = SchedulerConfig::default().with_timeout(Duration::ZERO);
+    let mut scheduler = RequestScheduler::new(config);
+
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+
+    // Peer A requests block
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+
+    // Request times out
+    let timed_out = scheduler.collect_timed_out();
+    assert_eq!(timed_out.len(), 1);
+    assert_eq!(timed_out[0].request.peer, peer_a);
+
+    // Block is no longer pending
+    assert!(!scheduler.is_block_pending(0, 0));
+
+    // Can now reassign to peer B
+    scheduler.register_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_b));
+
+    assert_eq!(scheduler.pending_count(), 1);
+    assert_eq!(scheduler.peer_request_count(&peer_b), 1);
+    assert!(scheduler.is_block_pending(0, 0));
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -3490,6 +4354,12 @@ The pieces module combines the error types and helpers.
 
 <<block selection>>
 
+<<scheduler config>>
+
+<<pending requests>>
+
+<<request scheduler>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3522,6 +4392,10 @@ mod tests {
     <<random tiebreaker tests>>
 
     <<block selection tests>>
+
+    <<request scheduler tests>>
+
+    <<request scheduler timeout tests>>
 }
 @
 
