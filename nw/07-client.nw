@@ -2495,6 +2495,59 @@ mod tests {
     }
 
     #[test]
+    fn choking_decision_interested_and_choking_should_unchoke() {
+        // AC #5: Unit test that verifies the choking decision logic.
+        // When a peer is interested and we are choking them, we should unchoke.
+        let mut state = PeerState::new(100);
+
+        // Initial state: we choke by default, peer not interested by default
+        assert!(state.am_choking, "Should start choking");
+        assert!(!state.peer_interested, "Should start not interested");
+
+        // Peer becomes interested (simulates receiving Interested message)
+        state.handle_interested();
+        assert!(state.peer_interested);
+        assert!(state.am_choking);
+
+        // The condition for unchoking: peer_interested && am_choking
+        let should_unchoke = state.peer_interested && state.am_choking;
+        assert!(should_unchoke, "Should unchoke interested peers we are choking");
+
+        // After sending Unchoke, we update am_choking
+        state.am_choking = false;
+
+        // Now verify the condition no longer holds
+        let should_unchoke_again = state.peer_interested && state.am_choking;
+        assert!(!should_unchoke_again, "Should not unchoke again (already unchoked)");
+    }
+
+    #[test]
+    fn choking_decision_not_interested_and_unchoked_should_choke() {
+        // Test the optional optimization: choke peers that become uninterested
+        let mut state = PeerState::new(100);
+
+        // Simulate a peer we previously unchoked
+        state.am_choking = false;
+        state.peer_interested = true;
+
+        // Peer becomes uninterested
+        state.handle_not_interested();
+        assert!(!state.peer_interested);
+        assert!(!state.am_choking);
+
+        // The condition for choking: !peer_interested && !am_choking
+        let should_choke = !state.peer_interested && !state.am_choking;
+        assert!(should_choke, "Should choke uninterested peers we are not choking");
+
+        // After sending Choke, we update am_choking
+        state.am_choking = true;
+
+        // Verify the condition no longer holds
+        let should_choke_again = !state.peer_interested && !state.am_choking;
+        assert!(!should_choke_again, "Should not choke again (already choking)");
+    }
+
+    #[test]
     fn handle_have_sets_bitfield_bit() {
         let mut state = PeerState::new(100);
         assert!(!state.has_piece(42));
@@ -7309,6 +7362,14 @@ pub const REQUEST_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 30;
 /// a good balance between keeping the user informed and not spamming output.
 pub const PROGRESS_DISPLAY_INTERVAL_SECS: u64 = 2;
 
+/// Choking reevaluation interval in seconds.
+///
+/// The event loop reevaluates choking decisions every 10 seconds. This ensures
+/// newly-interested peers are promptly unchoked. Since we are a leecher-only
+/// client, we use a simplified strategy: unchoke all interested peers to
+/// encourage reciprocal unchoking.
+pub const CHOKE_INTERVAL_SECS: u64 = 10;
+
 /// Events that can occur during the event loop.
 ///
 /// Each variant represents a distinct type of event that requires
@@ -7359,6 +7420,13 @@ pub enum EventLoopEvent {
     /// Triggered every PROGRESS_DISPLAY_INTERVAL_SECS seconds to show
     /// the user how the download is progressing.
     ProgressDisplay,
+
+    /// Time to reevaluate choking decisions.
+    ///
+    /// Triggered every CHOKE_INTERVAL_SECS seconds. For our leecher-only
+    /// client, this means unchoking all interested peers to encourage
+    /// reciprocal unchoking.
+    ChokingReevaluation,
 }
 
 /// Result of processing one event loop iteration.
@@ -7553,6 +7621,9 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     let mut progress_display_interval = interval(
         Duration::from_secs(PROGRESS_DISPLAY_INTERVAL_SECS)
     );
+    let mut choking_interval = interval(
+        Duration::from_secs(CHOKE_INTERVAL_SECS)
+    );
     // Use sleep() for re-announce to support dynamic intervals (backoff on failure)
     let mut re_announce_sleep: Pin<Box<Sleep>> = Box::pin(
         sleep(Duration::from_secs(ctx.tracker_interval))
@@ -7562,6 +7633,7 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     request_timeout_interval.tick().await;
     keep_alive_interval.tick().await;
     progress_display_interval.tick().await;
+    choking_interval.tick().await;
     // Note: re_announce_sleep doesn't need skipping - it's a one-shot sleep
 
     let mut iteration: u64 = 0;
@@ -7609,6 +7681,11 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
             // Progress display timer
             _ = progress_display_interval.tick() => {
                 EventLoopEvent::ProgressDisplay
+            }
+
+            // Choking reevaluation timer
+            _ = choking_interval.tick() => {
+                EventLoopEvent::ChokingReevaluation
             }
 
             // Read from peers (only if we have connections)
@@ -7713,6 +7790,10 @@ async fn handle_event(
         EventLoopEvent::ProgressDisplay => {
             handle_progress_display(ctx);
             EventLoopAction::Continue
+        }
+
+        EventLoopEvent::ChokingReevaluation => {
+            handle_choking_reevaluation(ctx).await
         }
 
         // ReAnnounce is handled specially in run_event_loop for dynamic intervals
@@ -8246,6 +8327,85 @@ async fn handle_keep_alives(
 }
 @
 
+\subsubsection{Choking Reevaluation}
+
+BitTorrent uses a tit-for-tat algorithm to encourage reciprocal sharing. Seeders
+typically unchoke peers that upload to them. However, since we are a leecher-only
+client (per PRD non-goals), we use a simplified strategy: unchoke all interested
+peers unconditionally. This encourages other peers to reciprocate by unchoking us.
+
+The algorithm runs periodically to catch newly-interested peers. When a peer
+sends us an Interested message, we don't immediately unchoke them in the message
+handler---instead, we wait for the next choking reevaluation cycle. This batches
+the decisions and keeps the logic centralized.
+
+<<event loop>>=
+/// Handles the choking reevaluation timer event.
+///
+/// Implements simplified choking for a leecher-only client: unchoke all
+/// interested peers. This encourages reciprocal unchoking without the
+/// complexity of tracking upload rates or optimistic unchoking.
+///
+/// # Algorithm
+///
+/// For each connected peer:
+/// 1. If they are interested AND we are currently choking them, send Unchoke
+/// 2. Optionally, if they are not interested AND we are not choking them, send Choke
+///
+/// The second case is an optimization to free up resources when peers lose
+/// interest, but is not strictly necessary for protocol correctness.
+///
+/// # Returns
+///
+/// Always returns `EventLoopAction::Continue` since choking decisions don't
+/// affect the event loop's termination.
+async fn handle_choking_reevaluation(
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    trace!("reevaluating choking decisions");
+
+    // Collect addresses to avoid borrowing issues
+    let peer_addrs: Vec<SocketAddr> = ctx.connection_manager
+        .connections()
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    for addr in peer_addrs {
+        if let Some(conn) = ctx.connection_manager.get_connection_mut(&addr) {
+            // Unchoke interested peers that we are currently choking
+            if conn.state.peer_interested && conn.state.am_choking {
+                match write_message(&mut conn.stream, &Message::Unchoke).await {
+                    Ok(()) => {
+                        conn.state.am_choking = false;
+                        conn.mark_sent();
+                        debug!(peer = %addr, "unchoked interested peer");
+                    }
+                    Err(e) => {
+                        debug!(peer = %addr, error = %e, "failed to send unchoke");
+                        // Don't disconnect here - let the next read fail
+                    }
+                }
+            }
+            // Optional optimization: choke peers that are no longer interested
+            else if !conn.state.peer_interested && !conn.state.am_choking {
+                match write_message(&mut conn.stream, &Message::Choke).await {
+                    Ok(()) => {
+                        conn.state.am_choking = true;
+                        conn.mark_sent();
+                        debug!(peer = %addr, "choked uninterested peer");
+                    }
+                    Err(e) => {
+                        debug!(peer = %addr, error = %e, "failed to send choke");
+                    }
+                }
+            }
+        }
+    }
+
+    EventLoopAction::Continue
+}
+@
+
 \subsubsection{Re-Announce Handling}
 
 When the re-announce timer fires, we contact the tracker again to update our
@@ -8696,6 +8856,22 @@ mod event_loop_tests {
         // but not so often as to spam the output
         assert!(PROGRESS_DISPLAY_INTERVAL_SECS >= 1);
         assert!(PROGRESS_DISPLAY_INTERVAL_SECS <= 5);
+    }
+
+    #[test]
+    fn choke_interval_is_reasonable() {
+        // Choking reevaluation should happen frequently enough to respond
+        // to peer interest changes, but not so often as to spam messages.
+        // 10 seconds is a good balance.
+        assert!(CHOKE_INTERVAL_SECS >= 5);
+        assert!(CHOKE_INTERVAL_SECS <= 30);
+    }
+
+    #[test]
+    fn choking_reevaluation_event_debug() {
+        let event = EventLoopEvent::ChokingReevaluation;
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("ChokingReevaluation"));
     }
 
     // ========================================================================

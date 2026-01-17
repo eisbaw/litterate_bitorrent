@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-17 23:05'
+updated_date: '2026-01-17 23:07'
 labels:
   - cli
   - progress
@@ -53,32 +53,5 @@ Display download progress to the user in a clear, informative format. Users need
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented progress display for BitTorrent downloads.
-
-## Changes:
-- Added `ProgressDisplay` variant to `EventLoopEvent` enum
-- Added `PROGRESS_DISPLAY_INTERVAL_SECS` constant (2 seconds)
-- Added progress tracking fields to `EventLoopContext`:
-  - `last_progress_bytes` - bytes at last display
-  - `last_progress_time` - time of last display
-  - `download_start_time` - for total elapsed calculation
-- Added `handle_progress_display()` handler function
-- Added `format_speed()` for human-readable speed (B/s, KB/s, MB/s, GB/s)
-- Added `format_duration()` for human-readable ETA (seconds, minutes, hours, days)
-- Updated completion message to use consistent formatting
-
-## Progress Output Format:
-```
-42/100 pieces (42.0%) - 1.5 MB/s - ETA: 2m 30s
-```
-
-## Completion Message Format:
-```
-Download complete\! 1.24 GB in 5m 30s (avg 3.8 MB/s) - 100/100 pieces verified
-```
-
-## Testing:
-- Unit tests for `format_speed` at all unit boundaries
-- Unit tests for `format_duration` including edge cases
-- Verified progress interval is within reasonable bounds (1-5 seconds)
+Progress display via tracing INFO. format_speed/format_duration helpers. 2-second interval.
 <!-- SECTION:NOTES:END -->
