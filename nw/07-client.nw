@@ -453,6 +453,199 @@ impl PeerState {
     pub fn is_seeder(&self, num_pieces: u32) -> bool {
         self.piece_count() == num_pieces
     }
+
+    // ========================================================================
+    // Message Handlers
+    // ========================================================================
+    //
+    // These methods update PeerState in response to protocol messages received
+    // from the remote peer. Each handler corresponds to a specific message type
+    // and updates the relevant state fields.
+
+    /// Handle a `choke` message from the peer.
+    ///
+    /// When the peer chokes us, they are indicating they will not respond to
+    /// our block requests. We must:
+    /// 1. Set `peer_choking` to true
+    /// 2. Clear all pending requests (the peer has effectively cancelled them)
+    ///
+    /// The pending requests should be re-queued for other peers or re-requested
+    /// when this peer unchokes us. The caller is responsible for this recovery.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    /// state.peer_choking = false; // Simulate having been unchoked
+    ///
+    /// // Simulate some pending requests
+    /// // (In production, these would be BlockRequest structs)
+    ///
+    /// state.handle_choke();
+    /// assert!(state.peer_choking);
+    /// assert!(state.pending_requests.is_empty());
+    /// ```
+    pub fn handle_choke(&mut self) {
+        self.peer_choking = true;
+        self.pending_requests.clear();
+    }
+
+    /// Handle an `unchoke` message from the peer.
+    ///
+    /// When the peer unchokes us, they are indicating they will respond to
+    /// our block requests. This sets `peer_choking` to false, allowing
+    /// `can_request()` to return true (if we are also interested).
+    ///
+    /// After receiving an unchoke, the client can start sending block requests
+    /// to this peer. The request scheduler should prioritize this peer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    /// assert!(state.peer_choking); // Initially choked
+    ///
+    /// state.handle_unchoke();
+    /// assert!(!state.peer_choking);
+    /// ```
+    pub fn handle_unchoke(&mut self) {
+        self.peer_choking = false;
+    }
+
+    /// Handle an `interested` message from the peer.
+    ///
+    /// When the peer sends `interested`, they are indicating they want pieces
+    /// that we have. This sets `peer_interested` to true.
+    ///
+    /// In a seeding implementation, this would signal that we should consider
+    /// unchoking this peer to upload to them. Since this client does not
+    /// implement seeding (per non-goals), we track this state for protocol
+    /// completeness but don't act on it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    /// assert!(!state.peer_interested); // Initially not interested
+    ///
+    /// state.handle_interested();
+    /// assert!(state.peer_interested);
+    /// ```
+    pub fn handle_interested(&mut self) {
+        self.peer_interested = true;
+    }
+
+    /// Handle a `not interested` message from the peer.
+    ///
+    /// When the peer sends `not interested`, they are indicating they no longer
+    /// want pieces that we have. This sets `peer_interested` to false.
+    ///
+    /// In a seeding implementation, this would signal that we might want to
+    /// choke this peer to free up upload slots for interested peers.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    /// state.peer_interested = true; // Simulate having received interested
+    ///
+    /// state.handle_not_interested();
+    /// assert!(!state.peer_interested);
+    /// ```
+    pub fn handle_not_interested(&mut self) {
+        self.peer_interested = false;
+    }
+
+    /// Handle a `have` message from the peer.
+    ///
+    /// The `have` message indicates the peer has completed downloading and
+    /// verifying a piece. We update our bitfield to reflect this.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The piece index the peer now has
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the index was valid and the bit was set
+    /// * `false` if the index was out of bounds
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    /// assert!(!state.has_piece(42));
+    ///
+    /// assert!(state.handle_have(42)); // Valid index
+    /// assert!(state.has_piece(42));
+    ///
+    /// assert!(!state.handle_have(200)); // Invalid index (out of bounds)
+    /// ```
+    pub fn handle_have(&mut self, index: u32) -> bool {
+        // Delegate to set_piece which already handles bounds checking
+        self.set_piece(index)
+    }
+
+    /// Handle a `bitfield` message from the peer.
+    ///
+    /// The `bitfield` message is sent immediately after the handshake to indicate
+    /// which pieces the peer already has. We replace our empty bitfield with
+    /// the received one, after validating the length.
+    ///
+    /// # Arguments
+    ///
+    /// * `bits` - The bitfield bytes from the peer
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the bitfield was valid and accepted
+    /// * `Err(PeerError::BitfieldWrongLength)` if the length doesn't match
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `bits.len()` does not equal `self.bitfield.len()`.
+    /// This indicates a protocol violation: the peer's bitfield must have
+    /// exactly `ceil(num_pieces / 8)` bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(16); // 16 pieces = 2 bytes
+    ///
+    /// // Valid bitfield: peer has pieces 0, 8, and 15
+    /// let bits = vec![0b1000_0000, 0b1000_0001]; // 2 bytes
+    /// assert!(state.handle_bitfield(&bits).is_ok());
+    /// assert!(state.has_piece(0));
+    /// assert!(state.has_piece(8));
+    /// assert!(state.has_piece(15));
+    ///
+    /// // Invalid bitfield: wrong length
+    /// let bad_bits = vec![0xFF, 0xFF, 0xFF]; // 3 bytes, expected 2
+    /// let mut state2 = PeerState::new(16);
+    /// assert!(state2.handle_bitfield(&bad_bits).is_err());
+    /// ```
+    pub fn handle_bitfield(&mut self, bits: &[u8]) -> Result<(), crate::messages::PeerError> {
+        if bits.len() != self.bitfield.len() {
+            return Err(crate::messages::PeerError::BitfieldWrongLength {
+                expected: self.bitfield.len(),
+                actual: bits.len(),
+            });
+        }
+        self.bitfield.copy_from_slice(bits);
+        Ok(())
+    }
 }
 
 impl Default for PeerState {
@@ -476,6 +669,56 @@ impl Default for PeerState {
 The [[active\_peers]] map uses [[SocketAddr]] as the key because a peer is
 uniquely identified by their IP address and port. The [[PeerState]] struct
 tracks the 4-bit state machine that governs data flow with each peer.
+
+\subsection{Message Handlers}
+
+When the client receives protocol messages from a peer, it must update the
+[[PeerState]] accordingly. Each message type has a corresponding handler method
+that encapsulates the state transition logic. This separation keeps the message
+processing code clean and makes the state transitions explicit and testable.
+
+\subsubsection{Choke and Unchoke}
+
+The [[handle\_choke]] and [[handle\_unchoke]] methods update [[peer\_choking]].
+When we receive a [[choke]] message, we not only set the flag but also clear
+all pending requests---the peer has implicitly cancelled them. This is critical
+for correctness: we must re-request these blocks from other peers or re-request
+them from this peer after they unchoke us.
+
+\begin{verbatim}
+handle_choke:    peer_choking := true;  pending_requests.clear()
+handle_unchoke:  peer_choking := false
+\end{verbatim}
+
+The asymmetry is important: unchoke does not restore pending requests. Those
+blocks have been returned to the piece manager's available pool (by the caller)
+and will be re-requested through the normal scheduling logic.
+
+\subsubsection{Interest Messages}
+
+The [[handle\_interested]] and [[handle\_not\_interested]] methods update
+[[peer\_interested]]. These track whether the remote peer wants pieces from us.
+Since this client does not implement seeding (per project non-goals), we track
+this state for protocol completeness but don't use it for upload scheduling.
+
+\subsubsection{Have Message}
+
+The [[handle\_have]] method updates the bitfield when a peer announces they have
+completed a piece. We delegate to [[set\_piece]] which handles the bit manipulation
+and bounds checking. The method returns [[false]] if the piece index is invalid,
+allowing the caller to detect protocol violations.
+
+\subsubsection{Bitfield Message}
+
+The [[handle\_bitfield]] method replaces our empty bitfield with the one received
+from the peer. Unlike [[handle\_have]], this can fail: if the bitfield length
+doesn't match [[ceil(num\_pieces / 8)]], we return an error. This indicates a
+protocol violation or incompatible torrent file.
+
+The bitfield is typically sent immediately after the handshake, before any other
+messages. If a peer sends [[bitfield]] later, or sends multiple [[bitfield]]
+messages, that's a protocol violation. However, we handle the message whenever
+received---protocol enforcement is the caller's responsibility.
 
 \subsection{Client Construction}
 
@@ -1230,6 +1473,150 @@ mod tests {
         assert!(cloned.am_interested);
         assert!(cloned.has_piece(42));
     }
+
+    // ========================================================================
+    // Message Handler Tests
+    // ========================================================================
+
+    #[test]
+    fn handle_choke_sets_peer_choking_true() {
+        let mut state = PeerState::new(100);
+        state.peer_choking = false; // Start unchoked
+
+        state.handle_choke();
+        assert!(state.peer_choking, "handle_choke should set peer_choking to true");
+    }
+
+    #[test]
+    fn handle_choke_clears_pending_requests() {
+        use crate::pieces::BlockRequest;
+        use std::time::Instant;
+
+        let mut state = PeerState::new(100);
+        state.peer_choking = false;
+
+        // Create a dummy peer ID for the requests
+        let peer_id: [u8; 20] = *b"-LB0001-TestPeer1234";
+
+        // Add some pending requests
+        state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: 0,
+            length: 16384,
+            requested_at: Instant::now(),
+            peer: peer_id,
+        });
+        state.pending_requests.push_back(BlockRequest {
+            piece_index: 1,
+            offset: 0,
+            length: 16384,
+            requested_at: Instant::now(),
+            peer: peer_id,
+        });
+        assert_eq!(state.pending_requests.len(), 2);
+
+        state.handle_choke();
+        assert!(state.pending_requests.is_empty(), "handle_choke should clear pending_requests");
+    }
+
+    #[test]
+    fn handle_unchoke_sets_peer_choking_false() {
+        let mut state = PeerState::new(100);
+        assert!(state.peer_choking); // Starts true by default
+
+        state.handle_unchoke();
+        assert!(!state.peer_choking, "handle_unchoke should set peer_choking to false");
+    }
+
+    #[test]
+    fn handle_interested_sets_peer_interested_true() {
+        let mut state = PeerState::new(100);
+        assert!(!state.peer_interested); // Starts false by default
+
+        state.handle_interested();
+        assert!(state.peer_interested, "handle_interested should set peer_interested to true");
+    }
+
+    #[test]
+    fn handle_not_interested_sets_peer_interested_false() {
+        let mut state = PeerState::new(100);
+        state.peer_interested = true; // Start interested
+
+        state.handle_not_interested();
+        assert!(!state.peer_interested, "handle_not_interested should set peer_interested to false");
+    }
+
+    #[test]
+    fn handle_have_sets_bitfield_bit() {
+        let mut state = PeerState::new(100);
+        assert!(!state.has_piece(42));
+
+        let result = state.handle_have(42);
+        assert!(result, "handle_have should return true for valid index");
+        assert!(state.has_piece(42), "handle_have should set the piece bit");
+    }
+
+    #[test]
+    fn handle_have_returns_false_for_invalid_index() {
+        let mut state = PeerState::new(8); // Only 8 pieces
+
+        let result = state.handle_have(100); // Way out of bounds
+        assert!(!result, "handle_have should return false for invalid index");
+
+        let result = state.handle_have(8); // Just past the end
+        assert!(!result, "handle_have should return false for index == num_pieces");
+    }
+
+    #[test]
+    fn handle_bitfield_replaces_bitfield() {
+        let mut state = PeerState::new(16); // 2 bytes
+        assert_eq!(state.piece_count(), 0);
+
+        // Set all bits
+        let bits = vec![0xFF, 0xFF];
+        let result = state.handle_bitfield(&bits);
+        assert!(result.is_ok(), "handle_bitfield should succeed with correct length");
+        assert_eq!(state.piece_count(), 16);
+
+        // Verify specific pieces
+        assert!(state.has_piece(0));
+        assert!(state.has_piece(7));
+        assert!(state.has_piece(8));
+        assert!(state.has_piece(15));
+    }
+
+    #[test]
+    fn handle_bitfield_rejects_wrong_length() {
+        use crate::messages::PeerError;
+
+        let mut state = PeerState::new(16); // Expects 2 bytes
+
+        // Too short
+        let short_bits = vec![0xFF];
+        let result = state.handle_bitfield(&short_bits);
+        assert!(matches!(result, Err(PeerError::BitfieldWrongLength { expected: 2, actual: 1 })));
+
+        // Too long
+        let long_bits = vec![0xFF, 0xFF, 0xFF];
+        let result = state.handle_bitfield(&long_bits);
+        assert!(matches!(result, Err(PeerError::BitfieldWrongLength { expected: 2, actual: 3 })));
+    }
+
+    #[test]
+    fn handle_bitfield_preserves_partial_last_byte() {
+        // 10 pieces = 2 bytes (with 6 unused bits in last byte)
+        let mut state = PeerState::new(10);
+
+        // Set first 10 bits, leave unused bits as 0
+        let bits = vec![0xFF, 0b1100_0000]; // 8 + 2 = 10 pieces set
+        let result = state.handle_bitfield(&bits);
+        assert!(result.is_ok());
+
+        // Verify the 10 valid pieces
+        for i in 0..10 {
+            assert!(state.has_piece(i), "Piece {} should be set", i);
+        }
+    }
 }
 @
 
@@ -1242,6 +1629,15 @@ The tests verify each aspect of client construction:
 \item Integration with real torrent files works correctly
 \item PeerState correctly implements the 4-bit state machine
 \item PeerState bitfield operations work correctly
+\item Message handlers correctly update PeerState:
+  \begin{itemize}
+  \item [[handle\_choke]] sets [[peer\_choking]] and clears [[pending\_requests]]
+  \item [[handle\_unchoke]] clears [[peer\_choking]]
+  \item [[handle\_interested]] sets [[peer\_interested]]
+  \item [[handle\_not\_interested]] clears [[peer\_interested]]
+  \item [[handle\_have]] sets bitfield bits with bounds checking
+  \item [[handle\_bitfield]] replaces bitfield with length validation
+  \end{itemize}
 \end{itemize}
 
 \subsection{Graceful Shutdown}
