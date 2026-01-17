@@ -1,9 +1,11 @@
 ---
 id: task-0016
 title: Write Bencode chapter prose
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-01-16 21:27'
+updated_date: '2026-01-17 23:29'
 labels: []
 dependencies: []
 priority: high

@@ -8,6 +8,60 @@ BitTorrent protocol. Every \texttt{.torrent} file is bencoded, tracker responses
 are bencoded, and even some peer protocol extensions use bencode. Understanding
 bencode is therefore our first task.
 
+\subsection{Why Not JSON or XML?}
+
+Before diving into bencode's grammar, it's worth asking: why did Bram Cohen
+invent a new serialization format instead of using an existing one like JSON
+or XML? The answer lies in two properties that are essential for BitTorrent
+but not guaranteed by general-purpose formats: \emph{canonical encoding} and
+\emph{simplicity}.
+
+\paragraph{Canonical Encoding.}
+The most critical requirement is that bencode produces \emph{exactly one}
+byte sequence for any given logical value. Consider JSON: the objects
+\texttt{\{"a":1,"b":2\}} and \texttt{\{"b":2,"a":1\}} are semantically
+identical, but they produce different byte sequences. Similarly, integers
+can be written as \texttt{42}, \texttt{+42}, or \texttt{42.0}. Whitespace
+is optional and can appear almost anywhere. These variations are harmless
+for configuration files, but they are fatal for BitTorrent.
+
+Why? Because the \emph{info hash}---the unique identifier for a torrent---is
+computed by hashing the bencoded \texttt{info} dictionary. If two clients
+encoded the same logical dictionary differently, they would compute different
+hashes and be unable to find each other. The swarm would fragment based on
+implementation details rather than content.
+
+Bencode achieves canonical encoding through strict rules:
+\begin{itemize}
+\item Dictionary keys \emph{must} appear in sorted order (lexicographic by
+  raw bytes).
+\item Integers have exactly one representation (no leading zeros, no positive
+  sign, no negative zero).
+\item Byte strings are length-prefixed, leaving no room for escape sequences
+  or encoding variations.
+\item There is no optional whitespace anywhere in the format.
+\end{itemize}
+
+\paragraph{Simplicity.}
+Bencode is also remarkably simple to implement. The entire grammar fits in
+a few lines, and a complete encoder/decoder requires only a few hundred
+lines of code in most languages. This matters for a protocol that must run
+on embedded devices, be implemented by hobbyists, and remain stable for
+decades. Complex formats like XML require sophisticated parsers and have
+numerous edge cases; bencode has almost none.
+
+The simplicity also aids debugging: bencoded data is mostly human-readable.
+You can often understand a torrent file just by looking at its raw bytes,
+without special tools.
+
+\paragraph{Binary Safety.}
+Unlike JSON (which assumes UTF-8 strings), bencode's byte strings are
+arbitrary binary data. This is essential for storing SHA1 hashes (20 bytes
+of binary data), peer IDs, and other non-textual content. There's no need
+for Base64 encoding or other escaping mechanisms.
+
+With these motivations in mind, let's examine the format itself.
+
 \subsection{The Bencode Grammar}
 
 Bencode is refreshingly simple. It has exactly four data types:
@@ -36,6 +90,39 @@ The sorted-key requirement for dictionaries is critical: it ensures that
 any two encoders produce identical output for the same logical data. This
 property is essential for computing the info hash, which is a SHA1 hash
 of the bencoded info dictionary.
+
+\subsubsection{Formal Grammar (EBNF)}
+
+For those who prefer a formal specification, here is bencode expressed in
+Extended Backus-Naur Form:
+
+\begin{verbatim}
+value       ::= integer | bytes | list | dict
+integer     ::= 'i' int-value 'e'
+int-value   ::= '0' | '-'? nonzero digit*
+nonzero     ::= '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9'
+digit       ::= '0' | nonzero
+bytes       ::= length ':' <length octets>
+length      ::= '0' | nonzero digit*
+list        ::= 'l' value* 'e'
+dict        ::= 'd' (bytes value)* 'e'
+\end{verbatim}
+
+Note several constraints that the grammar encodes:
+\begin{enumerate}
+\item Integer values cannot have leading zeros (the [[int-value]] rule
+  produces either ``0'' or a number starting with a non-zero digit).
+\item Negative zero is forbidden: the optional minus sign only appears
+  before [[nonzero]], never before ``0''.
+\item String lengths cannot have leading zeros (same pattern as integers).
+\item Dictionary keys must be byte strings (the grammar directly references
+  [[bytes]], not [[value]]).
+\end{enumerate}
+
+The grammar does \emph{not} express the sorted-key constraint for dictionaries;
+that is a semantic requirement that cannot be captured in context-free grammar.
+Our decoder will accept unsorted keys (since [[BTreeMap]] sorts them anyway),
+but our encoder will always produce correctly sorted output.
 
 \subsection{The BencodeValue Type}
 
@@ -2201,9 +2288,31 @@ as a generator).
 \subsection{Encoding Bencode Values}
 
 Encoding is the inverse of decoding: we traverse a [[BencodeValue]] tree and
-produce a byte sequence following the bencode grammar. Encoding is simpler
-than decoding because we don't need to handle errors---a well-formed
-[[BencodeValue]] always produces valid bencode output.
+produce a byte sequence following the bencode grammar. Notice the symmetric
+structure between encoder and decoder: where the decoder inspects the first
+byte to dispatch to type-specific parsing functions, the encoder matches on
+the [[BencodeValue]] variant to dispatch to type-specific output logic.
+
+This symmetry is not accidental---it reflects the clean correspondence between
+the grammar and our data representation. Each grammar production becomes a
+decoder function (consuming bytes to produce a value) and an encoder arm
+(consuming a value to produce bytes):
+
+\begin{center}
+\begin{tabular}{lcl}
+\textbf{Grammar} & & \textbf{Code} \\
+\hline
+\texttt{integer} & $\leftrightarrow$ & [[decode\_integer]] / [[BencodeValue::Integer]] \\
+\texttt{bytes} & $\leftrightarrow$ & [[decode\_bytes]] / [[BencodeValue::Bytes]] \\
+\texttt{list} & $\leftrightarrow$ & [[decode\_list]] / [[BencodeValue::List]] \\
+\texttt{dict} & $\leftrightarrow$ & [[decode\_dict]] / [[BencodeValue::Dict]] \\
+\end{tabular}
+\end{center}
+
+Encoding is simpler than decoding because we don't need to handle errors---a
+well-formed [[BencodeValue]] always produces valid bencode output. There are
+no malformed inputs to reject, no unexpected bytes to diagnose. We simply
+walk the tree and emit bytes.
 
 The encoding rules mirror the grammar:
 
@@ -2330,3 +2439,61 @@ lists and dictionaries.
 One important property: because [[BTreeMap]] maintains keys in sorted order,
 dictionary encoding automatically produces canonical output. This is critical
 for computing the info hash, where the exact byte sequence matters.
+
+\subsection{The Round-Trip Property and Info Hash Computation}
+
+A well-implemented bencode library must satisfy the \emph{round-trip property}:
+for any valid bencode byte sequence $b$ and any [[BencodeValue]] $v$,
+
+\begin{align}
+\text{decode}(\text{encode}(v)) &= \text{Ok}(v) \label{eq:roundtrip1} \\
+\text{encode}(\text{decode}(b)) &= b \label{eq:roundtrip2}
+\end{align}
+
+Property~\eqref{eq:roundtrip1} states that encoding preserves semantics: we can
+always recover the original value from its encoding. Property~\eqref{eq:roundtrip2}
+is stronger---it states that our encoding is \emph{canonical}: there is exactly
+one byte sequence for any given value, and decoding then re-encoding produces
+that exact sequence.
+
+\paragraph{Why This Matters for BitTorrent.}
+The canonical encoding property is not merely aesthetic; it is essential for
+the protocol's operation. The \emph{info hash} is computed as follows:
+
+\begin{enumerate}
+\item Parse the \texttt{.torrent} file to extract the \texttt{info} dictionary.
+\item Re-encode that dictionary using the bencode encoder.
+\item Compute SHA1 of the resulting bytes.
+\end{enumerate}
+
+If our encoder produced different bytes than the original \texttt{.torrent}
+file's info section, we would compute the wrong hash. Our client would be
+unable to connect to the swarm because it would be looking for peers sharing
+a different (nonexistent) torrent.
+
+This is why property~\eqref{eq:roundtrip2} is so critical. When we decode
+the info dictionary from a torrent file and re-encode it, we \emph{must}
+get the exact same bytes. Any deviation---different key ordering, different
+integer formatting, anything---would produce a different hash.
+
+\paragraph{Verification Through Testing.}
+Our property-based tests (using [[proptest]]) verify both round-trip properties
+across thousands of randomly generated values. If either property fails, we
+have a bug that could cause real protocol failures. The test
+[[proptest\_roundtrip\_decode\_encode]] specifically checks canonical encoding:
+we encode a value, decode it, re-encode, and verify the bytes are identical.
+
+\paragraph{Implications for Implementation.}
+The round-trip requirement influenced several design decisions:
+
+\begin{itemize}
+\item We use [[BTreeMap]] rather than [[HashMap]] for dictionaries, ensuring
+  keys iterate in sorted order without explicit sorting during encoding.
+\item We reject leading zeros in integers and string lengths during decoding,
+  matching the strictness of canonical encoding.
+\item We use Rust's [[i64::to\_string()]] for integer encoding, which produces
+  the minimal representation (no leading zeros, no positive sign).
+\end{itemize}
+
+These choices ensure that our encoder produces the unique canonical form for
+any value, making round-trip through our implementation lossless.
