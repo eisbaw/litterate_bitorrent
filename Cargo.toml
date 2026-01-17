@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "fs", "signal"] }
 
 # HTTP client for tracker communication
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
