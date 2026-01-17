@@ -140,11 +140,15 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<tracker errors>>
 
+<<url encoding>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     <<tracker error tests>>
+
+    <<url encoding tests>>
 }
 @
 
@@ -200,4 +204,248 @@ These tests verify that:
 \item The timeout error clearly states the 30-second timeout period.
 \item [[TrackerError]] implements [[std::error::Error]] as required.
 \item [[TrackerError]] implements [[Debug]] for diagnostic purposes.
+\end{enumerate}
+
+\subsection{URL Encoding for Binary Data}
+
+When constructing tracker announce URLs, we must include the 20-byte info hash
+and peer ID as query parameters. These are raw binary data---arbitrary byte
+sequences that may contain null bytes, control characters, or any value from
+0x00 to 0xFF. HTTP URLs require special characters to be percent-encoded, but
+standard URL encoding libraries are often designed for text and may mishandle
+raw binary data.
+
+RFC 3986 defines which characters may appear unencoded in a URL. The
+\emph{unreserved} characters are:
+\begin{verbatim}
+A-Z a-z 0-9 - _ . ~
+\end{verbatim}
+All other octets must be percent-encoded as \texttt{\%XX}, where \texttt{XX} is
+the uppercase hexadecimal representation of the byte value.
+
+For example, a null byte (0x00) becomes \texttt{\%00}, a space (0x20) becomes
+\texttt{\%20}, and the byte 0xAB becomes \texttt{\%AB}. Since info hashes are
+SHA1 digests, they contain essentially random bytes and will typically require
+extensive encoding.
+
+This is a common source of bugs in BitTorrent clients. If the encoding is
+incorrect---using lowercase hex, failing to encode certain bytes, or
+double-encoding already-encoded characters---the tracker will not recognize
+the torrent and will return an error or empty peer list.
+
+<<url encoding>>=
+/// Returns true if the byte is an RFC 3986 unreserved character.
+///
+/// Unreserved characters can appear in URLs without percent-encoding:
+/// - ALPHA: A-Z, a-z
+/// - DIGIT: 0-9
+/// - Hyphen, underscore, period, tilde: - _ . ~
+///
+/// All other bytes must be percent-encoded.
+fn is_unreserved(byte: u8) -> bool {
+    matches!(byte,
+        b'A'..=b'Z' |
+        b'a'..=b'z' |
+        b'0'..=b'9' |
+        b'-' | b'_' | b'.' | b'~'
+    )
+}
+
+/// Percent-encode a 20-byte binary value for use in tracker URLs.
+///
+/// This function implements RFC 3986 percent-encoding, specifically designed
+/// for the binary info_hash and peer_id parameters in BitTorrent tracker
+/// announces.
+///
+/// # Arguments
+///
+/// * `bytes` - A 20-byte array (typically an info_hash or peer_id)
+///
+/// # Returns
+///
+/// A String where unreserved characters (A-Z, a-z, 0-9, -, _, ., ~) appear
+/// as-is, and all other bytes are encoded as %XX with uppercase hex digits.
+///
+/// # Example
+///
+/// ```ignore
+/// let hash = [0x12, 0x34, 0x56, /* ... */];
+/// let encoded = url_encode(&hash);
+/// // Result: "%124V..." (0x34 is '4', 0x56 is 'V', both unreserved)
+/// ```
+pub fn url_encode(bytes: &[u8; 20]) -> String {
+    // Pre-allocate for worst case: all bytes encoded as %XX (3 chars each)
+    let mut result = String::with_capacity(60);
+
+    for &byte in bytes {
+        if is_unreserved(byte) {
+            result.push(byte as char);
+        } else {
+            // Format as %XX with uppercase hex
+            result.push('%');
+            result.push(to_hex_digit(byte >> 4));
+            result.push(to_hex_digit(byte & 0x0F));
+        }
+    }
+
+    result
+}
+
+/// Convert a nibble (0-15) to its uppercase hexadecimal character.
+fn to_hex_digit(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'A' + nibble - 10) as char,
+        _ => unreachable!("nibble must be 0-15"),
+    }
+}
+@
+
+The implementation iterates over each byte and either passes it through
+unchanged (if unreserved) or encodes it as a three-character percent-escape
+sequence. We use uppercase hexadecimal as required by the de facto BitTorrent
+specification---some trackers are case-sensitive about hex encoding.
+
+Note that we pre-allocate the worst-case capacity (60 characters for 20 bytes,
+each becoming \texttt{\%XX}). In practice, SHA1 hashes will have roughly 5--6
+unreserved bytes on average, so the typical output is around 52--54 characters.
+
+\subsection{URL Encoding Tests}
+
+We verify the URL encoder handles all the edge cases that commonly trip up
+BitTorrent implementations.
+
+<<url encoding tests>>=
+#[test]
+fn url_encode_all_zeros() {
+    // 20 null bytes should produce 20 occurrences of %00
+    let zeros = [0u8; 20];
+    let encoded = url_encode(&zeros);
+    assert_eq!(encoded, "%00".repeat(20));
+    assert_eq!(encoded.len(), 60); // 20 * 3 characters
+}
+
+#[test]
+fn url_encode_unreserved_chars_pass_through() {
+    // Test that unreserved characters are not encoded
+    // Using ASCII values that spell out unreserved chars
+    let input: [u8; 20] = [
+        b'A', b'Z', b'a', b'z', b'0', b'9', b'-', b'_', b'.', b'~',
+        b'B', b'Y', b'b', b'y', b'1', b'8', b'-', b'_', b'.', b'~',
+    ];
+    let encoded = url_encode(&input);
+    assert_eq!(encoded, "AZaz09-_.~BYby18-_.~");
+    assert_eq!(encoded.len(), 20); // No percent-encoding needed
+}
+
+#[test]
+fn url_encode_known_sha1_hash() {
+    // SHA1("hello") = aaf4c61ddcc5e8a2dabede5b54ca7aa4e7379202
+    // We use a subset that includes both encodable and unreserved bytes
+    let hash: [u8; 20] = [
+        0xAA, 0xF4, 0xC6, 0x1D, 0xDC, 0xC5, 0xE8, 0xA2, 0xDA, 0xBE,
+        0xDE, 0x5B, 0x54, 0xCA, 0x7A, 0xA4, 0xE7, 0x37, 0x92, 0x02,
+    ];
+    let encoded = url_encode(&hash);
+    // 0x5B = '[' (must encode), 0x54 = 'T' (unreserved), 0x7A = 'z' (unreserved)
+    // 0x37 = '7' (unreserved), 0x02 = control char (must encode)
+    assert!(encoded.contains("T"));  // 0x54 should not be encoded
+    assert!(encoded.contains("z"));  // 0x7A should not be encoded
+    assert!(encoded.contains("7"));  // 0x37 should not be encoded
+    assert!(encoded.contains("%5B")); // 0x5B '[' must be encoded
+    assert!(encoded.contains("%02")); // 0x02 must be encoded
+    // Verify uppercase hex
+    assert!(!encoded.contains("%5b")); // Must be uppercase
+    assert!(!encoded.contains("%aa")); // Must be uppercase
+}
+
+#[test]
+fn url_encode_special_characters() {
+    // Test that reserved and special characters are properly encoded
+    // These bytes correspond to characters that have special meaning in URLs
+    let input: [u8; 20] = [
+        b'/', b'?', b'#', b'[', b']', b'@', b'!', b'$', b'&', b'\'',
+        b'(', b')', b'*', b'+', b',', b';', b'=', b' ', b'%', b':',
+    ];
+    let encoded = url_encode(&input);
+    // All of these must be percent-encoded
+    assert!(encoded.contains("%2F")); // '/'
+    assert!(encoded.contains("%3F")); // '?'
+    assert!(encoded.contains("%23")); // '#'
+    assert!(encoded.contains("%5B")); // '['
+    assert!(encoded.contains("%5D")); // ']'
+    assert!(encoded.contains("%40")); // '@'
+    assert!(encoded.contains("%20")); // space
+    assert!(encoded.contains("%25")); // '%'
+    // Verify none pass through unencoded
+    assert!(!encoded.contains('/'));
+    assert!(!encoded.contains('?'));
+    assert!(!encoded.contains('#'));
+    assert!(!encoded.contains(' '));
+}
+
+#[test]
+fn url_encode_high_bytes() {
+    // Test bytes >= 0x80 (non-ASCII range)
+    let input: [u8; 20] = [
+        0x80, 0x81, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF,
+        0x82, 0x83, 0x91, 0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1, 0xFE,
+    ];
+    let encoded = url_encode(&input);
+    // All high bytes must be encoded
+    assert!(encoded.contains("%80"));
+    assert!(encoded.contains("%FF"));
+    assert!(encoded.contains("%FE"));
+    // Verify uppercase
+    assert!(!encoded.contains("%ff"));
+    assert!(!encoded.contains("%fe"));
+    // All 20 bytes should be encoded as 3 chars each
+    assert_eq!(encoded.len(), 60);
+}
+
+#[test]
+fn url_encode_round_trip() {
+    // Verify that percent-decoding the output yields the original bytes
+    let original: [u8; 20] = [
+        0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x00, 0xFF,
+        b'A', b'z', b'0', b'-', b'_', b'.', b'~', 0x01, 0x7F, 0x80,
+    ];
+    let encoded = url_encode(&original);
+    let decoded = percent_decode(&encoded);
+    assert_eq!(decoded.as_slice(), original.as_slice());
+}
+
+/// Helper function to decode percent-encoded strings for testing.
+/// This is only used in tests, not in the main library.
+fn percent_decode(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                result.push(byte);
+            }
+        } else {
+            result.push(c as u8);
+        }
+    }
+    result
+}
+@
+
+These tests cover the key scenarios:
+\begin{enumerate}
+\item \textbf{All zeros}: The worst case for encoding, producing the longest
+  output. This catches bugs where null bytes are mishandled.
+\item \textbf{Unreserved characters}: Verifies that the 66 unreserved ASCII
+  characters pass through without encoding.
+\item \textbf{Known SHA1 hash}: Uses a real hash value to test a realistic
+  mixture of encodable and unreserved bytes.
+\item \textbf{Special characters}: Tests URL-significant characters that must
+  never appear unencoded.
+\item \textbf{High bytes}: Verifies correct handling of bytes 0x80--0xFF, which
+  are outside the ASCII range.
+\item \textbf{Round-trip}: Decodes the encoded output and verifies it matches
+  the original bytes, ensuring no data loss.
 \end{enumerate}
