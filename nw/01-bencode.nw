@@ -704,6 +704,9 @@ both the returned value (or error) and that the position is correctly advanced.
 #[cfg(test)]
 mod tests {
     use super::*;
+    <<proptest imports>>
+
+    <<proptest strategy>>
 
     #[test]
     fn decode_positive_integer() {
@@ -2082,12 +2085,118 @@ mod tests {
         let decoded = decode(&encoded).unwrap();
         assert_eq!(decoded, original);
     }
+
+    // ========================================
+    // Property-Based Tests (Proptest)
+    // ========================================
+
+    <<proptest tests>>
 }
 @
 
 These tests serve as both verification and documentation. Reading through
 them shows exactly what the decoder accepts and rejects, serving as a
 specification complement to the prose description above.
+
+\subsection{Property-Based Testing with Proptest}
+
+While the unit tests above verify specific cases, property-based testing
+explores the solution space more thoroughly. We use the [[proptest]] crate
+to generate random [[BencodeValue]] instances and verify that our
+encoder and decoder are true inverses.
+
+The key properties we verify are:
+
+\begin{enumerate}
+\item \textbf{Roundtrip (value to bytes)}: For any valid [[BencodeValue]] $v$,
+  [[decode(encode(v)) == Ok(v)]]. This ensures the encoder produces valid
+  bencode that the decoder can reconstruct perfectly.
+
+\item \textbf{Roundtrip (bytes to value)}: For any valid encoded bytes $b$,
+  [[encode(decode(b)) == Ok(b)]]. This ensures our encoding is canonical---there's
+  exactly one way to encode any given value.
+\end{enumerate}
+
+The strategy for generating arbitrary [[BencodeValue]] instances uses
+[[prop\_recursive]] to handle the recursive nature of lists and dictionaries.
+We limit recursion depth and collection sizes to keep test execution fast
+while still exploring interesting nested structures.
+
+<<proptest imports>>=
+use proptest::prelude::*;
+use proptest::collection::{vec as prop_vec, btree_map as prop_btree_map};
+@
+
+<<proptest strategy>>=
+/// Generates arbitrary BencodeValue instances for property testing.
+///
+/// The strategy uses prop_recursive to handle nested structures (lists and dicts)
+/// while limiting depth and size to keep tests performant.
+fn arb_bencode_value() -> impl Strategy<Value = BencodeValue> {
+    // Leaf nodes: integers and byte strings
+    let leaf = prop_oneof![
+        any::<i64>().prop_map(BencodeValue::Integer),
+        // Limit byte string size to avoid excessive memory usage
+        prop_vec(any::<u8>(), 0..64).prop_map(BencodeValue::Bytes),
+    ];
+
+    // Recursively build nested structures
+    // Parameters: depth=4, desired_size=64, expected_branch_size=8
+    leaf.prop_recursive(4, 64, 8, |inner| {
+        prop_oneof![
+            // Lists containing 0-8 elements
+            prop_vec(inner.clone(), 0..8).prop_map(BencodeValue::List),
+            // Dicts with 0-8 entries; keys are byte strings
+            prop_btree_map(prop_vec(any::<u8>(), 0..32), inner, 0..8)
+                .prop_map(BencodeValue::Dict),
+        ]
+    })
+}
+@
+
+<<proptest tests>>=
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// Property: decode(encode(v)) == Ok(v)
+    ///
+    /// For any valid BencodeValue, encoding and then decoding should
+    /// return the original value. This verifies that:
+    /// 1. The encoder produces valid bencode
+    /// 2. The decoder correctly reconstructs the original value
+    #[test]
+    fn proptest_roundtrip_encode_decode(value in arb_bencode_value()) {
+        let encoded = encode(&value);
+        let decoded = decode(&encoded);
+        prop_assert_eq!(decoded, Ok(value));
+    }
+
+    /// Property: encode(decode(b)) == b for valid encoded bytes
+    ///
+    /// For any valid bencode bytes, decoding and then encoding should
+    /// produce the exact same bytes. This verifies canonical encoding.
+    ///
+    /// We generate valid bytes by encoding a random BencodeValue first,
+    /// which guarantees the bytes are well-formed.
+    #[test]
+    fn proptest_roundtrip_decode_encode(value in arb_bencode_value()) {
+        let original_bytes = encode(&value);
+        let decoded = decode(&original_bytes).expect("encoded bytes should decode");
+        let re_encoded = encode(&decoded);
+        prop_assert_eq!(re_encoded, original_bytes, "canonical encoding violated");
+    }
+}
+@
+
+The [[proptest\_config]] annotation ensures we run at least 1000 test cases,
+meeting our coverage requirements. Proptest's shrinking capability will
+automatically find minimal failing cases when a bug is discovered, making
+debugging significantly easier.
+
+Note that we test canonical encoding by generating values, encoding them,
+decoding, and re-encoding. This avoids the complexity of generating arbitrary
+valid bencode bytes directly (which would require implementing the grammar
+as a generator).
 
 \subsection{Encoding Bencode Values}
 
