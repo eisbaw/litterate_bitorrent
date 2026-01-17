@@ -173,6 +173,10 @@ pub enum MetainfoError {
     /// The pieces field is malformed (not a multiple of 20 bytes).
     #[error("invalid piece hashes: {0}")]
     InvalidPieceHashes(String),
+
+    /// The multi-file torrent has an invalid files array.
+    #[error("invalid multi-file torrent: {0}")]
+    InvalidMultiFile(String),
 }
 @
 
@@ -188,6 +192,10 @@ These error variants cover the main parsing failure modes:
 \item \textbf{InvalidPieceHashes}: The ``pieces'' field isn't a valid
   concatenation of 20-byte SHA1 hashes. This happens when its length
   isn't a multiple of 20.
+
+\item \textbf{InvalidMultiFile}: The multi-file torrent's ``files'' array
+  is malformed. This can happen when entries lack required fields, have
+  invalid types, or contain empty paths.
 \end{itemize}
 
 \subsection{Module Structure}
@@ -226,6 +234,8 @@ use crate::bencode::{decode, encode, BencodeError, BencodeValue};
 <<parse pieces>>
 
 <<parse single file>>
+
+<<parse multi file>>
 
 <<parse function>>
 
@@ -310,6 +320,18 @@ fn get_value<'a>(
 ) -> Result<&'a BencodeValue, MetainfoError> {
     dict.get(key.as_bytes())
         .ok_or(MetainfoError::MissingField(key))
+}
+
+/// Extracts a list from a dictionary by key.
+fn get_list<'a>(
+    dict: &'a BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<&'a Vec<BencodeValue>, MetainfoError> {
+    match dict.get(key.as_bytes()) {
+        Some(BencodeValue::List(l)) => Ok(l),
+        Some(_) => Err(MetainfoError::MissingField(key)), // wrong type
+        None => Err(MetainfoError::MissingField(key)),
+    }
 }
 @
 
@@ -457,7 +479,141 @@ fn parse_single_file(
 
 The function returns both the file list (a single-element vector) and the total
 length. For single-file torrents, these are effectively the same, but returning
-both maintains consistency with how we'll handle multi-file torrents.
+both maintains consistency with how we handle multi-file torrents.
+
+\subsection{Parsing Multi-File Torrents}
+
+Multi-file torrents store file information differently from single-file torrents.
+Instead of a single [[length]] field, they have a [[files]] array. Each entry in
+this array is a dictionary with [[length]] (file size in bytes) and [[path]]
+(a list of path components).
+
+The [[name]] field in multi-file torrents specifies the root directory name.
+All file paths are relative to this directory. For example, a torrent with
+name ``mydir'' and a file with path [[["subdir", "file.txt"]]] would result
+in the path ``mydir/subdir/file.txt''.
+
+<<parse multi file>>=
+/// Parses file information for a multi-file torrent.
+///
+/// Multi-file torrents have a `files` array in the info dict. Each entry
+/// contains:
+/// - `length`: size of the file in bytes
+/// - `path`: list of path components (byte strings)
+///
+/// The torrent's `name` field becomes the root directory for all paths.
+///
+/// Returns a tuple of (files, total_length) where total_length is the
+/// sum of all individual file lengths.
+fn parse_multi_file(
+    info_dict: &BTreeMap<Vec<u8>, BencodeValue>,
+    name: &str,
+) -> Result<(Vec<FileInfo>, u64), MetainfoError> {
+    let files_list = get_list(info_dict, "files")?;
+
+    if files_list.is_empty() {
+        return Err(MetainfoError::InvalidMultiFile(
+            "files array is empty".to_string(),
+        ));
+    }
+
+    let mut files = Vec::with_capacity(files_list.len());
+    let mut total_length: u64 = 0;
+
+    for (index, file_entry) in files_list.iter().enumerate() {
+        // Each file entry must be a dictionary
+        let file_dict = match file_entry {
+            BencodeValue::Dict(d) => d,
+            _ => {
+                return Err(MetainfoError::InvalidMultiFile(format!(
+                    "file entry {} is not a dictionary",
+                    index
+                )));
+            }
+        };
+
+        // Extract file length
+        let length = get_int(file_dict, "length").map_err(|_| {
+            MetainfoError::InvalidMultiFile(format!(
+                "file entry {} missing or invalid length",
+                index
+            ))
+        })?;
+
+        if length < 0 {
+            return Err(MetainfoError::InvalidMultiFile(format!(
+                "file entry {} has negative length",
+                index
+            )));
+        }
+        let length = length as u64;
+
+        // Extract path components
+        let path_list = get_list(file_dict, "path").map_err(|_| {
+            MetainfoError::InvalidMultiFile(format!(
+                "file entry {} missing or invalid path",
+                index
+            ))
+        })?;
+
+        if path_list.is_empty() {
+            return Err(MetainfoError::InvalidMultiFile(format!(
+                "file entry {} has empty path",
+                index
+            )));
+        }
+
+        // Build the path from components
+        // Start with the torrent name as root directory
+        let mut path = PathBuf::from(name);
+
+        for (comp_index, component) in path_list.iter().enumerate() {
+            match component {
+                BencodeValue::Bytes(bytes) => {
+                    // Convert bytes to string for the path component
+                    // Use lossy conversion to handle non-UTF8 bytes
+                    let component_str = String::from_utf8_lossy(bytes);
+                    if component_str.is_empty() {
+                        return Err(MetainfoError::InvalidMultiFile(format!(
+                            "file entry {} has empty path component at index {}",
+                            index, comp_index
+                        )));
+                    }
+                    path.push(component_str.as_ref());
+                }
+                _ => {
+                    return Err(MetainfoError::InvalidMultiFile(format!(
+                        "file entry {} path component {} is not a byte string",
+                        index, comp_index
+                    )));
+                }
+            }
+        }
+
+        files.push(FileInfo { length, path });
+
+        // Accumulate total length, checking for overflow
+        total_length = total_length.checked_add(length).ok_or_else(|| {
+            MetainfoError::InvalidMultiFile("total length overflow".to_string())
+        })?;
+    }
+
+    Ok((files, total_length))
+}
+@
+
+The path building deserves careful attention. We start with the torrent's name
+as the root directory, then append each path component. This matches the
+BitTorrent specification where multi-file torrents create a directory structure.
+
+For path components, we use [[String::from\_utf8\_lossy]] to handle the common
+case where paths are valid UTF-8 (most filenames), while still accepting
+arbitrary byte sequences (the protocol allows any bytes). Invalid UTF-8
+sequences are replaced with the Unicode replacement character.
+
+We also validate that neither the path array nor individual components are
+empty, and check for potential overflow when accumulating the total length.
+These edge cases may seem unlikely, but malformed torrents exist in the wild.
 
 \subsection{The Main Parse Function}
 
@@ -471,6 +627,10 @@ constructing the [[Metainfo]] struct.
 /// This is the main entry point for parsing .torrent files. The input should
 /// be the complete contents of a .torrent file (bencoded dictionary).
 ///
+/// Supports both single-file torrents (with `length` field) and multi-file
+/// torrents (with `files` array). Multi-file torrents have the torrent name
+/// as the root directory, with file paths relative to that directory.
+///
 /// # Errors
 ///
 /// Returns an error if:
@@ -478,7 +638,8 @@ constructing the [[Metainfo]] struct.
 /// - Required fields are missing (announce, info, name, piece length, pieces)
 /// - The pieces length is not a multiple of 20
 /// - The piece length is invalid (zero or negative)
-/// - Single-file torrent is missing `length` field
+/// - Neither `length` nor `files` field is present
+/// - Multi-file torrent has malformed files array
 ///
 /// # Example
 ///
@@ -533,9 +694,11 @@ pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
     // Single-file has "length" in info dict; multi-file has "files" array
     let (files, total_length) = if info_dict.contains_key(b"length".as_ref()) {
         parse_single_file(info_dict, &name)?
+    } else if info_dict.contains_key(b"files".as_ref()) {
+        parse_multi_file(info_dict, &name)?
     } else {
-        // Multi-file format not yet implemented (task 0106)
-        return Err(MetainfoError::MissingField("length (multi-file not supported)"));
+        // Neither single-file nor multi-file format
+        return Err(MetainfoError::MissingField("length or files"));
     };
 
     // Compute the info hash from the info dictionary
@@ -969,6 +1132,389 @@ mod tests {
     /// Helper to format a hash as a hex string for error messages
     fn hex_string(hash: &[u8; 20]) -> String {
         hash.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    // ========================================
+    // Multi-File Torrent Parsing Tests
+    // ========================================
+
+    /// Helper to create a minimal valid multi-file torrent in bencode format.
+    ///
+    /// The structure is:
+    /// ```text
+    /// d
+    ///   8:announce <url>
+    ///   4:info d
+    ///     5:files l
+    ///       d 6:length <bytes> 4:path l <components> e e
+    ///       ...
+    ///     e
+    ///     4:name <directory name>
+    ///     12:piece length <bytes per piece>
+    ///     6:pieces <20 * N bytes of hashes>
+    ///   e
+    /// e
+    /// ```
+    fn make_multi_file_torrent(
+        announce: &str,
+        name: &str,
+        files: &[(i64, &[&str])], // (length, path components)
+        piece_length: i64,
+        pieces: &[u8],
+    ) -> Vec<u8> {
+        use crate::bencode::encode;
+
+        // Build files list
+        let mut files_list = Vec::new();
+        for (length, path_components) in files {
+            let mut file_entry = BTreeMap::new();
+            file_entry.insert(b"length".to_vec(), BencodeValue::Integer(*length));
+
+            let path_list: Vec<BencodeValue> = path_components
+                .iter()
+                .map(|s| BencodeValue::Bytes(s.as_bytes().to_vec()))
+                .collect();
+            file_entry.insert(b"path".to_vec(), BencodeValue::List(path_list));
+
+            files_list.push(BencodeValue::Dict(file_entry));
+        }
+
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), BencodeValue::List(files_list));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(name.as_bytes().to_vec()));
+        info.insert(
+            b"piece length".to_vec(),
+            BencodeValue::Integer(piece_length),
+        );
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(announce.as_bytes().to_vec()),
+        );
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        encode(&BencodeValue::Dict(root))
+    }
+
+    #[test]
+    fn parse_multi_file_torrent_single_file() {
+        // Multi-file torrent with a single file entry
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[(1024, &["file.txt"])];
+        let torrent = make_multi_file_torrent(
+            "http://tracker.example.com/announce",
+            "mydir",
+            files,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse multi-file torrent");
+
+        assert_eq!(metainfo.announce, "http://tracker.example.com/announce");
+        assert_eq!(metainfo.name, "mydir");
+        assert_eq!(metainfo.total_length, 1024);
+        assert_eq!(metainfo.files.len(), 1);
+        assert_eq!(metainfo.files[0].length, 1024);
+        assert_eq!(metainfo.files[0].path, PathBuf::from("mydir/file.txt"));
+    }
+
+    #[test]
+    fn parse_multi_file_torrent_multiple_files() {
+        // Multi-file torrent with multiple file entries
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[
+            (1000, &["file1.txt"]),
+            (2000, &["file2.txt"]),
+            (3000, &["file3.txt"]),
+        ];
+        let torrent = make_multi_file_torrent(
+            "http://example.com/announce",
+            "bundle",
+            files,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+
+        assert_eq!(metainfo.name, "bundle");
+        assert_eq!(metainfo.total_length, 6000); // 1000 + 2000 + 3000
+        assert_eq!(metainfo.files.len(), 3);
+        assert_eq!(metainfo.files[0].length, 1000);
+        assert_eq!(metainfo.files[0].path, PathBuf::from("bundle/file1.txt"));
+        assert_eq!(metainfo.files[1].length, 2000);
+        assert_eq!(metainfo.files[1].path, PathBuf::from("bundle/file2.txt"));
+        assert_eq!(metainfo.files[2].length, 3000);
+        assert_eq!(metainfo.files[2].path, PathBuf::from("bundle/file3.txt"));
+    }
+
+    #[test]
+    fn parse_multi_file_torrent_nested_directories() {
+        // Multi-file torrent with nested directory structure
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[
+            (100, &["subdir", "nested", "deep.txt"]),
+            (200, &["other", "file.dat"]),
+            (300, &["root.txt"]),
+        ];
+        let torrent = make_multi_file_torrent(
+            "http://example.com/announce",
+            "project",
+            files,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse nested directories");
+
+        assert_eq!(metainfo.files.len(), 3);
+        assert_eq!(
+            metainfo.files[0].path,
+            PathBuf::from("project/subdir/nested/deep.txt")
+        );
+        assert_eq!(
+            metainfo.files[1].path,
+            PathBuf::from("project/other/file.dat")
+        );
+        assert_eq!(metainfo.files[2].path, PathBuf::from("project/root.txt"));
+        assert_eq!(metainfo.total_length, 600);
+    }
+
+    #[test]
+    fn reject_multi_file_empty_files_array() {
+        // Empty files array should be rejected
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[];
+        let torrent = make_multi_file_torrent(
+            "http://example.com/announce",
+            "empty",
+            files,
+            16384,
+            &pieces,
+        );
+
+        let result = parse(&torrent);
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("empty"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_empty_path() {
+        // File entry with empty path array should be rejected
+        use crate::bencode::encode;
+
+        // Manually construct a torrent with empty path
+        let mut file_entry = BTreeMap::new();
+        file_entry.insert(b"length".to_vec(), BencodeValue::Integer(100));
+        file_entry.insert(b"path".to_vec(), BencodeValue::List(vec![])); // empty path
+
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), BencodeValue::List(vec![BencodeValue::Dict(file_entry)]));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("empty path"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_missing_length() {
+        // File entry without length field should be rejected
+        use crate::bencode::encode;
+
+        let mut file_entry = BTreeMap::new();
+        // No length field!
+        file_entry.insert(
+            b"path".to_vec(),
+            BencodeValue::List(vec![BencodeValue::Bytes(b"file.txt".to_vec())]),
+        );
+
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), BencodeValue::List(vec![BencodeValue::Dict(file_entry)]));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("length"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_missing_path() {
+        // File entry without path field should be rejected
+        use crate::bencode::encode;
+
+        let mut file_entry = BTreeMap::new();
+        file_entry.insert(b"length".to_vec(), BencodeValue::Integer(100));
+        // No path field!
+
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), BencodeValue::List(vec![BencodeValue::Dict(file_entry)]));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("path"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_non_dict_entry() {
+        // File entry that is not a dictionary should be rejected
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        // Files array contains an integer instead of a dict
+        info.insert(
+            b"files".to_vec(),
+            BencodeValue::List(vec![BencodeValue::Integer(42)]),
+        );
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("not a dictionary"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_negative_length() {
+        // File with negative length should be rejected
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[(-100, &["file.txt"])];
+        let torrent = make_multi_file_torrent(
+            "http://example.com/announce",
+            "test",
+            files,
+            16384,
+            &pieces,
+        );
+
+        let result = parse(&torrent);
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("negative"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_multi_file_non_string_path_component() {
+        // Path component that is not a byte string should be rejected
+        use crate::bencode::encode;
+
+        let mut file_entry = BTreeMap::new();
+        file_entry.insert(b"length".to_vec(), BencodeValue::Integer(100));
+        // Path contains an integer instead of byte string
+        file_entry.insert(
+            b"path".to_vec(),
+            BencodeValue::List(vec![BencodeValue::Integer(42)]),
+        );
+
+        let mut info = BTreeMap::new();
+        info.insert(b"files".to_vec(), BencodeValue::List(vec![BencodeValue::Dict(file_entry)]));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::InvalidMultiFile(_))));
+        if let Err(MetainfoError::InvalidMultiFile(msg)) = result {
+            assert!(msg.contains("not a byte string"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_torrent_missing_length_and_files() {
+        // Torrent with neither length nor files should be rejected
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        // Neither length nor files!
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://example.com".to_vec()));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::MissingField(_))));
+        if let Err(MetainfoError::MissingField(field)) = result {
+            assert!(field.contains("length") || field.contains("files"), "field: {}", field);
+        }
+    }
+
+    #[test]
+    fn multi_file_total_length_computed_correctly() {
+        // Verify total_length is the sum of all file lengths
+        let pieces = [0u8; 20];
+        let files: &[(i64, &[&str])] = &[
+            (1_000_000, &["a.bin"]),
+            (2_000_000, &["b.bin"]),
+            (3_000_000, &["c.bin"]),
+            (4_000_000, &["d.bin"]),
+        ];
+        let torrent = make_multi_file_torrent(
+            "http://example.com/announce",
+            "data",
+            files,
+            262144,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+        assert_eq!(metainfo.total_length, 10_000_000);
     }
 }
 @
