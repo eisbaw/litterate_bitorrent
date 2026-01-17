@@ -1806,6 +1806,440 @@ fn piece_availability_implements_debug() {
 }
 @
 
+\subsection{Rarest-First Piece Selection}
+
+The rarest-first algorithm is the cornerstone of BitTorrent's piece selection
+strategy. By preferentially downloading pieces that fewer peers have, we achieve
+two critical goals:
+
+\begin{enumerate}
+\item \textbf{Swarm health}: If a rare piece exists on only one peer and that
+  peer disconnects before anyone else downloads it, the piece becomes unavailable
+  to the entire swarm. By prioritizing rare pieces, we replicate them quickly,
+  increasing their availability.
+\item \textbf{Download speed}: Rare pieces are bottlenecks. Once we have a rare
+  piece, we can upload it to other peers who want it, improving our reputation
+  and reciprocation from the swarm.
+\end{enumerate}
+
+The [[select_rarest]] function combines information from three sources:
+
+\begin{description}
+\item[PieceManager] Tells us which pieces we already have (Verified) or are
+  currently downloading (InProgress). We must exclude these from selection.
+\item[PieceAvailability] Tells us how many peers have each piece across the
+  entire swarm. Lower counts mean rarer pieces.
+\item[Peer bitfield] Tells us which pieces a specific peer has. We can only
+  request pieces that the peer actually has.
+\end{description}
+
+The algorithm proceeds as follows:
+\begin{enumerate}
+\item Enumerate all piece indices
+\item Filter out pieces we already have (Verified state)
+\item Filter out pieces we're currently downloading (InProgress state)
+\item Filter to only pieces the given peer has (bitfield check)
+\item Sort remaining pieces by availability count (ascending---rarest first)
+\item Return the sorted list of piece indices
+\end{enumerate}
+
+When multiple pieces have the same availability count, we use piece index as
+a tiebreaker (lower indices first). This provides deterministic behavior for
+testing and debugging.
+
+<<rarest first selection>>=
+/// Returns piece indices sorted by rarity (rarest first) that we need and a peer has.
+///
+/// This function implements the core rarest-first piece selection algorithm.
+/// It combines piece state (what we have), availability (what's rare), and
+/// peer bitfield (what this peer has) to produce a prioritized list of pieces
+/// to request.
+///
+/// # Arguments
+///
+/// * `manager` - The piece manager tracking our download state
+/// * `availability` - Global availability counts across all peers
+/// * `peer_bitfield` - The bitfield of pieces the peer has (MSB first per byte)
+///
+/// # Returns
+///
+/// A vector of piece indices sorted by availability (ascending). The first
+/// element is the rarest piece that we need and the peer has. Returns an
+/// empty vector if no suitable pieces exist.
+///
+/// # Filtering Rules
+///
+/// A piece is included in the result only if ALL of the following are true:
+/// - The piece is NOT in Verified state (we don't have it yet)
+/// - The piece is NOT in InProgress state (we're not already downloading it)
+/// - The peer HAS the piece (bit is set in their bitfield)
+/// - The piece has non-zero availability (at least one peer has it)
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::{PieceManager, PieceAvailability, select_rarest};
+///
+/// // Create a 4-piece torrent
+/// let hashes = vec![[0u8; 20]; 4];
+/// let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+/// let mut availability = PieceAvailability::new(4);
+///
+/// // Peer has all 4 pieces with varying availability
+/// // Piece 0: 3 peers, Piece 1: 1 peer, Piece 2: 2 peers, Piece 3: 4 peers
+/// availability.add_peer_bitfield(&[0b11110000]);
+/// availability.add_peer_bitfield(&[0b10100000]);
+/// availability.add_peer_bitfield(&[0b10100000]);
+/// availability.add_peer_bitfield(&[0b10010000]);
+///
+/// // This peer has all pieces
+/// let peer_bitfield = vec![0b11110000];
+///
+/// // Should return [1, 2, 0, 3] (sorted by availability: 1, 2, 3, 4)
+/// let selection = select_rarest(&manager, &availability, &peer_bitfield);
+/// assert_eq!(selection[0], 1); // Rarest piece (count=1)
+/// ```
+///
+/// # Performance
+///
+/// Time complexity: O(n log n) where n is the number of pieces (due to sorting).
+/// Space complexity: O(n) for the result vector.
+///
+/// For typical torrents with thousands of pieces, this is fast enough to call
+/// frequently without concern.
+pub fn select_rarest(
+    manager: &PieceManager,
+    availability: &PieceAvailability,
+    peer_bitfield: &[u8],
+) -> Vec<u32> {
+    let num_pieces = manager.num_pieces();
+
+    // Collect eligible pieces with their availability counts
+    let mut candidates: Vec<(u32, u32)> = (0..num_pieces)
+        .filter_map(|piece_index| {
+            // Check if we need this piece (not Verified or InProgress)
+            let state = manager.get_state(piece_index).ok()?;
+            if state.is_verified() || state.is_in_progress() {
+                return None;
+            }
+
+            // Check if peer has this piece
+            let byte_index = piece_index as usize / 8;
+            let bit_index = 7 - (piece_index as usize % 8);
+            if byte_index >= peer_bitfield.len() {
+                return None;
+            }
+            if (peer_bitfield[byte_index] >> bit_index) & 1 == 0 {
+                return None;
+            }
+
+            // Get availability count (must be > 0 since peer has it)
+            let count = availability.get_availability(piece_index)?;
+            if count == 0 {
+                // This shouldn't happen if peer_bitfield is consistent with
+                // availability, but we handle it gracefully
+                return None;
+            }
+
+            Some((piece_index, count))
+        })
+        .collect();
+
+    // Sort by availability (ascending), then by piece index for stability
+    candidates.sort_by(|a, b| {
+        a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+    });
+
+    // Extract just the piece indices
+    candidates.into_iter().map(|(idx, _)| idx).collect()
+}
+@
+
+\subsubsection{Rarest-First Selection Tests}
+
+We test the rarest-first selection with various scenarios to ensure correct
+filtering and sorting behavior.
+
+<<rarest first selection tests>>=
+#[test]
+fn select_rarest_returns_pieces_sorted_by_availability() {
+    // Setup: 4 pieces with availabilities [3, 1, 2, 4]
+    let hashes = vec![[0u8; 20]; 4];
+    let manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    // Build up the availability counts:
+    // Piece 0: 3, Piece 1: 1, Piece 2: 2, Piece 3: 4
+    availability.add_peer_bitfield(&[0b11110000]); // all +1
+    availability.add_peer_bitfield(&[0b10110000]); // 0,2,3 +1
+    availability.add_peer_bitfield(&[0b10010000]); // 0,3 +1
+    availability.add_peer_bitfield(&[0b00010000]); // 3 +1
+
+    // Peer has all pieces
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Should be sorted: piece 1 (count=1), piece 2 (count=2), piece 0 (count=3), piece 3 (count=4)
+    assert_eq!(selection, vec![1, 2, 0, 3]);
+}
+
+#[test]
+fn select_rarest_with_simple_availabilities() {
+    // Test case from AC #5: availabilities [3, 1, 2], expect order [1, 2, 0]
+    let hashes = vec![[0u8; 20]; 3];
+    let manager = PieceManager::new(100, 300, hashes).unwrap();
+    let mut availability = PieceAvailability::new(3);
+
+    // Set up: piece 0 = 3, piece 1 = 1, piece 2 = 2
+    availability.add_peer_bitfield(&[0b11100000]); // all +1
+    availability.add_peer_bitfield(&[0b10100000]); // 0,2 +1
+    availability.add_peer_bitfield(&[0b10000000]); // 0 +1
+
+    // Peer has all pieces
+    let peer_bitfield = vec![0b11100000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+    assert_eq!(selection, vec![1, 2, 0]);
+}
+
+#[test]
+fn select_rarest_excludes_verified_pieces() {
+    let hashes = vec![[0u8; 20]; 4];
+    let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    // All pieces have same availability
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // Mark piece 1 as verified
+    manager.mark_verified(1).unwrap();
+
+    // Peer has all pieces
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Piece 1 should be excluded
+    assert!(!selection.contains(&1));
+    assert_eq!(selection, vec![0, 2, 3]); // All have same availability, sorted by index
+}
+
+#[test]
+fn select_rarest_excludes_in_progress_pieces() {
+    let hashes = vec![[0u8; 20]; 4];
+    let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    // All pieces have same availability
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // Start downloading piece 2
+    manager.start_piece(2).unwrap();
+
+    // Peer has all pieces
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Piece 2 should be excluded (in progress)
+    assert!(!selection.contains(&2));
+    assert_eq!(selection, vec![0, 1, 3]);
+}
+
+#[test]
+fn select_rarest_filters_by_peer_bitfield() {
+    let hashes = vec![[0u8; 20]; 8];
+    let manager = PieceManager::new(100, 800, hashes).unwrap();
+    let mut availability = PieceAvailability::new(8);
+
+    // All pieces available (from multiple peers in the swarm)
+    availability.add_peer_bitfield(&[0b11111111]);
+    availability.add_peer_bitfield(&[0b11111111]);
+
+    // But this specific peer only has pieces 0, 2, 4, 6
+    let peer_bitfield = vec![0b10101010];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Should only return pieces the peer has
+    assert_eq!(selection, vec![0, 2, 4, 6]);
+}
+
+#[test]
+fn select_rarest_returns_empty_when_peer_has_nothing_we_need() {
+    let hashes = vec![[0u8; 20]; 4];
+    let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // We already have all pieces
+    manager.mark_verified(0).unwrap();
+    manager.mark_verified(1).unwrap();
+    manager.mark_verified(2).unwrap();
+    manager.mark_verified(3).unwrap();
+
+    // Peer has all pieces
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // No pieces to select
+    assert!(selection.is_empty());
+}
+
+#[test]
+fn select_rarest_returns_empty_when_peer_bitfield_empty() {
+    let hashes = vec![[0u8; 20]; 4];
+    let manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    // Other peers have pieces
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // But this peer has nothing
+    let peer_bitfield = vec![0b00000000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    assert!(selection.is_empty());
+}
+
+#[test]
+fn select_rarest_handles_partial_peer_bitfield() {
+    // Peer bitfield might be shorter than expected (edge case)
+    let hashes = vec![[0u8; 20]; 16];
+    let manager = PieceManager::new(100, 1600, hashes).unwrap();
+    let mut availability = PieceAvailability::new(16);
+
+    availability.add_peer_bitfield(&[0b11111111, 0b11111111]);
+
+    // Peer only sends 1 byte (covers pieces 0-7)
+    let peer_bitfield = vec![0b11111111];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Should only include pieces 0-7, not 8-15
+    assert_eq!(selection.len(), 8);
+    for &idx in &selection {
+        assert!(idx < 8, "should only have pieces 0-7, got {}", idx);
+    }
+}
+
+#[test]
+fn select_rarest_tie_breaking_uses_piece_index() {
+    let hashes = vec![[0u8; 20]; 4];
+    let manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    // All pieces have same availability (count = 1)
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // With equal availability, should be sorted by piece index
+    assert_eq!(selection, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn select_rarest_combined_filtering() {
+    // Complex scenario: some pieces verified, some in progress, peer has subset
+    let hashes = vec![[0u8; 20]; 8];
+    let mut manager = PieceManager::new(100, 800, hashes).unwrap();
+    let mut availability = PieceAvailability::new(8);
+
+    // Bitfield bit positions (MSB first): bit 7=piece 0, bit 6=piece 1, etc.
+    // Availabilities after all bitfields:
+    // 0b11111111 = pieces 0-7 all +1
+    // 0b10110110 = pieces 0,2,3,5,6 +1 (bits 7,5,4,2,1 set)
+    // 0b10010100 = pieces 0,3,5 +1 (bits 7,4,2 set)
+    // 0b00010001 = pieces 3,7 +1 (bits 4,0 set)
+    // Final counts: 0=3, 1=1, 2=2, 3=4, 4=1, 5=3, 6=2, 7=2
+    availability.add_peer_bitfield(&[0b11111111]); // all +1
+    availability.add_peer_bitfield(&[0b10110110]); // 0,2,3,5,6 +1
+    availability.add_peer_bitfield(&[0b10010100]); // 0,3,5 +1
+    availability.add_peer_bitfield(&[0b00010001]); // 3,7 +1
+
+    // Mark some pieces as complete
+    manager.mark_verified(0).unwrap(); // verified, count=3
+    manager.mark_verified(3).unwrap(); // verified, count=4
+
+    // Start downloading one piece
+    manager.start_piece(5).unwrap(); // in progress, count=3
+
+    // Peer has pieces 1, 2, 3, 5, 6 (0b01110110 = bits 6,5,4,2,1)
+    // Note: peer does NOT have piece 4 (bit 3 is 0)
+    let peer_bitfield = vec![0b01110110];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Expected:
+    // - Piece 0: EXCLUDED (verified)
+    // - Piece 1: count=1, peer has it -> INCLUDE
+    // - Piece 2: count=2, peer has it -> INCLUDE
+    // - Piece 3: EXCLUDED (verified)
+    // - Piece 4: count=1, peer does NOT have it -> EXCLUDE
+    // - Piece 5: EXCLUDED (in progress)
+    // - Piece 6: count=2, peer has it -> INCLUDE
+    // - Piece 7: count=2, peer does NOT have it -> EXCLUDE
+    // Sorted by availability: [1, 2, 6] (counts: 1, 2, 2)
+    // Tie between 2 and 6 broken by index
+    assert_eq!(selection, vec![1, 2, 6]);
+}
+
+#[test]
+fn select_rarest_handles_failed_pieces() {
+    // Failed pieces should be eligible for re-download
+    let hashes = vec![[0u8; 20]; 4];
+    let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+    let mut availability = PieceAvailability::new(4);
+
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // Piece 1 failed verification - should still be selectable
+    manager.start_piece(1).unwrap();
+    manager.mark_failed(1).unwrap();
+
+    let peer_bitfield = vec![0b11110000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    // Failed piece should be included (needs_download returns true for Failed)
+    assert!(selection.contains(&1));
+}
+
+#[test]
+fn select_rarest_empty_torrent() {
+    let hashes: Vec<[u8; 20]> = vec![];
+    let manager = PieceManager::new(100, 0, hashes).unwrap();
+    let availability = PieceAvailability::new(0);
+
+    let peer_bitfield: Vec<u8> = vec![];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    assert!(selection.is_empty());
+}
+
+#[test]
+fn select_rarest_single_piece() {
+    let hashes = vec![[0u8; 20]; 1];
+    let manager = PieceManager::new(100, 100, hashes).unwrap();
+    let mut availability = PieceAvailability::new(1);
+
+    availability.add_peer_bitfield(&[0b10000000]);
+
+    let peer_bitfield = vec![0b10000000];
+
+    let selection = select_rarest(&manager, &availability, &peer_bitfield);
+
+    assert_eq!(selection, vec![0]);
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -1858,6 +2292,8 @@ The pieces module combines the error types and helpers.
 
 <<piece availability>>
 
+<<rarest first selection>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1882,6 +2318,8 @@ mod tests {
     <<piece manager tests>>
 
     <<piece availability tests>>
+
+    <<rarest first selection tests>>
 }
 @
 
