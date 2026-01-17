@@ -2,9 +2,10 @@
 % Master noweb file - includes all chapters and defines document structure
 %
 % Build commands:
-%   noweave -delay -index nw/00-main.nw > doc/literate-bittorrent.tex
-%   xelatex -shell-escape doc/literate-bittorrent.tex
-%   notangle -Rmain.rs nw/00-main.nw > src/main.rs
+%   just tangle    # Extract Rust source files from all .nw chapters
+%   just weave     # Generate PDF documentation (processes all chapters)
+%   just build     # Compile the Rust project
+%   just all       # Complete build (tangle + build + weave)
 
 \documentclass[11pt,a4paper]{article}
 
@@ -132,33 +133,5 @@ pub mod messages;
 pub mod pieces;
 @
 
-\section{Next Steps}
-
-The following chapters will be included as they are developed:
-
-\begin{itemize}
-\item \texttt{01-bencode.nw} --- Bencode encoding and decoding
-\item \texttt{02-metainfo.nw} --- Torrent file parsing
-\item \texttt{03-tracker.nw} --- HTTP tracker protocol
-\item \texttt{04-messages.nw} --- Peer wire protocol messages
-\item \texttt{05-pieces.nw} --- Piece and block management
-\item \texttt{06-cli.nw} --- Command-line interface
-\item \texttt{07-client.nw} --- Main event loop
-\item \texttt{08-disk.nw} --- Disk I/O and file creation
-\end{itemize}
-
-\appendix
-
-\section{References}
-
-\begin{itemize}
-\item BEP 3: The BitTorrent Protocol Specification
-\item BEP 23: Tracker Returns Compact Peer Lists
-\item Unofficial BitTorrent Specification (wiki.theory.org)
-\end{itemize}
-
-\section{Chunk Index}
-
-\nowebchunks
-
-\end{document}
+% Chapters follow in separate files: 01-bencode.nw through 08-disk.nw
+% The appendix is in 09-appendix.nw

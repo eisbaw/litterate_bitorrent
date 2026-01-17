@@ -1,0 +1,17 @@
+% Appendix and document closing
+% Final noweb file - processed last to close the LaTeX document
+
+\appendix
+
+\section{References}
+
+\begin{itemize}
+\item BEP 3: The BitTorrent Protocol Specification
+\item BEP 20: Peer ID Conventions
+\item BEP 23: Tracker Returns Compact Peer Lists
+\item Unofficial BitTorrent Specification (wiki.theory.org)
+\end{itemize}
+
+% Note: Chunk index omitted - requires special handling with multi-file noweave
+
+\end{document}

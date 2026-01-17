@@ -374,11 +374,18 @@ impl PeerRequestQueue {
     /// # Example
     ///
     /// ```
+    /// use std::time::Instant;
     /// use literate_bittorrent::client::PeerRequestQueue;
     /// use literate_bittorrent::pieces::BlockRequest;
     ///
     /// let mut queue = PeerRequestQueue::new(10);
-    /// queue.push(BlockRequest { piece_index: 0, offset: 0, length: 16384 });
+    /// queue.push(BlockRequest {
+    ///     piece_index: 0,
+    ///     offset: 0,
+    ///     length: 16384,
+    ///     requested_at: Instant::now(),
+    ///     peer: [0u8; 20],
+    /// });
     ///
     /// // Immediately after push, nothing should be timed out
     /// let timed_out = queue.check_timeouts();
@@ -402,12 +409,18 @@ impl PeerRequestQueue {
     /// # Example
     ///
     /// ```
-    /// use std::time::Duration;
+    /// use std::time::{Duration, Instant};
     /// use literate_bittorrent::client::PeerRequestQueue;
     /// use literate_bittorrent::pieces::BlockRequest;
     ///
     /// let mut queue = PeerRequestQueue::new(10);
-    /// queue.push(BlockRequest { piece_index: 0, offset: 0, length: 16384 });
+    /// queue.push(BlockRequest {
+    ///     piece_index: 0,
+    ///     offset: 0,
+    ///     length: 16384,
+    ///     requested_at: Instant::now(),
+    ///     peer: [0u8; 20],
+    /// });
     ///
     /// // With zero duration, everything is timed out
     /// let timed_out = queue.check_timeouts_with(Duration::ZERO);
@@ -1252,7 +1265,11 @@ pub fn handle_incoming_have(
 /// assert_eq!(formatted, "2d4c42303030312d"); // "-LB0001-" in hex
 /// ```
 pub fn format_peer_id(peer_id: &[u8; 20]) -> String {
-    peer_id.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    peer_id.iter().take(8).fold(String::with_capacity(16), |mut s, b| {
+        let _ = write!(s, "{:02x}", b);
+        s
+    })
 }
 
 /// Handles an incoming unchoke message from a peer.
@@ -5126,10 +5143,9 @@ We test the [[PeerConnectionManager]] to ensure it correctly manages
 the connection pool and peer queues.
 
 <<connection manager tests>>=
-    // ========================================================================
-    // PeerConnectionManager Tests
-    // ========================================================================
-
+#[cfg(test)]
+mod connection_manager_tests {
+    use super::*;
     use tokio::net::TcpListener;
 
     /// Creates a TCP stream pair for testing.
@@ -5622,6 +5638,7 @@ the connection pool and peer queues.
             perform_handshake;
         }
     }
+}
 @
 
 \subsection{Framed Message Reading}

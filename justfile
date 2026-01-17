@@ -27,16 +27,18 @@ tangle:
 # Weave: generate PDF documentation from noweb source
 # Creates doc/ directory and produces doc/literate-bittorrent.pdf
 # Uses XeLaTeX for fontspec support and compatibility with noweb.sty
+# Processes all .nw files in order: main, chapters 1-8, appendix
+# Note: -index is omitted for multi-file processing compatibility
 weave:
     @mkdir -p doc
-    noweave -delay -index nw/00-main.nw > doc/literate-bittorrent.tex
+    noweave -delay nw/00-main.nw nw/01-bencode.nw nw/02-metainfo.nw nw/03-tracker.nw nw/04-messages.nw nw/05-pieces.nw nw/06-cli.nw nw/07-client.nw nw/08-disk.nw nw/09-appendix.nw > doc/literate-bittorrent.tex
     cd doc && xelatex -shell-escape literate-bittorrent.tex
     cd doc && xelatex -shell-escape literate-bittorrent.tex
 
 # Weave fast: single-pass draft mode (no index, faster)
 weave-fast:
     @mkdir -p doc
-    noweave -delay nw/00-main.nw > doc/literate-bittorrent.tex
+    noweave -delay nw/00-main.nw nw/01-bencode.nw nw/02-metainfo.nw nw/03-tracker.nw nw/04-messages.nw nw/05-pieces.nw nw/06-cli.nw nw/07-client.nw nw/08-disk.nw nw/09-appendix.nw > doc/literate-bittorrent.tex
     cd doc && xelatex -shell-escape literate-bittorrent.tex
 
 # ============================================================================

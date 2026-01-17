@@ -647,11 +647,11 @@ impl Handshake {
         [0u8; 8]
     }
 
-    <<handshake to_bytes>>
+    <<handshake to bytes>>
 
-    <<handshake from_bytes>>
+    <<handshake from bytes>>
 
-    <<handshake validate_info_hash>>
+    <<handshake validate info hash>>
 }
 @
 
@@ -678,7 +678,7 @@ We use a fixed-size array [[u8; 68]]] rather than a [[Vec<u8>]] because:
 \item Fixed-size arrays are efficient to copy and can be passed by value
 \end{itemize}
 
-<<handshake to_bytes>>=
+<<handshake to bytes>>=
 /// Serializes this handshake to its 68-byte wire format.
 ///
 /// The returned array contains:
@@ -777,7 +777,7 @@ extracts whatever 20 bytes are present; the caller must compare against the
 expected info\_hash using [[validate_info_hash]]. This separation keeps parsing
 pure (no external context needed) and makes the security-critical check explicit.
 
-<<handshake from_bytes>>=
+<<handshake from bytes>>=
 /// Parses a handshake from its 68-byte wire format.
 ///
 /// This method validates the handshake structure according to BEP 3:
@@ -890,7 +890,7 @@ do the comparison themselves. This makes the security-critical operation explici
 and self-documenting, and allows for future enhancements (like constant-time
 comparison if we ever handle sensitive hashes).
 
-<<handshake validate_info_hash>>=
+<<handshake validate info hash>>=
 /// Validates that this handshake's info_hash matches the expected value.
 ///
 /// After receiving a peer's handshake, you **must** call this method to
@@ -1733,9 +1733,9 @@ impl Message {
         }
     }
 
-    <<message to_bytes>>
+    <<message to bytes>>
 
-    <<message from_bytes>>
+    <<message from bytes>>
 }
 @
 
@@ -1778,7 +1778,7 @@ All multi-byte integers are encoded in big-endian (network) byte order, as is
 standard for network protocols. The length prefix counts only the bytes that
 follow---it does not include itself.
 
-<<message to_bytes>>=
+<<message to bytes>>=
 /// Serializes this message to its wire format.
 ///
 /// The wire format is: `<length><id><payload>` where:
@@ -2550,7 +2550,7 @@ Each message type has specific payload length requirements:
 \item Piece: payload must be at least 8 bytes for index + begin (length >= 9)
 \end{itemize}
 
-<<message from_bytes>>=
+<<message from bytes>>=
 /// Parses a message from its length-prefixed wire format.
 ///
 /// This method expects a complete message including the 4-byte length prefix.

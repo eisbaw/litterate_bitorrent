@@ -1095,7 +1095,11 @@ mod tests {
 
     /// Helper to format a hash as a hex string
     fn hex_string(hash: &[u8; 20]) -> String {
-        hash.iter().map(|b| format!("{:02x}", b)).collect()
+        use std::fmt::Write;
+        hash.iter().fold(String::with_capacity(40), |mut s, b| {
+            let _ = write!(s, "{:02x}", b);
+            s
+        })
     }
 
     /// Helper to format bytes as human-readable size

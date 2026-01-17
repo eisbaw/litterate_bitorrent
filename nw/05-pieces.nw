@@ -466,7 +466,11 @@ call sites cleaner and ensure consistent formatting of hash values.
 /// We implement this inline rather than depending on an external `hex` crate,
 /// following the same approach used in other modules of this client.
 fn hash_to_hex(hash: &[u8; 20]) -> String {
-    hash.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    hash.iter().fold(String::with_capacity(40), |mut s, b| {
+        let _ = write!(s, "{:02x}", b);
+        s
+    })
 }
 
 impl PieceError {
@@ -761,7 +765,7 @@ impl PieceManager {
         let expected_pieces = if total_length == 0 {
             0
         } else {
-            ((total_length + piece_length as u64 - 1) / piece_length as u64) as usize
+            total_length.div_ceil(piece_length as u64) as usize
         };
 
         if piece_hashes.len() != expected_pieces {
@@ -2235,10 +2239,8 @@ impl PieceAvailability {
             let byte_index = piece_index / 8;
             let bit_index = 7 - (piece_index % 8); // MSB first within byte
 
-            if byte_index < bitfield.len() {
-                if (bitfield[byte_index] >> bit_index) & 1 == 1 {
-                    *count = count.saturating_add(1);
-                }
+            if byte_index < bitfield.len() && (bitfield[byte_index] >> bit_index) & 1 == 1 {
+                *count = count.saturating_add(1);
             }
         }
     }
@@ -2278,10 +2280,8 @@ impl PieceAvailability {
             let byte_index = piece_index / 8;
             let bit_index = 7 - (piece_index % 8); // MSB first within byte
 
-            if byte_index < bitfield.len() {
-                if (bitfield[byte_index] >> bit_index) & 1 == 1 {
-                    *count = count.saturating_sub(1);
-                }
+            if byte_index < bitfield.len() && (bitfield[byte_index] >> bit_index) & 1 == 1 {
+                *count = count.saturating_sub(1);
             }
         }
     }
@@ -5506,9 +5506,7 @@ example, a 262144-byte piece (256 KiB) contains exactly 16 blocks, while a
 /// ```
 #[inline]
 pub fn blocks_per_piece(piece_length: u32) -> u32 {
-    // Ceiling division: (a + b - 1) / b
-    // This avoids floating point and handles the edge case correctly.
-    (piece_length + BLOCK_SIZE - 1) / BLOCK_SIZE
+    piece_length.div_ceil(BLOCK_SIZE)
 }
 @
 
