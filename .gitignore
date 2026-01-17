@@ -8,3 +8,4 @@ target/
 
 # Keep Cargo.lock for reproducibility
 !Cargo.lock
+.cargo/
