@@ -250,6 +250,15 @@ a foundation.
 //! 1. A 68-byte handshake (not length-prefixed, unlike other messages)
 //! 2. Length-prefixed messages for state and data exchange
 //!
+//! # Handshake
+//!
+//! The handshake is a fixed 68-byte structure:
+//! - 1 byte: protocol string length (19)
+//! - 19 bytes: "BitTorrent protocol"
+//! - 8 bytes: reserved (zeros)
+//! - 20 bytes: info_hash
+//! - 20 bytes: peer_id
+//!
 //! # Message Types
 //!
 //! | ID | Name | Payload |
@@ -272,6 +281,12 @@ a foundation.
 
 <<peer errors>>
 
+<<handshake constants>>
+
+<<handshake struct>>
+
+<<handshake impl>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,6 +295,8 @@ mod tests {
     <<peer error display tests>>
 
     <<peer error trait tests>>
+
+    <<handshake tests>>
 }
 @
 
@@ -399,13 +416,310 @@ works correctly, allowing [[?]] to automatically convert [[std::io::Error]]
 into [[PeerError::IoError]]. This is important for ergonomic error handling
 in async code where I/O operations are frequent.
 
+\subsection{The Handshake}
+
+Before any messages can be exchanged, peers must complete a handshake. Unlike
+the length-prefixed messages that follow, the handshake has a fixed 68-byte
+format defined by BEP 3. This asymmetry exists because the handshake predates
+the message framing---it establishes identity before the protocol proper begins.
+
+\subsubsection{Handshake Wire Format}
+
+The handshake consists of five fields, transmitted in order:
+
+\begin{verbatim}
++--------+---------------------+----------+-----------+---------+
+| pstrlen|       pstr          | reserved | info_hash | peer_id |
++--------+---------------------+----------+-----------+---------+
+| 1 byte |      19 bytes       | 8 bytes  | 20 bytes  | 20 bytes|
++--------+---------------------+----------+-----------+---------+
+| = 19   | "BitTorrent protocol"| zeros   | SHA1 hash | client  |
++--------+---------------------+----------+-----------+---------+
+                        Total: 68 bytes
+\end{verbatim}
+
+\begin{description}
+\item[pstrlen (1 byte)] The length of the protocol string. For BitTorrent v1,
+  this is always 19. Future protocols might use different lengths, so this
+  field allows version detection.
+
+\item[pstr (19 bytes)] The protocol identifier string: ``BitTorrent protocol''
+  (ASCII, no null terminator). This confirms both peers speak the same protocol.
+
+\item[reserved (8 bytes)] Eight bytes reserved for future extensions. BEP 3
+  specifies these should be zeros. Extensions like BEP 10 (Extension Protocol)
+  set specific bits here to advertise capabilities. For our basic implementation,
+  we send and expect zeros.
+
+\item[info\_hash (20 bytes)] The SHA1 hash of the bencoded info dictionary from
+  the torrent metainfo. This identifies which torrent we want to exchange. Both
+  peers must send the same info\_hash; a mismatch means they're talking about
+  different torrents.
+
+\item[peer\_id (20 bytes)] A unique identifier for this client instance. By
+  convention, the first 8 bytes encode the client name and version (e.g.,
+  ``-LB0001-'' for ``Literate BitTorrent version 0.0.01''), and the remaining
+  12 bytes are random. This helps with debugging and statistics.
+\end{description}
+
+\subsubsection{Handshake Constants}
+
+We define constants for the protocol string and total handshake length. Using
+constants prevents magic numbers in the code and makes the protocol specification
+explicit.
+
+<<handshake constants>>=
+/// The protocol identifier string for BitTorrent v1.
+///
+/// This 19-byte ASCII string is sent at the start of every handshake,
+/// preceded by a single byte containing its length (19). The string
+/// identifies the protocol version and must match exactly for peers
+/// to communicate.
+///
+/// BEP 3 specifies this exact string. Alternative protocols (like
+/// BitTorrent v2) would use different strings.
+pub const PROTOCOL_STRING: &[u8; 19] = b"BitTorrent protocol";
+
+/// The total length of a BitTorrent handshake in bytes.
+///
+/// The handshake is exactly 68 bytes:
+/// - 1 byte: protocol string length (19)
+/// - 19 bytes: protocol string ("BitTorrent protocol")
+/// - 8 bytes: reserved (zeros for basic protocol)
+/// - 20 bytes: info_hash (SHA1 of torrent's info dictionary)
+/// - 20 bytes: peer_id (client identifier)
+///
+/// This constant is useful for pre-allocating buffers and validating
+/// that we've received a complete handshake.
+pub const HANDSHAKE_LENGTH: usize = 1 + 19 + 8 + 20 + 20; // = 68
+@
+
+Note that [[PROTOCOL_STRING]] is typed as [[&[u8; 19]]] rather than [[&str]].
+While the content is ASCII text, we work with bytes throughout the wire protocol
+to avoid any UTF-8 validation overhead and to match the binary nature of the
+protocol.
+
+\subsubsection{The Handshake Struct}
+
+The [[Handshake]] struct captures the two variable parts of the handshake: the
+info\_hash and peer\_id. The protocol string and reserved bytes are fixed, so
+we don't store them---they're generated during serialization.
+
+<<handshake struct>>=
+/// A BitTorrent protocol handshake.
+///
+/// The handshake is exchanged immediately after TCP connection, before any
+/// length-prefixed messages. It identifies both the torrent (via `info_hash`)
+/// and the client (via `peer_id`).
+///
+/// # Wire Format
+///
+/// When serialized, a handshake is exactly 68 bytes:
+/// ```text
+/// <pstrlen><pstr><reserved><info_hash><peer_id>
+///    1      19       8        20        20     = 68 bytes
+/// ```
+///
+/// The `pstrlen` is always 19, `pstr` is always "BitTorrent protocol",
+/// and `reserved` is 8 zero bytes (no extensions). Only `info_hash` and
+/// `peer_id` vary between handshakes.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::Handshake;
+///
+/// let info_hash = [0u8; 20]; // In practice, SHA1 of info dict
+/// let peer_id = *b"-LB0001-AABBCCDDEEFF"; // Client identifier
+///
+/// let handshake = Handshake::new(info_hash, peer_id);
+/// assert_eq!(handshake.info_hash(), &info_hash);
+/// assert_eq!(handshake.peer_id(), &peer_id);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handshake {
+    /// The SHA1 hash of the torrent's bencoded info dictionary.
+    ///
+    /// This 20-byte value uniquely identifies the torrent. Both peers in a
+    /// connection must have the same info_hash, or they're talking about
+    /// different torrents.
+    info_hash: [u8; 20],
+
+    /// The unique identifier for this client instance.
+    ///
+    /// By convention, the first 8 bytes encode client name and version
+    /// (e.g., "-LB0001-" for "Literate BitTorrent v0.0.01"), and the
+    /// remaining 12 bytes are random to ensure uniqueness.
+    peer_id: [u8; 20],
+}
+@
+
+We derive [[Clone]] and [[PartialEq]]/[[Eq]] since handshakes are small value
+types that we might need to copy or compare. The [[Debug]] implementation is
+useful for logging during connection debugging.
+
+\subsubsection{Handshake Constructor and Accessors}
+
+The constructor is straightforward since both fields are fixed-size arrays.
+The inputs must already be the correct size, enforced by Rust's type system.
+
+<<handshake impl>>=
+impl Handshake {
+    /// Creates a new handshake with the given info hash and peer ID.
+    ///
+    /// Both arguments are 20-byte arrays, matching the wire protocol
+    /// specification. The type system ensures correct sizes at compile time.
+    ///
+    /// # Arguments
+    ///
+    /// * `info_hash` - SHA1 hash of the torrent's bencoded info dictionary
+    /// * `peer_id` - 20-byte client identifier (typically 8-byte prefix + 12 random bytes)
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::messages::Handshake;
+    ///
+    /// // Create a handshake for a torrent
+    /// let info_hash = [0xAB; 20]; // Would be actual SHA1 in practice
+    /// let peer_id = *b"-LB0001-123456789012";
+    ///
+    /// let hs = Handshake::new(info_hash, peer_id);
+    /// ```
+    #[must_use]
+    pub fn new(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        Self { info_hash, peer_id }
+    }
+
+    /// Returns the info hash from this handshake.
+    ///
+    /// The info hash identifies which torrent this connection is for.
+    /// After receiving a peer's handshake, compare this to your expected
+    /// info hash to verify you're both talking about the same torrent.
+    #[must_use]
+    pub fn info_hash(&self) -> &[u8; 20] {
+        &self.info_hash
+    }
+
+    /// Returns the peer ID from this handshake.
+    ///
+    /// The peer ID identifies the remote client. Useful for logging,
+    /// debugging, and potentially for peer statistics.
+    #[must_use]
+    pub fn peer_id(&self) -> &[u8; 20] {
+        &self.peer_id
+    }
+
+    /// Returns the reserved bytes for this handshake.
+    ///
+    /// In the basic BitTorrent protocol, reserved bytes are all zeros.
+    /// Extensions like BEP 10 would set specific bits here. For now,
+    /// we always return zeros.
+    #[must_use]
+    pub fn reserved(&self) -> [u8; 8] {
+        [0u8; 8]
+    }
+}
+@
+
+The [[#[must_use]]] attribute warns if the return value is discarded, which
+would indicate a likely bug (why create a handshake and ignore its fields?).
+
+Note that [[new]] takes ownership of the arrays rather than references. Since
+[[u8; 20]]] is [[Copy]], there's no performance difference, and taking ownership
+is clearer---the handshake owns its data.
+
+\subsubsection{Handshake Tests}
+
+We test that the handshake correctly stores and returns its fields, and verify
+the constant values match the BEP 3 specification.
+
+<<handshake tests>>=
+#[test]
+fn protocol_string_is_19_bytes() {
+    assert_eq!(PROTOCOL_STRING.len(), 19);
+    assert_eq!(PROTOCOL_STRING, b"BitTorrent protocol");
+}
+
+#[test]
+fn handshake_length_is_68() {
+    // Verify our constant matches the sum of all field sizes
+    assert_eq!(HANDSHAKE_LENGTH, 68);
+    assert_eq!(HANDSHAKE_LENGTH, 1 + 19 + 8 + 20 + 20);
+}
+
+#[test]
+fn handshake_stores_info_hash() {
+    let info_hash = [0xAB; 20];
+    let peer_id = [0xCD; 20];
+    let hs = Handshake::new(info_hash, peer_id);
+
+    assert_eq!(hs.info_hash(), &info_hash);
+}
+
+#[test]
+fn handshake_stores_peer_id() {
+    let info_hash = [0xAB; 20];
+    let peer_id = *b"-LB0001-AABBCCDDEEFF";
+    let hs = Handshake::new(info_hash, peer_id);
+
+    assert_eq!(hs.peer_id(), &peer_id);
+}
+
+#[test]
+fn handshake_reserved_is_zeros() {
+    let hs = Handshake::new([0; 20], [0; 20]);
+    assert_eq!(hs.reserved(), [0u8; 8]);
+}
+
+#[test]
+fn handshake_equality() {
+    let hs1 = Handshake::new([1; 20], [2; 20]);
+    let hs2 = Handshake::new([1; 20], [2; 20]);
+    let hs3 = Handshake::new([1; 20], [3; 20]); // Different peer_id
+
+    assert_eq!(hs1, hs2);
+    assert_ne!(hs1, hs3);
+}
+
+#[test]
+fn handshake_is_cloneable() {
+    let original = Handshake::new([0xAA; 20], [0xBB; 20]);
+    let cloned = original.clone();
+
+    assert_eq!(original, cloned);
+}
+
+#[test]
+fn handshake_debug_output() {
+    let hs = Handshake::new([0; 20], [0; 20]);
+    let debug = format!("{:?}", hs);
+
+    // Should contain struct name and fields
+    assert!(debug.contains("Handshake"));
+    assert!(debug.contains("info_hash"));
+    assert!(debug.contains("peer_id"));
+}
+@
+
+These tests verify:
+\begin{itemize}
+\item The protocol string constant has the correct value and length
+\item The handshake length constant equals 68 (and matches the field sum)
+\item The struct correctly stores and returns both fields
+\item Reserved bytes are always zeros (no extensions yet)
+\item Equality comparison works correctly
+\item The struct is cloneable
+\item Debug output is reasonable
+\end{itemize}
+
 \subsection{Next Steps}
 
-With error types defined, the messages module is ready for:
+With the handshake struct defined, the messages module is ready for:
 \begin{enumerate}
-\item Handshake struct and parsing
-\item Message enum with serialization/deserialization
-\item Length-prefix framing helpers
+\item Handshake serialization (to bytes) and deserialization (from bytes)
+\item Message enum with the nine message types (keep-alive through cancel)
+\item Length-prefix framing helpers for reading/writing messages
 \end{enumerate}
 
 These will be added in subsequent development as we build out the peer
