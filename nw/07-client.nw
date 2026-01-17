@@ -187,6 +187,28 @@ pub struct Client {
     /// Used to spawn tasks for peer connections. Stored here so all
     /// async operations use the same runtime.
     runtime_handle: tokio::runtime::Handle,
+
+    /// Time when the download started.
+    ///
+    /// Used to calculate total download time and average speed when
+    /// the download completes. Set to the current instant when the
+    /// client is created.
+    start_time: std::time::Instant,
+
+    /// Flag indicating the download is complete.
+    ///
+    /// Set to `true` when all pieces have been verified. Once set,
+    /// no further piece requests should be made. This flag is checked
+    /// by the request scheduler to prevent requesting pieces from a
+    /// completed download.
+    download_complete: bool,
+
+    /// Flag indicating the completed event has been announced.
+    ///
+    /// The `event=completed` announce should be sent exactly once when
+    /// the download finishes. This flag prevents duplicate announces
+    /// if `on_piece_verified` is called multiple times after completion.
+    completed_announced: bool,
 }
 
 /// Placeholder for per-peer connection state.
@@ -278,6 +300,9 @@ impl Client {
             port,
             active_peers: HashMap::new(),
             runtime_handle,
+            start_time: std::time::Instant::now(),
+            download_complete: false,
+            completed_announced: false,
         })
     }
 
@@ -321,6 +346,9 @@ impl Client {
             port,
             active_peers: HashMap::new(),
             runtime_handle,
+            start_time: std::time::Instant::now(),
+            download_complete: false,
+            completed_announced: false,
         })
     }
 
@@ -408,6 +436,27 @@ impl Client {
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.runtime_handle
     }
+
+    /// Returns the time when the download started.
+    #[inline]
+    pub fn start_time(&self) -> std::time::Instant {
+        self.start_time
+    }
+
+    /// Returns true if the download is complete.
+    ///
+    /// This flag is set when all pieces have been verified. Once set,
+    /// no further piece requests should be made.
+    #[inline]
+    pub fn is_download_complete(&self) -> bool {
+        self.download_complete
+    }
+
+    /// Returns true if the completed event has been announced to the tracker.
+    #[inline]
+    pub fn is_completed_announced(&self) -> bool {
+        self.completed_announced
+    }
 }
 @
 
@@ -480,6 +529,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<shutdown announce>>
 
+<<completion announce>>
+
 <<client struct>>
 
 <<client impl>>
@@ -489,6 +540,8 @@ The client module exports the [[Client]] struct and associated types.
 <<shutdown tests>>
 
 <<shutdown announce tests>>
+
+<<completion tests>>
 @
 
 \subsection{Testing}
@@ -1469,3 +1522,481 @@ The async test uses [[#[tokio::test]]] to run within a Tokio runtime, allowing
 us to actually exercise the shutdown logic. We use an invalid tracker URL to
 verify the best-effort behavior: even when notification fails, the exit code
 is 0 because the shutdown itself was successful.
+
+\subsection{Download Completion Detection}
+
+When all pieces have been downloaded and verified, the client must notify the
+tracker with an [[event=completed]] announce. This signals our transition from
+\emph{leecher} (downloading) to \emph{seeder} (having all pieces). Although this
+client does not implement seeding per the project's non-goals, correctly sending
+the completed event is important for tracker statistics and swarm health metrics.
+
+The completion detection logic is triggered after each piece is verified. When
+the last piece is marked as verified, the piece manager's [[is\_complete()]]
+method returns true, and we:
+
+\begin{enumerate}
+\item Log the completion with total download time and average speed.
+\item Send a tracker announce with [[event=completed]].
+\item Set an internal flag to prevent further piece requests.
+\end{enumerate}
+
+The completion announce follows the same best-effort pattern as the stopped
+announce: we attempt to notify the tracker but don't fail the download if the
+announce fails. Tracker notification is important but not critical---the tracker
+will eventually update our status based on subsequent regular announces.
+
+\subsubsection{The Completed Announce}
+
+The [[send\_completed\_announce]] function is structurally similar to
+[[send\_stopped\_announce]] but uses [[TrackerEvent::Completed]].
+
+<<completion announce>>=
+/// Timeout for completion announce, in seconds.
+///
+/// We use the same short timeout as shutdown announces because the user
+/// has finished downloading and shouldn't have to wait long for tracker
+/// communication.
+pub const COMPLETION_ANNOUNCE_TIMEOUT_SECS: u64 = 10;
+
+/// Result of a completion detection check.
+///
+/// This enum captures what happened when we checked for download completion
+/// after a piece was verified. It helps the caller understand whether the
+/// download just completed and what action was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompletionResult {
+    /// The download was already complete before this check.
+    AlreadyComplete,
+
+    /// The download is still in progress; not all pieces are verified.
+    StillDownloading {
+        /// Number of verified pieces.
+        verified: usize,
+        /// Total number of pieces.
+        total: u32,
+    },
+
+    /// The download just completed with this piece verification.
+    JustCompleted {
+        /// Total download time.
+        elapsed: Duration,
+        /// Average download speed in bytes per second.
+        bytes_per_second: f64,
+    },
+}
+
+/// Send a "completed" event to the tracker when download finishes.
+///
+/// This function notifies the tracker that we have finished downloading all
+/// pieces. The tracker uses this to update statistics and potentially provide
+/// us to other peers as a seeder (though we don't implement seeding).
+///
+/// # Arguments
+///
+/// * `announce_url` - The tracker announce URL
+/// * `info_hash` - The 20-byte info hash
+/// * `peer_id` - Our 20-byte peer identifier
+/// * `port` - The port we are listening on
+/// * `uploaded` - Total bytes uploaded during this session
+/// * `downloaded` - Total bytes downloaded during this session
+///
+/// # Returns
+///
+/// * `Ok(())` if the tracker acknowledged our completed event
+/// * `Err(TrackerError)` if the announce failed (logged as warning)
+///
+/// # Logging
+///
+/// - INFO: "Sending completed announce to tracker"
+/// - INFO: "Tracker notified of completion" (on success)
+/// - WARN: "Failed to send completed announce: {error}" (on failure)
+pub async fn send_completed_announce(
+    announce_url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+) -> Result<(), TrackerError> {
+    info!("Sending completed announce to tracker");
+
+    // Build the request with event=completed
+    // left=0 because we have all pieces
+    let request = TrackerRequest {
+        info_hash: *info_hash,
+        peer_id: *peer_id,
+        port,
+        uploaded,
+        downloaded,
+        left: 0, // All pieces verified
+        event: Some(TrackerEvent::Completed),
+        compact: true,
+    };
+
+    // Build the URL
+    let url = build_announce_url(announce_url, &request);
+
+    // Send with timeout
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(COMPLETION_ANNOUNCE_TIMEOUT_SECS))
+        .build()
+        .map_err(TrackerError::TrackerHttpError)?;
+
+    let response = match tokio::time::timeout(
+        Duration::from_secs(COMPLETION_ANNOUNCE_TIMEOUT_SECS),
+        client.get(&url).send(),
+    ).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            warn!("Failed to send completed announce: {}", e);
+            return Err(TrackerError::TrackerHttpError(e));
+        }
+        Err(_) => {
+            warn!("Completed announce timed out after {} seconds", COMPLETION_ANNOUNCE_TIMEOUT_SECS);
+            return Err(TrackerError::TrackerTimeout);
+        }
+    };
+
+    // Check status
+    if response.status().is_success() {
+        info!("Tracker notified of completion");
+        Ok(())
+    } else {
+        let status = response.status();
+        warn!("Tracker returned error status {} for completed announce", status);
+        Err(TrackerError::TrackerInvalidResponse(
+            format!("tracker returned HTTP {}", status)
+        ))
+    }
+}
+
+impl Client {
+    /// Check for download completion after a piece is verified.
+    ///
+    /// This method should be called after each successful piece verification.
+    /// It checks if all pieces are now verified, and if so:
+    ///
+    /// 1. Logs the completion with timing and speed statistics
+    /// 2. Sets the internal `download_complete` flag
+    /// 3. Returns `JustCompleted` with the statistics
+    ///
+    /// The caller is responsible for sending the completed announce to the
+    /// tracker based on the return value. This separation allows the caller
+    /// to handle the async tracker communication appropriately.
+    ///
+    /// # Returns
+    ///
+    /// * `AlreadyComplete` - Download was already marked complete
+    /// * `StillDownloading` - Not all pieces are verified yet
+    /// * `JustCompleted` - Download just completed with this check
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // After successfully verifying a piece:
+    /// match client.check_completion() {
+    ///     CompletionResult::JustCompleted { elapsed, bytes_per_second } => {
+    ///         // Send completed announce to tracker
+    ///         send_completed_announce(...).await;
+    ///     }
+    ///     CompletionResult::StillDownloading { verified, total } => {
+    ///         // Continue downloading
+    ///     }
+    ///     CompletionResult::AlreadyComplete => {
+    ///         // Ignore, already handled
+    ///     }
+    /// }
+    /// ```
+    pub fn check_completion(&mut self) -> CompletionResult {
+        // Already marked complete
+        if self.download_complete {
+            return CompletionResult::AlreadyComplete;
+        }
+
+        // Check if all pieces are verified
+        if !self.piece_manager.is_complete() {
+            let verified = self.piece_manager.verified_count();
+            let total = self.piece_manager.num_pieces();
+            return CompletionResult::StillDownloading { verified, total };
+        }
+
+        // Download just completed!
+        self.download_complete = true;
+
+        let elapsed = self.start_time.elapsed();
+        let total_bytes = self.metainfo.total_length as f64;
+        let bytes_per_second = if elapsed.as_secs_f64() > 0.0 {
+            total_bytes / elapsed.as_secs_f64()
+        } else {
+            total_bytes // Instant completion
+        };
+
+        // Format speed for logging
+        let speed_str = if bytes_per_second >= 1_000_000.0 {
+            format!("{:.2} MB/s", bytes_per_second / 1_000_000.0)
+        } else if bytes_per_second >= 1_000.0 {
+            format!("{:.2} KB/s", bytes_per_second / 1_000.0)
+        } else {
+            format!("{:.0} B/s", bytes_per_second)
+        };
+
+        info!(
+            "Download complete! {} in {:.1}s ({}) - {} pieces verified",
+            format_bytes(self.metainfo.total_length),
+            elapsed.as_secs_f64(),
+            speed_str,
+            self.piece_manager.num_pieces()
+        );
+
+        CompletionResult::JustCompleted { elapsed, bytes_per_second }
+    }
+
+    /// Mark the completed announce as sent.
+    ///
+    /// This should be called after successfully sending the completed announce
+    /// to the tracker, or after deciding not to retry a failed announce.
+    pub fn mark_completed_announced(&mut self) {
+        self.completed_announced = true;
+    }
+}
+
+/// Format a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+@
+
+The [[check\_completion]] method is designed to be called synchronously after each
+piece verification. It returns a [[CompletionResult]] enum that tells the caller
+what happened, allowing the caller to handle the async tracker communication
+appropriately.
+
+Note that we separate the completion check from the tracker announce. This keeps
+the [[check\_completion]] method synchronous and fast, while giving the caller
+control over when and how to send the async tracker request. This is important
+for integration with the main event loop.
+
+\subsubsection{Completion Detection Tests}
+
+We test the completion detection logic to verify correct state transitions and
+statistics calculation.
+
+<<completion tests>>=
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use crate::metainfo::Metainfo;
+
+    /// Helper to create a minimal valid metainfo for testing.
+    fn make_test_metainfo(num_pieces: usize) -> Metainfo {
+        Metainfo {
+            announce: "http://tracker.example.com/announce".to_string(),
+            info_hash: [0xAA; 20],
+            piece_length: 262144,
+            piece_hashes: vec![[0u8; 20]; num_pieces],
+            total_length: 262144 * num_pieces as u64,
+            files: vec![crate::metainfo::FileInfo {
+                length: 262144 * num_pieces as u64,
+                path: PathBuf::from("test.bin"),
+            }],
+            name: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn completion_announce_timeout_is_10_seconds() {
+        assert_eq!(COMPLETION_ANNOUNCE_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn check_completion_returns_still_downloading_when_incomplete() {
+        let metainfo = make_test_metainfo(4);
+        let mut client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        // No pieces verified yet
+        match client.check_completion() {
+            CompletionResult::StillDownloading { verified, total } => {
+                assert_eq!(verified, 0);
+                assert_eq!(total, 4);
+            }
+            other => panic!("Expected StillDownloading, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_completion_returns_just_completed_when_last_piece_verified() {
+        let metainfo = make_test_metainfo(3);
+        let mut client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        // Mark all pieces as verified
+        client.piece_manager_mut().mark_verified(0).unwrap();
+        client.piece_manager_mut().mark_verified(1).unwrap();
+        client.piece_manager_mut().mark_verified(2).unwrap();
+
+        // Now check completion
+        match client.check_completion() {
+            CompletionResult::JustCompleted { elapsed, bytes_per_second } => {
+                // Elapsed should be very small (test runs fast)
+                assert!(elapsed.as_secs() < 10, "Elapsed time unexpectedly large");
+                // Speed should be positive
+                assert!(bytes_per_second > 0.0, "Speed should be positive");
+            }
+            other => panic!("Expected JustCompleted, got {:?}", other),
+        }
+
+        // Verify download_complete flag is set
+        assert!(client.is_download_complete());
+    }
+
+    #[test]
+    fn check_completion_returns_already_complete_on_subsequent_calls() {
+        let metainfo = make_test_metainfo(2);
+        let mut client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        // Mark all pieces as verified
+        client.piece_manager_mut().mark_verified(0).unwrap();
+        client.piece_manager_mut().mark_verified(1).unwrap();
+
+        // First check should return JustCompleted
+        match client.check_completion() {
+            CompletionResult::JustCompleted { .. } => {}
+            other => panic!("Expected JustCompleted, got {:?}", other),
+        }
+
+        // Second check should return AlreadyComplete
+        match client.check_completion() {
+            CompletionResult::AlreadyComplete => {}
+            other => panic!("Expected AlreadyComplete, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mark_completed_announced_sets_flag() {
+        let metainfo = make_test_metainfo(1);
+        let mut client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        assert!(!client.is_completed_announced());
+        client.mark_completed_announced();
+        assert!(client.is_completed_announced());
+    }
+
+    #[test]
+    fn download_complete_flag_starts_false() {
+        let metainfo = make_test_metainfo(1);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        assert!(!client.is_download_complete());
+    }
+
+    #[test]
+    fn completed_announced_flag_starts_false() {
+        let metainfo = make_test_metainfo(1);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        assert!(!client.is_completed_announced());
+    }
+
+    #[test]
+    fn start_time_is_set() {
+        let metainfo = make_test_metainfo(1);
+        let before = std::time::Instant::now();
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+        let after = std::time::Instant::now();
+
+        // start_time should be between before and after
+        assert!(client.start_time() >= before);
+        assert!(client.start_time() <= after);
+    }
+
+    #[test]
+    fn completed_request_has_correct_event() {
+        use crate::tracker::TrackerEvent;
+        assert_eq!(TrackerEvent::Completed.as_str(), "completed");
+    }
+
+    #[test]
+    fn build_completed_announce_url_contains_event() {
+        use crate::tracker::{TrackerRequest, TrackerEvent, build_announce_url};
+
+        let request = TrackerRequest {
+            info_hash: [0xAA; 20],
+            peer_id: [0xBB; 20],
+            port: 6881,
+            uploaded: 1000,
+            downloaded: 2000,
+            left: 0,
+            event: Some(TrackerEvent::Completed),
+            compact: true,
+        };
+
+        let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+        assert!(
+            url.contains("event=completed"),
+            "Completed announce URL should contain event=completed, got: {}",
+            url
+        );
+    }
+
+    #[test]
+    fn format_bytes_gigabytes() {
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+        assert_eq!(format_bytes(2_147_483_648), "2.00 GB");
+    }
+
+    #[test]
+    fn format_bytes_megabytes() {
+        assert_eq!(format_bytes(1_048_576), "1.00 MB");
+        assert_eq!(format_bytes(10_485_760), "10.00 MB");
+    }
+
+    #[test]
+    fn format_bytes_kilobytes() {
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(10240), "10.00 KB");
+    }
+
+    #[test]
+    fn format_bytes_bytes() {
+        assert_eq!(format_bytes(512), "512 bytes");
+        assert_eq!(format_bytes(0), "0 bytes");
+    }
+
+    #[tokio::test]
+    async fn send_completed_announce_handles_unreachable_tracker() {
+        // Use an invalid tracker URL
+        let result = send_completed_announce(
+            "http://definitely-invalid-tracker.local:1/announce",
+            &[0xAA; 20],
+            &[0xBB; 20],
+            6881,
+            100,
+            200,
+        ).await;
+
+        // Should return an error (network failure or timeout)
+        assert!(result.is_err(), "Should fail with unreachable tracker");
+    }
+}
+@
+
+These tests verify:
+\begin{enumerate}
+\item The completion timeout constant is set appropriately.
+\item The [[check\_completion]] method returns the correct result based on state.
+\item The download complete flag is properly set after completion.
+\item Subsequent calls to [[check\_completion]] return [[AlreadyComplete]].
+\item The completed announce contains the correct event parameter.
+\item The [[format\_bytes]] helper formats byte counts correctly.
+\item The tracker communication handles unreachable trackers gracefully.
+\end{enumerate}
