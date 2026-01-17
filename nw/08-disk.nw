@@ -105,6 +105,8 @@ pub enum DiskError {
         #[source]
         source: std::io::Error,
     },
+
+<<disk write error>>
 }
 @
 
@@ -273,18 +275,33 @@ The disk module combines the error types and file creation logic.
 //! Disk I/O operations for BitTorrent client.
 //!
 //! This module handles creating and managing output files for torrent downloads.
-//! The primary entry point is [`create_output_files`], which sets up the
-//! directory structure and sparse files based on torrent metadata.
+//! The primary entry points are:
+//!
+//! - [`create_output_files`]: Sets up the directory structure and sparse files
+//! - [`write_piece`]: Writes verified piece data to the correct file location(s)
+//! - [`map_piece_to_files`]: Maps a piece to the file slices it spans
 //!
 //! # Sparse Files
 //!
 //! Files are created using sparse allocation, meaning they report their full
 //! size but only consume disk space for regions that have been written.
 //! This enables efficient partial downloads and fast initialization.
+//!
+//! # Multi-File Torrents
+//!
+//! BitTorrent treats all files as a single contiguous byte stream. A piece
+//! may span multiple files, requiring the write operation to split the piece
+//! data across multiple seek+write operations.
 
 <<disk errors>>
 
+<<file slice>>
+
 <<create output files>>
+
+<<map piece to files>>
+
+<<write piece>>
 
 <<disk tests>>
 @
@@ -526,6 +543,253 @@ mod tests {
         // Should succeed with empty list
         create_output_files(output_dir, &files).expect("create files");
     }
+
+    // ========================================
+    // Piece to File Mapping Tests
+    // ========================================
+
+    #[test]
+    fn map_piece_single_file_first_piece() {
+        // Single file of 1000 bytes, piece length 256
+        // Piece 0 should map to bytes 0-255 of file 0
+        let files = vec![FileInfo {
+            length: 1000,
+            path: PathBuf::from("file.bin"),
+        }];
+
+        let slices = map_piece_to_files(0, 256, 1000, &files);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 0);
+        assert_eq!(slices[0].length, 256);
+    }
+
+    #[test]
+    fn map_piece_single_file_middle_piece() {
+        // Single file of 1000 bytes, piece length 256
+        // Piece 2 should map to bytes 512-767 of file 0
+        let files = vec![FileInfo {
+            length: 1000,
+            path: PathBuf::from("file.bin"),
+        }];
+
+        let slices = map_piece_to_files(2, 256, 1000, &files);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 512);
+        assert_eq!(slices[0].length, 256);
+    }
+
+    #[test]
+    fn map_piece_single_file_last_piece_shorter() {
+        // Single file of 1000 bytes, piece length 256
+        // Piece 3 should map to bytes 768-999 (only 232 bytes, not 256)
+        let files = vec![FileInfo {
+            length: 1000,
+            path: PathBuf::from("file.bin"),
+        }];
+
+        let slices = map_piece_to_files(3, 256, 1000, &files);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 768);
+        assert_eq!(slices[0].length, 232); // 1000 - 768 = 232
+    }
+
+    #[test]
+    fn map_piece_spanning_two_files() {
+        // Two files of 100 bytes each (total 200)
+        // Piece length 64 bytes
+        // Piece 1 spans bytes 64-127 in virtual stream
+        //   - File 0 ends at byte 99, so piece 1 uses bytes 64-99 (36 bytes)
+        //   - File 1 starts at byte 100, so piece 1 uses bytes 100-127 (28 bytes at offset 0)
+        let files = vec![
+            FileInfo { length: 100, path: PathBuf::from("a.bin") },
+            FileInfo { length: 100, path: PathBuf::from("b.bin") },
+        ];
+
+        let slices = map_piece_to_files(1, 64, 200, &files);
+
+        assert_eq!(slices.len(), 2, "piece should span two files");
+
+        // First slice: end of file 0
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 64);
+        assert_eq!(slices[0].length, 36);
+
+        // Second slice: beginning of file 1
+        assert_eq!(slices[1].file_index, 1);
+        assert_eq!(slices[1].file_offset, 0);
+        assert_eq!(slices[1].length, 28);
+    }
+
+    #[test]
+    fn map_piece_spanning_three_files() {
+        // Three small files: 30, 30, 30 bytes (total 90)
+        // Piece length 64 bytes
+        // Piece 0 spans bytes 0-63:
+        //   - File 0: bytes 0-29 (30 bytes at offset 0)
+        //   - File 1: bytes 30-59 (30 bytes at offset 0)
+        //   - File 2: bytes 60-63 (4 bytes at offset 0)
+        let files = vec![
+            FileInfo { length: 30, path: PathBuf::from("a.bin") },
+            FileInfo { length: 30, path: PathBuf::from("b.bin") },
+            FileInfo { length: 30, path: PathBuf::from("c.bin") },
+        ];
+
+        let slices = map_piece_to_files(0, 64, 90, &files);
+
+        assert_eq!(slices.len(), 3, "piece should span three files");
+
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 0);
+        assert_eq!(slices[0].length, 30);
+
+        assert_eq!(slices[1].file_index, 1);
+        assert_eq!(slices[1].file_offset, 0);
+        assert_eq!(slices[1].length, 30);
+
+        assert_eq!(slices[2].file_index, 2);
+        assert_eq!(slices[2].file_offset, 0);
+        assert_eq!(slices[2].length, 4);
+    }
+
+    #[test]
+    fn map_piece_entirely_in_second_file() {
+        // Two files: 200 bytes, 300 bytes (total 500)
+        // Piece length 64 bytes
+        // Piece 4 spans bytes 256-319, entirely within file 1 (which starts at 200)
+        let files = vec![
+            FileInfo { length: 200, path: PathBuf::from("a.bin") },
+            FileInfo { length: 300, path: PathBuf::from("b.bin") },
+        ];
+
+        let slices = map_piece_to_files(4, 64, 500, &files);
+
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].file_index, 1);
+        assert_eq!(slices[0].file_offset, 56); // 256 - 200 = 56
+        assert_eq!(slices[0].length, 64);
+    }
+
+    // ========================================
+    // Write Piece Tests
+    // ========================================
+
+    #[test]
+    fn write_piece_single_file() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Create a single file of 100 bytes
+        let files = vec![FileInfo {
+            length: 100,
+            path: PathBuf::from("test.bin"),
+        }];
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Write piece 0 (32 bytes) at offset 0
+        let piece_data: Vec<u8> = (0..32).collect();
+        write_piece(0, &piece_data, 32, 100, output_dir, &files).expect("write piece");
+
+        // Read back and verify
+        let content = fs::read(output_dir.join("test.bin")).expect("read file");
+        assert_eq!(&content[0..32], &piece_data[..]);
+    }
+
+    #[test]
+    fn write_piece_single_file_middle() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Create a single file of 200 bytes
+        let files = vec![FileInfo {
+            length: 200,
+            path: PathBuf::from("test.bin"),
+        }];
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Write piece 2 (64 bytes) at offset 128
+        let piece_data: Vec<u8> = (100..164).collect();
+        write_piece(2, &piece_data, 64, 200, output_dir, &files).expect("write piece");
+
+        // Read back and verify
+        let content = fs::read(output_dir.join("test.bin")).expect("read file");
+        assert_eq!(&content[128..192], &piece_data[..]);
+
+        // Verify other regions are still zeros (sparse file)
+        assert!(content[0..128].iter().all(|&b| b == 0), "start should be zeros");
+    }
+
+    #[test]
+    fn write_piece_spanning_two_files() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Two files: 100 bytes each
+        let files = vec![
+            FileInfo { length: 100, path: PathBuf::from("a.bin") },
+            FileInfo { length: 100, path: PathBuf::from("b.bin") },
+        ];
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Piece 1 (64 bytes) spans bytes 64-127 in virtual stream
+        // File 0: bytes 64-99 (36 bytes), File 1: bytes 0-27 (28 bytes)
+        let piece_data: Vec<u8> = (0..64).collect();
+        write_piece(1, &piece_data, 64, 200, output_dir, &files).expect("write piece");
+
+        // Verify file 0: bytes 64-99 should contain piece_data[0..36]
+        let content_a = fs::read(output_dir.join("a.bin")).expect("read a.bin");
+        assert_eq!(&content_a[64..100], &piece_data[0..36]);
+
+        // Verify file 1: bytes 0-27 should contain piece_data[36..64]
+        let content_b = fs::read(output_dir.join("b.bin")).expect("read b.bin");
+        assert_eq!(&content_b[0..28], &piece_data[36..64]);
+    }
+
+    #[test]
+    fn write_piece_last_piece_shorter() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Single file of 100 bytes, piece length 64
+        // Last piece (piece 1) is only 36 bytes (100 - 64 = 36)
+        let files = vec![FileInfo {
+            length: 100,
+            path: PathBuf::from("test.bin"),
+        }];
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Write last piece (36 bytes)
+        let piece_data: Vec<u8> = (200..236).collect();
+        write_piece(1, &piece_data, 64, 100, output_dir, &files).expect("write piece");
+
+        // Verify
+        let content = fs::read(output_dir.join("test.bin")).expect("read file");
+        assert_eq!(&content[64..100], &piece_data[..]);
+    }
+
+    #[test]
+    fn write_piece_error_includes_path() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Don't create the files - write should fail
+        let files = vec![FileInfo {
+            length: 100,
+            path: PathBuf::from("missing.bin"),
+        }];
+
+        let piece_data = vec![0u8; 32];
+        let result = write_piece(0, &piece_data, 32, 100, output_dir, &files);
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("missing.bin"), "error should include filename: {}", err_msg);
+    }
 }
 @
 
@@ -539,9 +803,295 @@ The tests cover the main scenarios:
 \item \textbf{Zero-length files}: Edge case handled correctly
 \item \textbf{Sparse allocation}: Large file doesn't consume excessive disk space
 \item \textbf{Error context}: Error messages include the problematic path
+\item \textbf{Piece mapping}: Single file, spanning two files, spanning three files
+\item \textbf{Piece writing}: Single file writes, multi-file spanning writes
+\item \textbf{Last piece handling}: Shorter last pieces are handled correctly
 \end{itemize}
 
 The sparse file test creates a 1 GB file to verify that sparse allocation works.
 On systems with sparse file support, this completes instantly despite the large
 size. The test doesn't verify actual disk usage (which varies by filesystem)
 but confirms the API works correctly.
+
+The piece mapping and writing tests verify the core functionality needed for
+multi-file torrents. The test case with 3 files of 100KB each and 64KB pieces
+demonstrates that a piece can span multiple files and be written correctly.
+
+\subsection{Mapping Pieces to Files}
+
+BitTorrent treats all files in a torrent as a single contiguous byte stream. When
+we download piece $i$, we receive bytes in the range
+$[i \times \text{piece\_length}, (i+1) \times \text{piece\_length})$ of this
+virtual stream. For single-file torrents, mapping is trivial: piece $i$ goes at
+offset $i \times \text{piece\_length}$ in the file. For multi-file torrents,
+a piece may span multiple files, requiring us to split the write into multiple
+operations.
+
+The [[FileSlice]] structure represents one such write operation: a range of bytes
+to write to a specific file at a specific offset.
+
+<<file slice>>=
+/// A slice of data to be written to a specific file at a specific offset.
+///
+/// When a piece spans multiple files, writing it requires multiple `FileSlice`
+/// operations. Each slice describes: which file (by index), where in that file
+/// (byte offset), and how many bytes to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSlice {
+    /// Index into the torrent's file list.
+    pub file_index: usize,
+    /// Byte offset within the file where writing should begin.
+    pub file_offset: u64,
+    /// Number of bytes to write to this file.
+    pub length: u64,
+}
+@
+
+The mapping algorithm is a key piece of the disk module. Given a piece index
+and the torrent's file list, we determine which file(s) the piece maps to.
+
+<<map piece to files>>=
+/// Maps a piece to the file slices it spans.
+///
+/// BitTorrent concatenates all files in a torrent into a single byte stream.
+/// A piece occupies a contiguous range in this stream, but may span multiple
+/// physical files. This function determines which files a piece touches and
+/// what portion of the piece data goes to each file.
+///
+/// # Arguments
+///
+/// * `piece_index` - Index of the piece (0-based)
+/// * `piece_length` - Standard piece length from the metainfo
+/// * `total_length` - Total size of all files combined
+/// * `files` - List of files from the torrent's metainfo
+///
+/// # Returns
+///
+/// A vector of `FileSlice` describing where to write each portion of the piece.
+/// The slices are ordered by file index and cover the entire piece without gaps.
+/// For single-file torrents, this always returns exactly one slice.
+///
+/// # Panics
+///
+/// Panics if `files` is empty (invalid torrent metadata).
+///
+/// # Example
+///
+/// ```ignore
+/// // A piece that spans two files:
+/// // File 0: 100 bytes, File 1: 100 bytes
+/// // Piece length: 64 bytes, Piece 1 spans bytes 64-127
+/// // This means: 36 bytes in File 0 (offset 64-99), 28 bytes in File 1 (offset 0-27)
+/// let slices = map_piece_to_files(1, 64, 200, &files);
+/// assert_eq!(slices.len(), 2);
+/// assert_eq!(slices[0], FileSlice { file_index: 0, file_offset: 64, length: 36 });
+/// assert_eq!(slices[1], FileSlice { file_index: 1, file_offset: 0, length: 28 });
+/// ```
+pub fn map_piece_to_files(
+    piece_index: u32,
+    piece_length: u32,
+    total_length: u64,
+    files: &[FileInfo],
+) -> Vec<FileSlice> {
+    assert!(!files.is_empty(), "torrent must have at least one file");
+
+    // Calculate the byte range of this piece in the virtual stream
+    let piece_start = u64::from(piece_index) * u64::from(piece_length);
+
+    // The last piece may be shorter than piece_length
+    let piece_end = std::cmp::min(
+        piece_start + u64::from(piece_length),
+        total_length,
+    );
+    let actual_piece_length = piece_end - piece_start;
+
+    if actual_piece_length == 0 {
+        return vec![];
+    }
+
+    let mut slices = Vec::new();
+    let mut file_start: u64 = 0; // Start of current file in virtual stream
+
+    for (file_index, file_info) in files.iter().enumerate() {
+        let file_end = file_start + file_info.length;
+
+        // Skip files that end before our piece starts
+        if file_end <= piece_start {
+            file_start = file_end;
+            continue;
+        }
+
+        // Stop if we've passed our piece
+        if file_start >= piece_end {
+            break;
+        }
+
+        // Calculate the overlap between piece and file
+        let overlap_start = std::cmp::max(piece_start, file_start);
+        let overlap_end = std::cmp::min(piece_end, file_end);
+        let overlap_length = overlap_end - overlap_start;
+
+        if overlap_length > 0 {
+            slices.push(FileSlice {
+                file_index,
+                file_offset: overlap_start - file_start,
+                length: overlap_length,
+            });
+        }
+
+        file_start = file_end;
+    }
+
+    slices
+}
+@
+
+The algorithm walks through files in order, tracking where each file starts in
+the virtual byte stream. For each file, it calculates the overlap with the piece
+range. This handles all cases uniformly:
+
+\begin{itemize}
+\item \textbf{Single-file torrent}: The piece falls entirely within the one file.
+\item \textbf{Piece within one file}: Common case where pieces don't cross boundaries.
+\item \textbf{Piece spanning two files}: The piece is split across two files.
+\item \textbf{Piece spanning many files}: Rare case where small files are involved.
+\item \textbf{Last piece}: May be shorter than [[piece\_length]]; handled by clamping.
+\end{itemize}
+
+\subsection{Writing Piece Data}
+
+With the mapping in hand, writing a verified piece is straightforward: for each
+[[FileSlice]], we open the file, seek to the correct offset, and write the
+corresponding portion of the piece data.
+
+We add a new error variant for write failures.
+
+<<disk write error>>=
+    /// Failed to seek within a file.
+    ///
+    /// This typically indicates:
+    /// - Corrupt file system
+    /// - File was truncated externally
+    #[error("failed to seek in {path} to offset {offset}: {source}")]
+    SeekError {
+        /// The file path we were seeking in.
+        path: PathBuf,
+        /// The offset we tried to seek to.
+        offset: u64,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Failed to write data to a file.
+    ///
+    /// This can happen if:
+    /// - Disk is full (ENOSPC)
+    /// - Permission denied
+    /// - File was removed during operation
+    #[error("failed to write to {path} at offset {offset}: {source}")]
+    WriteError {
+        /// The file path we were writing to.
+        path: PathBuf,
+        /// The byte offset where the write failed.
+        offset: u64,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+@
+
+<<write piece>>=
+use std::io::{Seek, SeekFrom, Write};
+
+/// Writes verified piece data to the correct location(s) in the output files.
+///
+/// After a piece has been downloaded and its hash verified, this function
+/// writes the piece data to disk. For multi-file torrents, a piece may span
+/// multiple files, requiring multiple seek+write operations.
+///
+/// # Arguments
+///
+/// * `piece_index` - Index of the piece being written
+/// * `data` - The verified piece data
+/// * `piece_length` - Standard piece length from metainfo (last piece may be smaller)
+/// * `total_length` - Total size of all files combined
+/// * `output_dir` - Base directory where files are stored
+/// * `files` - List of files from the torrent's metainfo
+///
+/// # Errors
+///
+/// Returns `DiskError::WriteError` if:
+/// - A file cannot be opened for writing
+/// - Seeking to the correct offset fails
+/// - Writing the data fails (e.g., disk full)
+///
+/// # Example
+///
+/// ```ignore
+/// // Write piece 5 to a single-file torrent
+/// write_piece(5, &piece_data, 262144, 1_000_000, output_dir, &files)?;
+/// ```
+pub fn write_piece(
+    piece_index: u32,
+    data: &[u8],
+    piece_length: u32,
+    total_length: u64,
+    output_dir: &Path,
+    files: &[FileInfo],
+) -> Result<(), DiskError> {
+    let slices = map_piece_to_files(piece_index, piece_length, total_length, files);
+
+    let mut data_offset: usize = 0;
+
+    for slice in slices {
+        let file_info = &files[slice.file_index];
+        let full_path = output_dir.join(&file_info.path);
+
+        // Open file for writing (file should already exist from create_output_files)
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&full_path)
+            .map_err(|e| DiskError::WriteError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        // Seek to the correct position
+        file.seek(SeekFrom::Start(slice.file_offset))
+            .map_err(|e| DiskError::SeekError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        // Extract the portion of piece data for this slice
+        let slice_len = slice.length as usize;
+        let slice_data = &data[data_offset..data_offset + slice_len];
+
+        // Write the data
+        file.write_all(slice_data)
+            .map_err(|e| DiskError::WriteError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        data_offset += slice_len;
+    }
+
+    Ok(())
+}
+@
+
+The implementation follows the explicit seek+write approach recommended by the
+PRD for pedagogical clarity. Each [[FileSlice]] tells us exactly where to write:
+we open the file, seek to [[file\_offset]], and write [[length]] bytes from the
+piece data starting at our current position in the data buffer.
+
+Note that we don't call [[sync\_data]] or [[sync\_all]] after each write. While
+this means data might be lost on a crash, it significantly improves performance.
+For a production client, you might periodically sync to disk or sync after
+writing each piece, depending on your durability requirements.
+
