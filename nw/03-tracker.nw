@@ -140,6 +140,10 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<tracker errors>>
 
+<<tracker event enum>>
+
+<<tracker request struct>>
+
 <<url encoding>>
 
 <<peer id generation>>
@@ -149,6 +153,10 @@ mod tests {
     use super::*;
 
     <<tracker error tests>>
+
+    <<tracker event tests>>
+
+    <<tracker request tests>>
 
     <<url encoding tests>>
 
@@ -209,6 +217,401 @@ These tests verify that:
 \item [[TrackerError]] implements [[std::error::Error]] as required.
 \item [[TrackerError]] implements [[Debug]] for diagnostic purposes.
 \end{enumerate}
+
+\subsection{Tracker Request Parameters}
+
+Before we can announce to a tracker, we need to gather all the parameters that
+the BitTorrent protocol requires. BEP 3 specifies these parameters precisely,
+and getting them right is essential for successful tracker communication.
+
+The parameters fall into three categories:
+
+\begin{description}
+\item[Identity parameters] The [[info_hash]] identifies which torrent we're
+  interested in, while [[peer_id]] identifies our specific client instance.
+  Both are 20-byte binary values.
+
+\item[Network parameters] The [[port]] tells the tracker what port we're
+  listening on, so other peers can connect to us.
+
+\item[Progress parameters] The [[uploaded]], [[downloaded]], and [[left]]
+  fields report our current transfer statistics. Trackers use these for
+  statistics and may use them to prioritize peer selection.
+
+\item[Control parameters] The [[event]] field signals lifecycle events
+  (started, stopped, completed), while [[compact]] requests the efficient
+  BEP-23 peer list format.
+\end{description}
+
+\subsubsection{Tracker Events}
+
+The [[event]] parameter is optional in most announces, but \emph{must} be
+sent for certain lifecycle events. BEP 3 defines three events:
+
+\begin{description}
+\item[started] Sent on the first announce when a download begins. The tracker
+  uses this to add us to the swarm and may return a larger peer list for
+  initial seeding.
+
+\item[stopped] Sent when the client shuts down gracefully. This allows the
+  tracker to immediately remove us from the swarm, rather than waiting for
+  our entry to expire. Clients that crash or lose network connectivity
+  cannot send this event, so trackers must handle missing ``stopped'' events.
+
+\item[completed] Sent when the download finishes (all pieces verified). This
+  only happens once per torrent---if we start the client with an already-complete
+  torrent, we don't send ``completed'' again. Trackers use this to update their
+  statistics on seeders vs. leechers.
+\end{description}
+
+Regular periodic announces (after the first ``started'') omit the event
+parameter entirely. This is represented as [[None]] in our enum wrapper.
+
+<<tracker event enum>>=
+/// Events that can be sent to the tracker during the torrent lifecycle.
+///
+/// BEP 3 defines three events that signal state changes to the tracker.
+/// Regular periodic announces omit the event parameter entirely.
+///
+/// # Protocol Details
+///
+/// - `started`: First announce, adds us to the swarm
+/// - `stopped`: Graceful shutdown, removes us from swarm immediately
+/// - `completed`: Download finished, transition from leecher to seeder
+///
+/// Note: If we start with an already-complete torrent (resuming as seeder),
+/// we should send `started`, not `completed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackerEvent {
+    /// First announce when starting a download.
+    ///
+    /// Must be sent on the very first announce for a torrent. The tracker
+    /// adds us to the swarm and typically returns a larger initial peer list.
+    Started,
+
+    /// Graceful shutdown notification.
+    ///
+    /// Should be sent when the client is shutting down cleanly. This allows
+    /// the tracker to remove us from the swarm immediately rather than
+    /// waiting for our entry to expire (typically 30-60 minutes).
+    Stopped,
+
+    /// Download completed notification.
+    ///
+    /// Sent exactly once when all pieces have been downloaded and verified.
+    /// After this, we are a seeder (though this client doesn't implement
+    /// seeding). Do not send if starting with an already-complete torrent.
+    Completed,
+}
+
+impl TrackerEvent {
+    /// Returns the event string as it appears in the tracker URL.
+    ///
+    /// BEP 3 specifies these exact strings: "started", "stopped", "completed".
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrackerEvent::Started => "started",
+            TrackerEvent::Stopped => "stopped",
+            TrackerEvent::Completed => "completed",
+        }
+    }
+}
+@
+
+\subsubsection{The Request Structure}
+
+Now we define a struct that holds all parameters needed for a tracker announce.
+This struct serves as both documentation (what does an announce need?) and as
+a clean interface for the announce function we'll implement later.
+
+<<tracker request struct>>=
+/// All parameters required for a tracker announce request.
+///
+/// This struct captures the complete state needed to construct an announce URL.
+/// It is constructed by the client before each announce and used to build the
+/// HTTP GET request to the tracker.
+///
+/// # BEP 3 Parameters
+///
+/// | Parameter | Type | Description |
+/// |-----------|------|-------------|
+/// | `info_hash` | 20 bytes | SHA1 hash of the bencoded info dictionary |
+/// | `peer_id` | 20 bytes | Client's unique identifier for this session |
+/// | `port` | integer | Port number client is listening on |
+/// | `uploaded` | integer | Total bytes uploaded since `started` event |
+/// | `downloaded` | integer | Total bytes downloaded since `started` event |
+/// | `left` | integer | Number of bytes still needed (0 = seeding) |
+/// | `event` | string | Optional: started, stopped, or completed |
+/// | `compact` | flag | Request compact peer list (BEP-23) |
+///
+/// # Example
+///
+/// ```ignore
+/// let request = TrackerRequest {
+///     info_hash: torrent.info_hash,
+///     peer_id: generate_peer_id(),
+///     port: 6881,
+///     uploaded: 0,
+///     downloaded: 0,
+///     left: torrent.total_length,
+///     event: Some(TrackerEvent::Started),
+///     compact: true,
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct TrackerRequest {
+    /// SHA1 hash of the bencoded info dictionary.
+    ///
+    /// This 20-byte value uniquely identifies the torrent. It must match
+    /// exactly what the tracker expects, computed from the original .torrent
+    /// file's info dictionary.
+    pub info_hash: [u8; 20],
+
+    /// Unique identifier for this client session.
+    ///
+    /// This 20-byte value is generated once at startup (see [`generate_peer_id`])
+    /// and reused for all announces and peer handshakes. It follows the
+    /// Azureus-style format defined in BEP 20.
+    pub peer_id: [u8; 20],
+
+    /// Port number the client is listening on for incoming peer connections.
+    ///
+    /// Standard BitTorrent ports are 6881-6889, but any valid port works.
+    /// If we're behind NAT without port forwarding, peers won't be able to
+    /// connect to us, but we can still connect to them.
+    pub port: u16,
+
+    /// Total number of bytes uploaded since the "started" event.
+    ///
+    /// This is cumulative across all peers for this torrent session.
+    /// Trackers use this for statistics and may factor it into peer selection.
+    /// Set to 0 for the initial announce.
+    pub uploaded: u64,
+
+    /// Total number of bytes downloaded since the "started" event.
+    ///
+    /// This counts raw bytes received, including bytes from pieces that
+    /// later failed hash verification. Set to 0 for the initial announce.
+    pub downloaded: u64,
+
+    /// Number of bytes still needed to complete the download.
+    ///
+    /// Calculated as `total_torrent_size - verified_bytes`. When this reaches
+    /// 0, we have all pieces and can send the "completed" event.
+    pub left: u64,
+
+    /// Optional event indicating a state change.
+    ///
+    /// - `Some(Started)`: First announce for this torrent
+    /// - `Some(Stopped)`: Client is shutting down
+    /// - `Some(Completed)`: Download just finished
+    /// - `None`: Regular periodic announce
+    pub event: Option<TrackerEvent>,
+
+    /// Request compact peer list format (BEP-23).
+    ///
+    /// When true, the tracker should return peers as a byte string where
+    /// each peer is 6 bytes: 4 bytes for IPv4 address + 2 bytes for port
+    /// (all big-endian). This is more efficient than the dictionary format.
+    ///
+    /// Most modern trackers only support compact format, so this should
+    /// typically be `true`.
+    pub compact: bool,
+}
+@
+
+The struct uses fixed-size arrays for [[info_hash]] and [[peer_id]] rather than
+[[Vec<u8>]] because these are always exactly 20 bytes. This provides compile-time
+guarantees about the size and avoids heap allocation.
+
+The numeric types are chosen to match the protocol requirements:
+\begin{itemize}
+\item [[port]] is [[u16]] because TCP ports range from 0 to 65535.
+\item [[uploaded]], [[downloaded]], and [[left]] are [[u64]] because torrents
+  can be many terabytes in size, and cumulative upload statistics can exceed
+  the torrent size.
+\end{itemize}
+
+\subsubsection{Tracker Event Tests}
+
+We verify that the event enum correctly converts to the protocol strings.
+
+<<tracker event tests>>=
+#[test]
+fn tracker_event_started_as_str() {
+    assert_eq!(TrackerEvent::Started.as_str(), "started");
+}
+
+#[test]
+fn tracker_event_stopped_as_str() {
+    assert_eq!(TrackerEvent::Stopped.as_str(), "stopped");
+}
+
+#[test]
+fn tracker_event_completed_as_str() {
+    assert_eq!(TrackerEvent::Completed.as_str(), "completed");
+}
+
+#[test]
+fn tracker_event_implements_debug() {
+    let event = TrackerEvent::Started;
+    let debug = format!("{:?}", event);
+    assert!(debug.contains("Started"));
+}
+
+#[test]
+fn tracker_event_implements_clone() {
+    let event = TrackerEvent::Completed;
+    let cloned = event.clone();
+    assert_eq!(event, cloned);
+}
+
+#[test]
+fn tracker_event_implements_copy() {
+    let event = TrackerEvent::Stopped;
+    let copied = event; // Copy, not move
+    assert_eq!(copied.as_str(), "stopped");
+    // Original is still valid because Copy
+    assert_eq!(event.as_str(), "stopped");
+}
+@
+
+\subsubsection{Tracker Request Tests}
+
+We verify that the request struct can be constructed with valid values and
+that it properly implements the required traits.
+
+<<tracker request tests>>=
+#[test]
+fn tracker_request_construction() {
+    let info_hash = [0x12u8; 20];
+    let peer_id = [0x34u8; 20];
+
+    let request = TrackerRequest {
+        info_hash,
+        peer_id,
+        port: 6881,
+        uploaded: 1024,
+        downloaded: 2048,
+        left: 1_000_000,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    assert_eq!(request.info_hash, [0x12u8; 20]);
+    assert_eq!(request.peer_id, [0x34u8; 20]);
+    assert_eq!(request.port, 6881);
+    assert_eq!(request.uploaded, 1024);
+    assert_eq!(request.downloaded, 2048);
+    assert_eq!(request.left, 1_000_000);
+    assert_eq!(request.event, Some(TrackerEvent::Started));
+    assert!(request.compact);
+}
+
+#[test]
+fn tracker_request_without_event() {
+    let request = TrackerRequest {
+        info_hash: [0u8; 20],
+        peer_id: [0u8; 20],
+        port: 51413,
+        uploaded: 0,
+        downloaded: 0,
+        left: 0,
+        event: None,
+        compact: true,
+    };
+
+    assert!(request.event.is_none());
+}
+
+#[test]
+fn tracker_request_implements_debug() {
+    let request = TrackerRequest {
+        info_hash: [0xAAu8; 20],
+        peer_id: [0xBBu8; 20],
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 100,
+        event: None,
+        compact: false,
+    };
+
+    let debug = format!("{:?}", request);
+    assert!(debug.contains("TrackerRequest"));
+    assert!(debug.contains("6881"));
+}
+
+#[test]
+fn tracker_request_implements_clone() {
+    let original = TrackerRequest {
+        info_hash: [1u8; 20],
+        peer_id: [2u8; 20],
+        port: 8080,
+        uploaded: 500,
+        downloaded: 1000,
+        left: 5000,
+        event: Some(TrackerEvent::Completed),
+        compact: true,
+    };
+
+    let cloned = original.clone();
+
+    assert_eq!(cloned.info_hash, original.info_hash);
+    assert_eq!(cloned.peer_id, original.peer_id);
+    assert_eq!(cloned.port, original.port);
+    assert_eq!(cloned.uploaded, original.uploaded);
+    assert_eq!(cloned.downloaded, original.downloaded);
+    assert_eq!(cloned.left, original.left);
+    assert_eq!(cloned.event, original.event);
+    assert_eq!(cloned.compact, original.compact);
+}
+
+#[test]
+fn tracker_request_large_values() {
+    // Test with maximum realistic values for a large torrent
+    let request = TrackerRequest {
+        info_hash: [0xFFu8; 20],
+        peer_id: [0xFFu8; 20],
+        port: 65535, // Max port
+        uploaded: u64::MAX,
+        downloaded: u64::MAX,
+        left: u64::MAX,
+        event: None,
+        compact: true,
+    };
+
+    // Verify the struct can hold maximum values
+    assert_eq!(request.port, u16::MAX);
+    assert_eq!(request.uploaded, u64::MAX);
+    assert_eq!(request.downloaded, u64::MAX);
+    assert_eq!(request.left, u64::MAX);
+}
+
+#[test]
+fn tracker_request_realistic_initial_announce() {
+    // Simulate a realistic first announce for a 1GB torrent
+    let torrent_size: u64 = 1_073_741_824; // 1 GiB
+
+    let request = TrackerRequest {
+        info_hash: [
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33,
+            0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+        ],
+        peer_id: *b"-LT0001-aabbccddee01",
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: torrent_size,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    assert_eq!(request.left, torrent_size);
+    assert!(request.event.is_some());
+    assert_eq!(request.event.unwrap().as_str(), "started");
+}
+@
 
 \subsection{URL Encoding for Binary Data}
 
