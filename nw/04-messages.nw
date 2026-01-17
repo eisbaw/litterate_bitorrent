@@ -621,6 +621,10 @@ impl Handshake {
     }
 
     <<handshake to_bytes>>
+
+    <<handshake from_bytes>>
+
+    <<handshake validate_info_hash>>
 }
 @
 
@@ -708,6 +712,206 @@ the reserved bytes (positions 20-27). This is a common pattern: zero-initialize
 and then fill in the non-zero parts. If we ever support protocol extensions
 that use the reserved bytes, we would add logic here to set specific bits.
 
+\subsubsection{Handshake Parsing (Deserialization)}
+
+When receiving a handshake from a peer, we must parse the 68-byte buffer and
+validate its contents. Unlike construction (where Rust's type system enforces
+correctness), parsing untrusted network data requires explicit validation at
+every step.
+
+The parsing process is the inverse of serialization, but with an important
+asymmetry: serialization cannot fail (we control the input), while parsing
+can fail in many ways (the peer controls the input). We return [[Result]] to
+propagate validation failures, using [[PeerError::HandshakeFailed]] with
+descriptive messages.
+
+The validation order matters for security and performance:
+
+\begin{enumerate}
+\item \textbf{Length check}: Reject immediately if not exactly 68 bytes. This
+  prevents out-of-bounds reads and provides a clear error for truncated data.
+
+\item \textbf{Protocol string length}: The first byte must be 19. A different
+  value indicates either a different protocol version (unlikely) or corrupted
+  data. We check this before reading the protocol string to fail fast.
+
+\item \textbf{Protocol string}: The 19 bytes starting at position 1 must match
+  ``BitTorrent protocol'' exactly. This confirms the peer speaks our protocol.
+
+\item \textbf{Reserved bytes}: We read but do not validate the 8 reserved bytes.
+  Extensions set bits here; for forward compatibility we accept any values.
+
+\item \textbf{Info hash and peer ID}: Extract the final 40 bytes. These are
+  opaque binary data with no intrinsic validity constraints.
+\end{enumerate}
+
+Note that we do \emph{not} validate the info\_hash during parsing. The parser
+extracts whatever 20 bytes are present; the caller must compare against the
+expected info\_hash using [[validate_info_hash]]. This separation keeps parsing
+pure (no external context needed) and makes the security-critical check explicit.
+
+<<handshake from_bytes>>=
+/// Parses a handshake from its 68-byte wire format.
+///
+/// This method validates the handshake structure according to BEP 3:
+/// - Input must be exactly 68 bytes
+/// - First byte (pstrlen) must be 19
+/// - Bytes 1-19 must be "BitTorrent protocol"
+///
+/// The reserved bytes (20-27) are accepted but not validated, allowing
+/// forward compatibility with protocol extensions.
+///
+/// # Arguments
+///
+/// * `bytes` - A byte slice containing the handshake data
+///
+/// # Returns
+///
+/// * `Ok(Handshake)` - Successfully parsed handshake
+/// * `Err(PeerError::HandshakeFailed)` - Validation failed
+///
+/// # Errors
+///
+/// Returns [`PeerError::HandshakeFailed`] if:
+/// - Input length is not 68 bytes
+/// - Protocol string length byte is not 19
+/// - Protocol string is not "BitTorrent protocol"
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::{Handshake, PeerError, HANDSHAKE_LENGTH};
+///
+/// // Create a valid handshake buffer
+/// let info_hash = [0xAB; 20];
+/// let peer_id = *b"-LB0001-123456789012";
+/// let original = Handshake::new(info_hash, peer_id);
+/// let bytes = original.to_bytes();
+///
+/// // Parse it back
+/// let parsed = Handshake::from_bytes(&bytes).unwrap();
+/// assert_eq!(parsed.info_hash(), &info_hash);
+/// assert_eq!(parsed.peer_id(), &peer_id);
+///
+/// // Invalid handshakes are rejected
+/// let short_buffer = [0u8; 50];
+/// assert!(Handshake::from_bytes(&short_buffer).is_err());
+/// ```
+pub fn from_bytes(bytes: &[u8]) -> Result<Self, PeerError> {
+    // Validate length first - this is the fastest check and prevents
+    // out-of-bounds access in subsequent steps
+    if bytes.len() != HANDSHAKE_LENGTH {
+        return Err(PeerError::HandshakeFailed(format!(
+            "expected {} bytes, got {}",
+            HANDSHAKE_LENGTH,
+            bytes.len()
+        )));
+    }
+
+    // Validate protocol string length (pstrlen)
+    let pstrlen = bytes[0];
+    if pstrlen != 19 {
+        return Err(PeerError::HandshakeFailed(format!(
+            "invalid protocol string length: expected 19, got {}",
+            pstrlen
+        )));
+    }
+
+    // Validate protocol string (pstr)
+    let pstr = &bytes[1..20];
+    if pstr != PROTOCOL_STRING {
+        // Include the actual string if it's valid UTF-8, otherwise show hex
+        let pstr_display = match std::str::from_utf8(pstr) {
+            Ok(s) => format!("\"{}\"", s),
+            Err(_) => format!("{:02x?}", pstr),
+        };
+        return Err(PeerError::HandshakeFailed(format!(
+            "invalid protocol string: expected \"BitTorrent protocol\", got {}",
+            pstr_display
+        )));
+    }
+
+    // Reserved bytes (20-27) are accepted without validation for
+    // forward compatibility with extensions like BEP 10
+
+    // Extract info_hash (bytes 28-47)
+    let info_hash: [u8; 20] = bytes[28..48]
+        .try_into()
+        .expect("slice length verified above");
+
+    // Extract peer_id (bytes 48-67)
+    let peer_id: [u8; 20] = bytes[48..68]
+        .try_into()
+        .expect("slice length verified above");
+
+    Ok(Self { info_hash, peer_id })
+}
+@
+
+The [[try_into()]] calls convert slices to fixed-size arrays. We use [[expect]]
+rather than [[?]] because the slice lengths are guaranteed by our prior length
+check---if these panicked, it would indicate a bug in our code, not invalid input.
+
+\subsubsection{Info Hash Validation}
+
+After parsing a peer's handshake, the caller must verify the info\_hash matches
+their expected torrent. This is a critical security check: without it, a malicious
+peer could inject data for the wrong torrent.
+
+We provide a dedicated method for this check rather than requiring callers to
+do the comparison themselves. This makes the security-critical operation explicit
+and self-documenting, and allows for future enhancements (like constant-time
+comparison if we ever handle sensitive hashes).
+
+<<handshake validate_info_hash>>=
+/// Validates that this handshake's info_hash matches the expected value.
+///
+/// After receiving a peer's handshake, you **must** call this method to
+/// verify the peer is serving the torrent you requested. Skipping this
+/// check is a security vulnerability: the peer could send data for a
+/// completely different torrent.
+///
+/// # Arguments
+///
+/// * `expected` - The info_hash of the torrent you are downloading
+///
+/// # Returns
+///
+/// * `Ok(())` - The info hashes match
+/// * `Err(PeerError::HandshakeFailed)` - The info hashes do not match
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::Handshake;
+///
+/// let expected_hash = [0xAB; 20];
+/// let handshake = Handshake::new([0xAB; 20], *b"-PEER-ID-12345678901");
+///
+/// // Validation succeeds when hashes match
+/// assert!(handshake.validate_info_hash(&expected_hash).is_ok());
+///
+/// // Validation fails when hashes differ
+/// let wrong_hash = [0xCD; 20];
+/// assert!(handshake.validate_info_hash(&wrong_hash).is_err());
+/// ```
+pub fn validate_info_hash(&self, expected: &[u8; 20]) -> Result<(), PeerError> {
+    if &self.info_hash == expected {
+        Ok(())
+    } else {
+        Err(PeerError::HandshakeFailed(format!(
+            "info_hash mismatch: expected {:02x?}, got {:02x?}",
+            expected, self.info_hash
+        )))
+    }
+}
+@
+
+The error message includes both the expected and actual hashes in hexadecimal
+format, which is invaluable for debugging. In production, you might truncate
+these to avoid log spam, but for development the full hashes help diagnose
+configuration issues (e.g., using the wrong torrent file).
+
 \subsubsection{Handshake Tests}
 
 We test that the handshake correctly stores and returns its fields, and verify
@@ -781,6 +985,10 @@ fn handshake_debug_output() {
 }
 
 <<handshake serialization tests>>
+
+<<handshake parsing tests>>
+
+<<handshake info hash validation tests>>
 @
 
 These tests verify:
@@ -908,14 +1116,269 @@ bytes and verifies they match the original. This is a partial round-trip test;
 the full round-trip (using [[from_bytes]]) will be tested once that method is
 implemented in a later task.
 
+\subsubsection{Handshake Parsing Tests}
+
+The parsing tests verify that [[from_bytes]] correctly validates and extracts
+handshake data. We test the happy path (valid handshakes) and all error cases
+(wrong length, wrong pstrlen, wrong protocol string).
+
+<<handshake parsing tests>>=
+#[test]
+fn from_bytes_parses_valid_handshake() {
+    let info_hash = [0xAB; 20];
+    let peer_id = *b"-LB0001-123456789012";
+
+    // Create a valid handshake and serialize it
+    let original = Handshake::new(info_hash, peer_id);
+    let bytes = original.to_bytes();
+
+    // Parse it back
+    let parsed = Handshake::from_bytes(&bytes).expect("valid handshake should parse");
+
+    assert_eq!(parsed.info_hash(), &info_hash);
+    assert_eq!(parsed.peer_id(), &peer_id);
+    assert_eq!(parsed, original);
+}
+
+#[test]
+fn from_bytes_round_trip() {
+    // Test round-trip with various byte patterns
+    let test_cases = [
+        ([0x00; 20], [0x00; 20]),
+        ([0xFF; 20], [0xFF; 20]),
+        ([0xAB; 20], [0xCD; 20]),
+    ];
+
+    for (info_hash, peer_id) in test_cases {
+        let original = Handshake::new(info_hash, peer_id);
+        let bytes = original.to_bytes();
+        let parsed = Handshake::from_bytes(&bytes).expect("round-trip should succeed");
+        assert_eq!(parsed, original);
+    }
+}
+
+#[test]
+fn from_bytes_rejects_too_short() {
+    // Test various lengths less than 68
+    for len in [0, 1, 19, 20, 27, 47, 67] {
+        let bytes = vec![0u8; len];
+        let result = Handshake::from_bytes(&bytes);
+
+        assert!(result.is_err(), "length {} should be rejected", len);
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected 68 bytes") || msg.contains("expected"),
+            "error for length {} should mention expected: {}",
+            len,
+            msg
+        );
+    }
+}
+
+#[test]
+fn from_bytes_rejects_too_long() {
+    // Create a valid handshake with extra bytes appended
+    let hs = Handshake::new([0; 20], [0; 20]);
+    let mut bytes = hs.to_bytes().to_vec();
+    bytes.push(0xFF); // Make it 69 bytes
+
+    let result = Handshake::from_bytes(&bytes);
+    assert!(result.is_err(), "69 bytes should be rejected");
+
+    // Also test significantly longer
+    let long_bytes = vec![0u8; 100];
+    assert!(
+        Handshake::from_bytes(&long_bytes).is_err(),
+        "100 bytes should be rejected"
+    );
+}
+
+#[test]
+fn from_bytes_rejects_wrong_pstrlen() {
+    // Create a buffer with wrong protocol string length byte.
+    // The wire format always has 19 bytes in the pstr slot, but we test
+    // that the pstrlen byte (first byte) being wrong causes rejection.
+    let mut bytes = [0u8; 68];
+    bytes[0] = 18; // Wrong: should be 19
+    // Fill pstr slot with valid protocol string (content is irrelevant since
+    // pstrlen check fails first)
+    bytes[1..20].copy_from_slice(b"BitTorrent protocol");
+
+    let result = Handshake::from_bytes(&bytes);
+    assert!(result.is_err());
+
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("protocol string length") || msg.contains("expected 19"),
+        "error should mention pstrlen: {}",
+        msg
+    );
+}
+
+#[test]
+fn from_bytes_rejects_wrong_pstr() {
+    // Create a buffer with wrong protocol string but correct length
+    let mut bytes = [0u8; 68];
+    bytes[0] = 19; // Correct length
+    bytes[1..20].copy_from_slice(b"BitTorrent protocoX"); // Wrong: last char
+
+    let result = Handshake::from_bytes(&bytes);
+    assert!(result.is_err());
+
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("protocol string") || msg.contains("BitTorrent"),
+        "error should mention protocol string: {}",
+        msg
+    );
+}
+
+#[test]
+fn from_bytes_rejects_completely_wrong_pstr() {
+    // Create a buffer with completely different protocol string
+    let mut bytes = [0u8; 68];
+    bytes[0] = 19;
+    bytes[1..20].copy_from_slice(b"Not BitTorrent....!"); // Completely wrong
+
+    let result = Handshake::from_bytes(&bytes);
+    assert!(result.is_err());
+
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("protocol string"),
+        "error should mention protocol string: {}",
+        msg
+    );
+}
+
+#[test]
+fn from_bytes_accepts_nonzero_reserved() {
+    // Extensions like BEP 10 set reserved bits; we should accept them
+    let mut bytes = Handshake::new([0xAB; 20], [0xCD; 20]).to_bytes();
+
+    // Set some reserved bits (simulating extension support)
+    bytes[20] = 0x00;
+    bytes[21] = 0x00;
+    bytes[22] = 0x00;
+    bytes[23] = 0x00;
+    bytes[24] = 0x00;
+    bytes[25] = 0x10; // BEP 10 extension protocol bit
+    bytes[26] = 0x00;
+    bytes[27] = 0x00;
+
+    let result = Handshake::from_bytes(&bytes);
+    assert!(
+        result.is_ok(),
+        "non-zero reserved bytes should be accepted for forward compatibility"
+    );
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.info_hash(), &[0xAB; 20]);
+    assert_eq!(parsed.peer_id(), &[0xCD; 20]);
+}
+
+#[test]
+fn from_bytes_empty_slice() {
+    let result = Handshake::from_bytes(&[]);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("0"));
+}
+@
+
+These tests cover:
+\begin{itemize}
+\item Valid handshake parsing (happy path)
+\item Round-trip serialization/deserialization
+\item Rejection of buffers shorter than 68 bytes
+\item Rejection of buffers longer than 68 bytes
+\item Rejection of wrong [[pstrlen]] value
+\item Rejection of wrong [[pstr]] string
+\item Acceptance of non-zero reserved bytes (forward compatibility)
+\item Edge case: empty input slice
+\end{itemize}
+
+\subsubsection{Info Hash Validation Tests}
+
+The [[validate_info_hash]] method is security-critical. We test both matching
+and mismatching hashes, verifying the error messages are helpful for debugging.
+
+<<handshake info hash validation tests>>=
+#[test]
+fn validate_info_hash_accepts_matching_hash() {
+    let info_hash = [0xAB; 20];
+    let hs = Handshake::new(info_hash, [0; 20]);
+
+    assert!(hs.validate_info_hash(&info_hash).is_ok());
+}
+
+#[test]
+fn validate_info_hash_rejects_different_hash() {
+    let hs = Handshake::new([0xAB; 20], [0; 20]);
+    let wrong_hash = [0xCD; 20];
+
+    let result = hs.validate_info_hash(&wrong_hash);
+    assert!(result.is_err());
+}
+
+#[test]
+fn validate_info_hash_error_contains_both_hashes() {
+    let actual = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+                  0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14];
+    let expected = [0xFF; 20];
+    let hs = Handshake::new(actual, [0; 20]);
+
+    let result = hs.validate_info_hash(&expected);
+    let msg = result.unwrap_err().to_string();
+
+    // Error should contain hex representation of both hashes for debugging
+    assert!(msg.contains("mismatch"), "error should mention mismatch: {}", msg);
+}
+
+#[test]
+fn validate_info_hash_single_byte_difference() {
+    // Even a single byte difference should be rejected
+    let hash1 = [0xAB; 20];
+    let mut hash2 = [0xAB; 20];
+    hash2[19] = 0xAC; // Differ only in last byte
+
+    let hs = Handshake::new(hash1, [0; 20]);
+    assert!(hs.validate_info_hash(&hash1).is_ok());
+    assert!(hs.validate_info_hash(&hash2).is_err());
+}
+
+#[test]
+fn validate_info_hash_all_zeros_vs_all_ones() {
+    let zeros = [0x00; 20];
+    let ones = [0xFF; 20];
+
+    let hs_zeros = Handshake::new(zeros, [0; 20]);
+    let hs_ones = Handshake::new(ones, [0; 20]);
+
+    assert!(hs_zeros.validate_info_hash(&zeros).is_ok());
+    assert!(hs_zeros.validate_info_hash(&ones).is_err());
+    assert!(hs_ones.validate_info_hash(&ones).is_ok());
+    assert!(hs_ones.validate_info_hash(&zeros).is_err());
+}
+@
+
+These tests verify:
+\begin{itemize}
+\item Matching hashes are accepted
+\item Different hashes are rejected
+\item Error messages include both hashes for debugging
+\item Single-byte differences are caught
+\item Edge cases (all zeros, all ones) work correctly
+\end{itemize}
+
 \subsection{Next Steps}
 
-With the handshake struct and serialization complete, the messages module is
-ready for:
+With the handshake struct, serialization, and parsing complete, the messages
+module is ready for:
 \begin{enumerate}
-\item Handshake deserialization (from bytes) with validation
 \item Message enum with the nine message types (keep-alive through cancel)
 \item Length-prefix framing helpers for reading/writing messages
+\item Async I/O wrappers for handshake exchange
 \end{enumerate}
 
 These will be added in subsequent development as we build out the peer
