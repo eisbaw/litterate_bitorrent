@@ -1204,6 +1204,566 @@ fn piece_manager_implements_debug() {
 }
 @
 
+\subsection{In-Progress Piece Buffer}
+
+When downloading a piece, we need to buffer the incoming blocks before the piece
+is complete and can be verified. The [[InProgressPiece]] struct provides this
+buffering capability, holding both the raw data and tracking which blocks have
+been received.
+
+The design separates concerns: [[PieceState]] tracks the abstract state of a piece
+(Missing, InProgress, Verified, Failed), while [[InProgressPiece]] holds the actual
+byte data for a piece currently being downloaded. This separation allows the piece
+manager to remain lightweight---it does not hold megabytes of data, only state bits.
+
+The [[InProgressPiece]] struct has two main components:
+
+\begin{description}
+\item[data] A [[Vec<u8>]] pre-allocated to the full piece size. Blocks are written
+  directly into their correct positions within this buffer.
+\item[blocks\_received] A [[BitVec]] tracking which blocks have been received. This
+  mirrors the tracking in [[PieceState::InProgress]] and is used to detect completion.
+\end{description}
+
+When receiving a block, we perform several validations:
+
+\begin{enumerate}
+\item \textbf{Block alignment}: The offset must be a multiple of [[BLOCK_SIZE]]
+  (or zero). Non-aligned offsets indicate protocol violations or bugs.
+\item \textbf{Bounds checking}: The block must fit entirely within the piece.
+  The offset plus data length must not exceed the piece size.
+\item \textbf{Duplicate detection}: If a block has already been received, we
+  silently ignore the duplicate. This is not an error condition.
+\end{enumerate}
+
+<<in-progress piece>>=
+/// Buffer for accumulating block data during piece download.
+///
+/// `InProgressPiece` holds the raw bytes of a piece being downloaded, along with
+/// tracking information about which blocks have been received. Once all blocks
+/// are received, the caller can extract the complete piece data for verification.
+///
+/// # Usage Pattern
+///
+/// 1. Create with piece geometry: `InProgressPiece::new(piece_index, piece_size)`
+/// 2. As blocks arrive, call `receive_block(offset, data)`
+/// 3. Check `is_complete()` after each block
+/// 4. When complete, call `take_data()` to get the assembled piece for verification
+///
+/// # Memory Management
+///
+/// The data buffer is pre-allocated to the full piece size on construction.
+/// This avoids reallocations during download and ensures predictable memory usage.
+/// For a typical 256 KiB piece, this is a modest allocation.
+///
+/// # Thread Safety
+///
+/// This struct is not thread-safe. In a multi-threaded context, wrap it in a
+/// `Mutex` or use message-passing to serialize access.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::{InProgressPiece, BLOCK_SIZE};
+///
+/// // Create buffer for a 40000-byte piece (3 blocks: 16384 + 16384 + 7232)
+/// let mut piece = InProgressPiece::new(0, 40000);
+///
+/// // Receive blocks (can be out of order)
+/// piece.receive_block(BLOCK_SIZE, &[0u8; 16384]).unwrap();      // Block 1
+/// piece.receive_block(0, &[0u8; 16384]).unwrap();                // Block 0
+/// piece.receive_block(2 * BLOCK_SIZE, &[0u8; 7232]).unwrap();   // Block 2
+///
+/// assert!(piece.is_complete());
+/// let data = piece.take_data();
+/// assert_eq!(data.len(), 40000);
+/// ```
+#[derive(Debug)]
+pub struct InProgressPiece {
+    /// Index of this piece within the torrent.
+    piece_index: u32,
+
+    /// Size of this piece in bytes.
+    piece_size: u32,
+
+    /// Buffer holding the piece data. Pre-allocated to `piece_size`.
+    data: Vec<u8>,
+
+    /// Bit vector tracking which blocks have been received.
+    /// `blocks_received[i]` is true if block `i` has been received.
+    blocks_received: BitVec<u8, Msb0>,
+}
+
+impl InProgressPiece {
+    /// Creates a new buffer for an in-progress piece.
+    ///
+    /// The data buffer is pre-allocated and zero-initialized to the full piece
+    /// size. The `blocks_received` bit vector is initialized with all bits false.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of this piece
+    /// * `piece_size` - The size of this piece in bytes
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::InProgressPiece;
+    ///
+    /// let piece = InProgressPiece::new(5, 262144); // 256 KiB piece
+    /// assert_eq!(piece.piece_index(), 5);
+    /// assert_eq!(piece.piece_size(), 262144);
+    /// assert!(!piece.is_complete());
+    /// ```
+    pub fn new(piece_index: u32, piece_size: u32) -> Self {
+        let num_blocks = blocks_per_piece(piece_size);
+        InProgressPiece {
+            piece_index,
+            piece_size,
+            data: vec![0u8; piece_size as usize],
+            blocks_received: bitvec![u8, Msb0; 0; num_blocks as usize],
+        }
+    }
+
+    /// Returns the piece index.
+    #[inline]
+    pub fn piece_index(&self) -> u32 {
+        self.piece_index
+    }
+
+    /// Returns the piece size in bytes.
+    #[inline]
+    pub fn piece_size(&self) -> u32 {
+        self.piece_size
+    }
+
+    /// Returns the number of blocks in this piece.
+    #[inline]
+    pub fn num_blocks(&self) -> u32 {
+        self.blocks_received.len() as u32
+    }
+
+    /// Returns the number of blocks received so far.
+    #[inline]
+    pub fn blocks_received_count(&self) -> u32 {
+        self.blocks_received.count_ones() as u32
+    }
+
+    /// Checks if a specific block has been received.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_index` - The zero-based index of the block
+    ///
+    /// # Returns
+    ///
+    /// `true` if the block has been received, `false` otherwise.
+    /// Returns `false` if `block_index` is out of bounds.
+    pub fn has_block(&self, block_index: u32) -> bool {
+        let idx = block_index as usize;
+        idx < self.blocks_received.len() && self.blocks_received[idx]
+    }
+
+    /// Receives a block of data at the specified offset.
+    ///
+    /// The block data is copied into the buffer at the correct position, and
+    /// the corresponding bit in `blocks_received` is set.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset within the piece where this block starts.
+    ///   Must be a multiple of `BLOCK_SIZE` (or 0).
+    /// * `block_data` - The raw block data received from a peer.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - Block was newly received and stored
+    /// * `Ok(false)` - Block was a duplicate (already received); no-op
+    /// * `Err(PieceError::InvalidBlockOffset)` - Offset not block-aligned or
+    ///   block extends past piece end
+    ///
+    /// # Validation
+    ///
+    /// This method validates that:
+    /// 1. The offset is a multiple of `BLOCK_SIZE`
+    /// 2. The offset is within the piece bounds
+    /// 3. The block (offset + data length) does not extend past the piece end
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::{InProgressPiece, BLOCK_SIZE};
+    ///
+    /// let mut piece = InProgressPiece::new(0, 40000);
+    ///
+    /// // Valid block at offset 0
+    /// assert!(piece.receive_block(0, &[1u8; 16384]).unwrap());
+    ///
+    /// // Duplicate block is a no-op
+    /// assert!(!piece.receive_block(0, &[2u8; 16384]).unwrap());
+    ///
+    /// // Invalid: non-aligned offset
+    /// assert!(piece.receive_block(100, &[0u8; 100]).is_err());
+    /// ```
+    pub fn receive_block(&mut self, offset: u32, block_data: &[u8]) -> Result<bool, PieceError> {
+        // Validate block alignment (offset must be multiple of BLOCK_SIZE)
+        if offset != 0 && offset % BLOCK_SIZE != 0 {
+            return Err(PieceError::InvalidBlockOffset {
+                piece_index: self.piece_index,
+                offset,
+                piece_size: self.piece_size,
+            });
+        }
+
+        // Validate offset is within piece bounds
+        if offset >= self.piece_size {
+            return Err(PieceError::InvalidBlockOffset {
+                piece_index: self.piece_index,
+                offset,
+                piece_size: self.piece_size,
+            });
+        }
+
+        // Validate block does not extend past piece end
+        let end_offset = offset as u64 + block_data.len() as u64;
+        if end_offset > self.piece_size as u64 {
+            return Err(PieceError::InvalidBlockOffset {
+                piece_index: self.piece_index,
+                offset,
+                piece_size: self.piece_size,
+            });
+        }
+
+        // Calculate block index from offset
+        let block_index = (offset / BLOCK_SIZE) as usize;
+
+        // Check for duplicate
+        if block_index < self.blocks_received.len() && self.blocks_received[block_index] {
+            return Ok(false); // Duplicate, no-op
+        }
+
+        // Copy data into buffer
+        let start = offset as usize;
+        let end = start + block_data.len();
+        self.data[start..end].copy_from_slice(block_data);
+
+        // Mark block as received
+        if block_index < self.blocks_received.len() {
+            self.blocks_received.set(block_index, true);
+        }
+
+        Ok(true)
+    }
+
+    /// Returns `true` if all blocks have been received.
+    ///
+    /// When this returns `true`, the piece data is complete and ready for
+    /// hash verification.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::InProgressPiece;
+    ///
+    /// // Small piece that fits in one block
+    /// let mut piece = InProgressPiece::new(0, 1000);
+    /// assert!(!piece.is_complete());
+    ///
+    /// piece.receive_block(0, &[0u8; 1000]).unwrap();
+    /// assert!(piece.is_complete());
+    /// ```
+    #[inline]
+    pub fn is_complete(&self) -> bool {
+        self.blocks_received.all()
+    }
+
+    /// Returns a reference to the piece data.
+    ///
+    /// The returned slice has length equal to `piece_size`. Blocks that have
+    /// not been received will contain zeros (or stale data from previous
+    /// failed attempts, if the buffer is reused).
+    ///
+    /// # Note
+    ///
+    /// Typically you should only call this when `is_complete()` returns `true`.
+    /// Accessing incomplete data may return partial or zeroed content.
+    pub fn data(&self) -> &[u8] {
+        &self.data[..self.piece_size as usize]
+    }
+
+    /// Consumes the buffer and returns the piece data.
+    ///
+    /// This method takes ownership of the data buffer, avoiding a copy.
+    /// After calling this, the `InProgressPiece` is consumed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::InProgressPiece;
+    ///
+    /// let mut piece = InProgressPiece::new(0, 100);
+    /// piece.receive_block(0, &[42u8; 100]).unwrap();
+    ///
+    /// let data = piece.take_data();
+    /// assert_eq!(data.len(), 100);
+    /// assert_eq!(data[0], 42);
+    /// ```
+    pub fn take_data(mut self) -> Vec<u8> {
+        self.data.truncate(self.piece_size as usize);
+        self.data
+    }
+
+    /// Resets the buffer for reuse (e.g., after verification failure).
+    ///
+    /// This clears all received block markers and zeros the data buffer.
+    /// The piece geometry (index, size) remains unchanged.
+    ///
+    /// # Use Case
+    ///
+    /// When a piece fails hash verification, we need to re-download it.
+    /// Rather than allocating a new buffer, we can reset and reuse the
+    /// existing one.
+    pub fn reset(&mut self) {
+        self.blocks_received.fill(false);
+        self.data.fill(0);
+    }
+}
+@
+
+\subsubsection{In-Progress Piece Tests}
+
+We test the in-progress piece buffer with various scenarios, including out-of-order
+block reception, duplicate handling, and validation of invalid inputs.
+
+<<in-progress piece tests>>=
+#[test]
+fn in_progress_piece_new_initializes_correctly() {
+    let piece = InProgressPiece::new(5, 40000);
+
+    assert_eq!(piece.piece_index(), 5);
+    assert_eq!(piece.piece_size(), 40000);
+    // 40000 bytes = 3 blocks (16384 + 16384 + 7232)
+    assert_eq!(piece.num_blocks(), 3);
+    assert_eq!(piece.blocks_received_count(), 0);
+    assert!(!piece.is_complete());
+}
+
+#[test]
+fn in_progress_piece_receive_block_stores_data() {
+    let mut piece = InProgressPiece::new(0, BLOCK_SIZE);
+    let block_data: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+
+    assert!(piece.receive_block(0, &block_data).unwrap());
+    assert!(piece.is_complete());
+
+    let data = piece.data();
+    for i in 0..BLOCK_SIZE as usize {
+        assert_eq!(data[i], (i % 256) as u8);
+    }
+}
+
+#[test]
+fn in_progress_piece_receive_blocks_out_of_order() {
+    // 40000 bytes = 3 blocks
+    let mut piece = InProgressPiece::new(0, 40000);
+
+    // Create distinct data for each block
+    let block0: Vec<u8> = vec![0u8; BLOCK_SIZE as usize];
+    let block1: Vec<u8> = vec![1u8; BLOCK_SIZE as usize];
+    let block2: Vec<u8> = vec![2u8; 7232]; // Last block is smaller
+
+    // Receive in reverse order: 2, 0, 1
+    assert!(piece.receive_block(2 * BLOCK_SIZE, &block2).unwrap());
+    assert!(!piece.is_complete());
+    assert_eq!(piece.blocks_received_count(), 1);
+
+    assert!(piece.receive_block(0, &block0).unwrap());
+    assert!(!piece.is_complete());
+    assert_eq!(piece.blocks_received_count(), 2);
+
+    assert!(piece.receive_block(BLOCK_SIZE, &block1).unwrap());
+    assert!(piece.is_complete());
+    assert_eq!(piece.blocks_received_count(), 3);
+
+    // Verify data is correctly positioned
+    let data = piece.data();
+    assert_eq!(data[0], 0);                           // Start of block 0
+    assert_eq!(data[BLOCK_SIZE as usize], 1);         // Start of block 1
+    assert_eq!(data[2 * BLOCK_SIZE as usize], 2);     // Start of block 2
+}
+
+#[test]
+fn in_progress_piece_duplicate_block_is_noop() {
+    let mut piece = InProgressPiece::new(0, BLOCK_SIZE);
+    let block_data = vec![42u8; BLOCK_SIZE as usize];
+
+    // First receive
+    assert!(piece.receive_block(0, &block_data).unwrap()); // returns true (new)
+
+    // Duplicate receive
+    let different_data = vec![99u8; BLOCK_SIZE as usize];
+    assert!(!piece.receive_block(0, &different_data).unwrap()); // returns false (dup)
+
+    // Original data should be preserved
+    assert_eq!(piece.data()[0], 42);
+    assert_eq!(piece.blocks_received_count(), 1);
+}
+
+#[test]
+fn in_progress_piece_validates_block_alignment() {
+    let mut piece = InProgressPiece::new(0, 40000);
+
+    // Non-aligned offset should fail
+    let result = piece.receive_block(100, &[0u8; 100]);
+    assert!(result.is_err());
+
+    match result {
+        Err(PieceError::InvalidBlockOffset { piece_index, offset, piece_size }) => {
+            assert_eq!(piece_index, 0);
+            assert_eq!(offset, 100);
+            assert_eq!(piece_size, 40000);
+        }
+        _ => panic!("expected InvalidBlockOffset error"),
+    }
+}
+
+#[test]
+fn in_progress_piece_validates_offset_within_bounds() {
+    let mut piece = InProgressPiece::new(0, 40000);
+
+    // Offset at or beyond piece size should fail
+    let result = piece.receive_block(40000, &[0u8; 100]);
+    assert!(result.is_err());
+
+    // Offset way beyond piece size
+    let result = piece.receive_block(BLOCK_SIZE * 100, &[0u8; 100]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn in_progress_piece_validates_block_does_not_exceed_piece() {
+    let mut piece = InProgressPiece::new(0, 40000);
+
+    // Block that would extend past piece end
+    // Last valid block starts at 2*BLOCK_SIZE = 32768 and has 7232 bytes
+    let oversized_block = vec![0u8; 10000]; // 7232 would be valid, 10000 is not
+    let result = piece.receive_block(2 * BLOCK_SIZE, &oversized_block);
+    assert!(result.is_err());
+}
+
+#[test]
+fn in_progress_piece_has_block_checks_correctly() {
+    let mut piece = InProgressPiece::new(0, 40000);
+
+    assert!(!piece.has_block(0));
+    assert!(!piece.has_block(1));
+    assert!(!piece.has_block(2));
+    assert!(!piece.has_block(100)); // Out of bounds
+
+    piece.receive_block(BLOCK_SIZE, &[0u8; BLOCK_SIZE as usize]).unwrap();
+
+    assert!(!piece.has_block(0));
+    assert!(piece.has_block(1));
+    assert!(!piece.has_block(2));
+}
+
+#[test]
+fn in_progress_piece_take_data_consumes_piece() {
+    let mut piece = InProgressPiece::new(0, 1000);
+    let data = vec![55u8; 1000];
+    piece.receive_block(0, &data).unwrap();
+
+    let taken = piece.take_data();
+    assert_eq!(taken.len(), 1000);
+    assert_eq!(taken[0], 55);
+    // piece is now consumed
+}
+
+#[test]
+fn in_progress_piece_reset_clears_state() {
+    let mut piece = InProgressPiece::new(0, BLOCK_SIZE);
+    let data = vec![77u8; BLOCK_SIZE as usize];
+
+    piece.receive_block(0, &data).unwrap();
+    assert!(piece.is_complete());
+    assert_eq!(piece.data()[0], 77);
+
+    piece.reset();
+
+    assert!(!piece.is_complete());
+    assert_eq!(piece.blocks_received_count(), 0);
+    assert_eq!(piece.data()[0], 0);
+}
+
+#[test]
+fn in_progress_piece_single_block_piece() {
+    // Piece smaller than BLOCK_SIZE
+    let mut piece = InProgressPiece::new(0, 5000);
+    assert_eq!(piece.num_blocks(), 1);
+
+    let data = vec![123u8; 5000];
+    assert!(piece.receive_block(0, &data).unwrap());
+    assert!(piece.is_complete());
+
+    let result = piece.take_data();
+    assert_eq!(result.len(), 5000);
+}
+
+#[test]
+fn in_progress_piece_implements_debug() {
+    let piece = InProgressPiece::new(42, 1000);
+    let debug_str = format!("{:?}", piece);
+    assert!(debug_str.contains("InProgressPiece"));
+    assert!(debug_str.contains("42"));
+}
+
+#[test]
+fn in_progress_piece_exactly_block_sized() {
+    // Piece that is exactly one BLOCK_SIZE
+    let mut piece = InProgressPiece::new(0, BLOCK_SIZE);
+    assert_eq!(piece.num_blocks(), 1);
+
+    let data = vec![0u8; BLOCK_SIZE as usize];
+    piece.receive_block(0, &data).unwrap();
+    assert!(piece.is_complete());
+}
+
+#[test]
+fn in_progress_piece_receive_all_blocks_any_order_completes() {
+    // This test specifically verifies AC #6:
+    // "receive all blocks out of order, verify is_complete returns true"
+
+    // 65536 bytes = 4 blocks of BLOCK_SIZE each
+    let piece_size = BLOCK_SIZE * 4;
+    let mut piece = InProgressPiece::new(7, piece_size);
+
+    // Receive in scrambled order: 2, 0, 3, 1
+    let orders = [2, 0, 3, 1];
+    for (i, &block_idx) in orders.iter().enumerate() {
+        let offset = block_idx * BLOCK_SIZE;
+        let data = vec![block_idx as u8; BLOCK_SIZE as usize];
+
+        let was_new = piece.receive_block(offset, &data).unwrap();
+        assert!(was_new, "block {} should be new", block_idx);
+
+        if i < 3 {
+            assert!(!piece.is_complete(), "should not be complete after {} blocks", i + 1);
+        }
+    }
+
+    assert!(piece.is_complete(), "should be complete after all 4 blocks");
+    assert_eq!(piece.blocks_received_count(), 4);
+
+    // Verify data integrity - each block should contain its index as all bytes
+    let data = piece.data();
+    for block_idx in 0..4u32 {
+        let start = (block_idx * BLOCK_SIZE) as usize;
+        assert_eq!(data[start], block_idx as u8,
+            "block {} should start with {}", block_idx, block_idx);
+    }
+}
+@
+
 \subsection{Piece Availability Tracking}
 
 In order to implement the rarest-first piece selection strategy, we need to track
@@ -2920,6 +3480,8 @@ The pieces module combines the error types and helpers.
 
 <<piece manager>>
 
+<<in-progress piece>>
+
 <<piece availability>>
 
 <<rarest first selection>>
@@ -2950,6 +3512,8 @@ mod tests {
     <<piece verification tests>>
 
     <<piece manager tests>>
+
+    <<in-progress piece tests>>
 
     <<piece availability tests>>
 
