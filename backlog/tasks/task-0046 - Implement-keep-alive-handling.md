@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:29'
-updated_date: '2026-01-17 22:32'
+updated_date: '2026-01-17 22:34'
 labels:
   - phase-6
   - keep-alive
@@ -45,18 +45,5 @@ Implements keep-alive message sending and receiving. Keep-alives maintain TCP co
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented keep-alive handling with idle peer detection:
-
-- Added PEER_IDLE_TIMEOUT_SECS constant (180 seconds) after KEEP_ALIVE_INTERVAL_SECS
-- Extended handle_keep_alives() to:
-  1. First pass: identify and disconnect peers with no messages in 180 seconds
-  2. Second pass: send keep-alives to remaining peers that haven't had messages sent in 120 seconds
-- The existing mark_received() call on every message (line 7678) already tracks last receive time
-- Added unit tests:
-  - peer_idle_timeout_is_180_seconds: verifies constant value
-  - idle_timeout_greater_than_keep_alive_interval: ensures gap for response time
-  - keep_alive_timing_allows_peer_response: documents the 60-second timing gap
-
-Files modified:
-- nw/07-client.nw: Added constant, extended handler, added tests
+Two-pass approach: disconnect idle peers first, then send keep-alives. 120s send interval, 180s idle timeout.
 <!-- SECTION:NOTES:END -->
