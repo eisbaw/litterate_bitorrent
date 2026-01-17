@@ -123,6 +123,7 @@ reused. The library root re-exports all public modules.
 //! functional BitTorrent client.
 
 pub mod bencode;
+pub mod cli;
 pub mod metainfo;
 pub mod tracker;
 pub mod messages;

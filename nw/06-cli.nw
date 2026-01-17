@@ -1,0 +1,561 @@
+% Command-Line Interface
+% Chapter 6 of the literate BitTorrent client
+
+\section{Command-Line Interface}
+
+The command-line interface is the user's first point of contact with the
+BitTorrent client. A well-designed CLI makes the tool intuitive to use while
+providing flexibility through options. We use the [[clap]] crate with its
+derive macros to define our argument structure declaratively, gaining automatic
+help text generation, validation, and shell completion support.
+
+\subsection{CLI Design Principles}
+
+Our CLI follows common conventions for Unix command-line tools:
+
+\begin{enumerate}
+\item \textbf{Required positional argument}: The torrent file path is the
+  primary input and is required. Placing it as a positional argument makes
+  the common case ([[literate-bittorrent file.torrent]]) simple.
+
+\item \textbf{Sensible defaults}: Optional arguments have reasonable defaults
+  that work for most use cases. The output directory defaults to the current
+  directory, and the port defaults to 6881 (the traditional BitTorrent port).
+
+\item \textbf{Short and long options}: Both forms are provided for frequently
+  used options ([[{-}o]] and [[{-}{-}output]], [[{-}v]] and [[{-}{-}verbose]]).
+
+\item \textbf{Helpful error messages}: Invalid input produces clear messages
+  explaining what went wrong and how to fix it.
+\end{enumerate}
+
+\subsection{The Args Structure}
+
+We define the CLI arguments using [[clap]]'s derive macros. Each field becomes
+either a positional argument (no [[long]] or [[short]] attribute) or an option.
+The [[Parser]] derive macro generates the parsing code, while [[#[command]]]
+and [[#[arg]]] attributes configure behavior and documentation.
+
+<<cli args>>=
+use clap::Parser;
+use std::path::PathBuf;
+
+/// A pedagogical BitTorrent client implemented as a literate program.
+///
+/// Downloads files from the BitTorrent network using a torrent file or
+/// magnet link. This client prioritizes clarity and educational value
+/// over performance optimizations.
+#[derive(Parser, Debug, Clone, PartialEq, Eq)]
+#[command(name = "literate-bittorrent")]
+#[command(author, version, about, long_about = None)]
+pub struct Args {
+    /// Path to the .torrent file to download
+    ///
+    /// The torrent file contains metadata about the download including
+    /// file names, sizes, piece hashes, and tracker URLs.
+    #[arg(value_name = "TORRENT")]
+    pub torrent: PathBuf,
+
+    /// Output directory for downloaded files
+    ///
+    /// Files will be saved to this directory, creating it if necessary.
+    /// Defaults to the current working directory.
+    #[arg(short, long, value_name = "DIR", default_value = ".")]
+    pub output: PathBuf,
+
+    /// Listen port for incoming peer connections
+    ///
+    /// The client will listen on this port for connections from other
+    /// peers. The default port 6881 is the traditional BitTorrent port.
+    /// Ports 6881-6889 are commonly used.
+    #[arg(short, long, default_value_t = 6881)]
+    pub port: u16,
+
+    /// Enable verbose (DEBUG level) logging
+    ///
+    /// When enabled, the client outputs detailed logging information
+    /// useful for debugging connection issues, protocol exchanges,
+    /// and download progress.
+    #[arg(short, long)]
+    pub verbose: bool,
+}
+@
+
+The [[Args]] structure captures all command-line configuration. Let's examine
+each field:
+
+\begin{description}
+\item[torrent] A required positional argument for the torrent file path.
+  The [[value\_name = "TORRENT"]] makes the help text clearer by showing
+  [[<TORRENT>]] rather than [[<TORRENT\_PATH>]].
+
+\item[output] The output directory with [[{-}o]] short form and [[{-}{-}output]]
+  long form. The [[default\_value = "."]] means files are saved in the current
+  directory if not specified.
+
+\item[port] The listen port for peer connections. We use [[default\_value\_t]]
+  (note the [[\_t]] suffix) because this is a typed default rather than a
+  string that needs parsing.
+
+\item[verbose] A boolean flag that enables DEBUG-level logging. Flags don't
+  take values; their presence sets the field to [[true]].
+\end{description}
+
+\subsection{Argument Parsing}
+
+The [[parse]] method provided by the [[Parser]] trait handles argument parsing.
+We wrap this in a custom function to make testing easier and to provide a
+clean interface for the main program.
+
+<<cli parse>>=
+impl Args {
+    /// Parse command-line arguments from the process arguments.
+    ///
+    /// This is the primary entry point for CLI parsing. It reads from
+    /// `std::env::args()` and exits the process with a helpful error
+    /// message if parsing fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use literate_bittorrent::cli::Args;
+    ///
+    /// let args = Args::parse_args();
+    /// println!("Downloading: {:?}", args.torrent);
+    /// ```
+    pub fn parse_args() -> Self {
+        Args::parse()
+    }
+
+    /// Parse arguments from an iterator of strings.
+    ///
+    /// This is useful for testing or when embedding the CLI in another
+    /// program. The first element should be the program name (it will
+    /// be used in error messages).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::cli::Args;
+    /// use std::path::PathBuf;
+    ///
+    /// let args = Args::try_parse_from([
+    ///     "literate-bittorrent",
+    ///     "test.torrent",
+    ///     "-o", "/tmp/downloads",
+    /// ]).unwrap();
+    ///
+    /// assert_eq!(args.torrent, PathBuf::from("test.torrent"));
+    /// assert_eq!(args.output, PathBuf::from("/tmp/downloads"));
+    /// ```
+    pub fn try_parse_from<I, T>(iter: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        <Args as Parser>::try_parse_from(iter)
+    }
+}
+@
+
+We provide two parsing methods:
+
+\begin{itemize}
+\item [[parse\_args]] reads from the actual command line and exits on error.
+  This is what [[main]] will call.
+
+\item [[try\_parse\_from]] accepts an iterator of strings, allowing tests to
+  provide synthetic arguments. It returns a [[Result]] instead of exiting,
+  making it suitable for testing error cases.
+\end{itemize}
+
+\subsection{Module Structure}
+
+The CLI module is intentionally simple, exporting just the [[Args]] structure
+and its methods. The main program will use [[Args::parse\_args()]] to get
+configuration, then pass the relevant fields to the download logic.
+
+<<cli.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/06-cli.nw
+// Regenerate with: just tangle
+
+//! Command-line interface for the BitTorrent client.
+//!
+//! This module defines the CLI using clap's derive macros, providing
+//! automatic argument parsing, validation, and help text generation.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use literate_bittorrent::cli::Args;
+//!
+//! let args = Args::parse_args();
+//! println!("Torrent: {:?}", args.torrent);
+//! println!("Output: {:?}", args.output);
+//! println!("Port: {}", args.port);
+//! println!("Verbose: {}", args.verbose);
+//! ```
+
+<<cli args>>
+
+<<cli parse>>
+
+<<cli tests>>
+@
+
+\subsection{Testing the CLI}
+
+Testing command-line parsing requires care because we want to verify both
+successful parsing and proper error handling. We use [[try\_parse\_from]]
+to test with synthetic arguments, avoiding the need to manipulate process
+arguments.
+
+<<cli tests>>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_required_torrent_path() {
+        // AC #1: CLI accepts required positional argument for torrent file path
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "ubuntu.torrent",
+        ]).unwrap();
+
+        assert_eq!(args.torrent, PathBuf::from("ubuntu.torrent"));
+    }
+
+    #[test]
+    fn parse_torrent_path_with_spaces() {
+        // Paths with spaces should work when properly quoted
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "my downloads/ubuntu 22.04.torrent",
+        ]).unwrap();
+
+        assert_eq!(
+            args.torrent,
+            PathBuf::from("my downloads/ubuntu 22.04.torrent")
+        );
+    }
+
+    #[test]
+    fn parse_absolute_torrent_path() {
+        // Absolute paths should work
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "/home/user/torrents/file.torrent",
+        ]).unwrap();
+
+        assert_eq!(
+            args.torrent,
+            PathBuf::from("/home/user/torrents/file.torrent")
+        );
+    }
+
+    #[test]
+    fn parse_output_directory_short() {
+        // AC #2: CLI accepts -o/--output option for output directory
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-o", "/tmp/downloads",
+        ]).unwrap();
+
+        assert_eq!(args.output, PathBuf::from("/tmp/downloads"));
+    }
+
+    #[test]
+    fn parse_output_directory_long() {
+        // AC #2: --output long form
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--output", "/tmp/downloads",
+        ]).unwrap();
+
+        assert_eq!(args.output, PathBuf::from("/tmp/downloads"));
+    }
+
+    #[test]
+    fn output_defaults_to_current_dir() {
+        // AC #2: output defaults to current directory
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        assert_eq!(args.output, PathBuf::from("."));
+    }
+
+    #[test]
+    fn parse_port_short() {
+        // AC #3: CLI accepts -p/--port option for listen port
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-p", "6889",
+        ]).unwrap();
+
+        assert_eq!(args.port, 6889);
+    }
+
+    #[test]
+    fn parse_port_long() {
+        // AC #3: --port long form
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--port", "12345",
+        ]).unwrap();
+
+        assert_eq!(args.port, 12345);
+    }
+
+    #[test]
+    fn port_defaults_to_6881() {
+        // AC #3: port defaults to 6881
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        assert_eq!(args.port, 6881);
+    }
+
+    #[test]
+    fn parse_verbose_short() {
+        // AC #4: CLI accepts -v/--verbose flag for DEBUG logging
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-v",
+        ]).unwrap();
+
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn parse_verbose_long() {
+        // AC #4: --verbose long form
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--verbose",
+        ]).unwrap();
+
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn verbose_defaults_to_false() {
+        // AC #4: verbose defaults to false
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn parse_all_options_combined() {
+        // All options can be used together
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "downloads/ubuntu.torrent",
+            "-o", "/media/storage",
+            "-p", "6999",
+            "-v",
+        ]).unwrap();
+
+        assert_eq!(args.torrent, PathBuf::from("downloads/ubuntu.torrent"));
+        assert_eq!(args.output, PathBuf::from("/media/storage"));
+        assert_eq!(args.port, 6999);
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn parse_options_in_any_order() {
+        // Options can appear before or after the positional argument
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "-v",
+            "-o", "/tmp",
+            "file.torrent",
+            "-p", "7000",
+        ]).unwrap();
+
+        assert_eq!(args.torrent, PathBuf::from("file.torrent"));
+        assert_eq!(args.output, PathBuf::from("/tmp"));
+        assert_eq!(args.port, 7000);
+        assert!(args.verbose);
+    }
+
+    #[test]
+    fn help_output_contains_usage() {
+        // AC #5: CLI generates --help output with usage examples
+        let err = Args::try_parse_from([
+            "literate-bittorrent",
+            "--help",
+        ]).unwrap_err();
+
+        let help_text = err.to_string();
+
+        // Help should contain program name
+        assert!(
+            help_text.contains("literate-bittorrent"),
+            "Help should contain program name: {}",
+            help_text
+        );
+
+        // Help should mention the torrent argument
+        assert!(
+            help_text.contains("TORRENT") || help_text.contains("torrent"),
+            "Help should mention torrent argument: {}",
+            help_text
+        );
+
+        // Help should mention output option
+        assert!(
+            help_text.contains("output") || help_text.contains("-o"),
+            "Help should mention output option: {}",
+            help_text
+        );
+
+        // Help should mention port option
+        assert!(
+            help_text.contains("port") || help_text.contains("-p"),
+            "Help should mention port option: {}",
+            help_text
+        );
+
+        // Help should mention verbose option
+        assert!(
+            help_text.contains("verbose") || help_text.contains("-v"),
+            "Help should mention verbose option: {}",
+            help_text
+        );
+    }
+
+    #[test]
+    fn missing_torrent_produces_helpful_error() {
+        // AC #6: Invalid arguments produce helpful error messages
+        let err = Args::try_parse_from([
+            "literate-bittorrent",
+        ]).unwrap_err();
+
+        let error_text = err.to_string();
+
+        // Error should mention the missing argument
+        assert!(
+            error_text.contains("TORRENT") ||
+            error_text.contains("required") ||
+            error_text.contains("torrent"),
+            "Error should mention missing TORRENT: {}",
+            error_text
+        );
+    }
+
+    #[test]
+    fn invalid_port_produces_helpful_error() {
+        // AC #6: Invalid port value produces helpful error
+        let err = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-p", "not-a-number",
+        ]).unwrap_err();
+
+        let error_text = err.to_string();
+
+        // Error should indicate the value is invalid
+        assert!(
+            error_text.contains("invalid") ||
+            error_text.contains("Invalid") ||
+            error_text.contains("not-a-number"),
+            "Error should mention invalid port value: {}",
+            error_text
+        );
+    }
+
+    #[test]
+    fn port_overflow_produces_error() {
+        // Port number exceeding u16 max should fail
+        let err = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-p", "99999",
+        ]).unwrap_err();
+
+        let error_text = err.to_string();
+        assert!(
+            error_text.contains("invalid") ||
+            error_text.contains("Invalid") ||
+            error_text.contains("99999"),
+            "Error should mention invalid port: {}",
+            error_text
+        );
+    }
+
+    #[test]
+    fn unknown_option_produces_error() {
+        // Unknown options should produce an error
+        let err = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--unknown-option",
+        ]).unwrap_err();
+
+        let error_text = err.to_string();
+        assert!(
+            error_text.contains("unexpected") ||
+            error_text.contains("unknown") ||
+            error_text.contains("--unknown-option"),
+            "Error should mention unknown option: {}",
+            error_text
+        );
+    }
+
+    #[test]
+    fn args_is_clone() {
+        // Args should be Clone for flexibility
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        let cloned = args.clone();
+        assert_eq!(args, cloned);
+    }
+
+    #[test]
+    fn args_is_debug() {
+        // Args should be Debug for logging
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        let debug_str = format!("{:?}", args);
+        assert!(debug_str.contains("Args"));
+        assert!(debug_str.contains("file.torrent"));
+    }
+}
+@
+
+The tests cover each acceptance criterion:
+
+\begin{itemize}
+\item \textbf{AC \#1}: Required torrent path parsing
+\item \textbf{AC \#2}: Output directory option with default
+\item \textbf{AC \#3}: Port option with default
+\item \textbf{AC \#4}: Verbose flag
+\item \textbf{AC \#5}: Help output generation
+\item \textbf{AC \#6}: Error messages for invalid input
+\end{itemize}
+
+We also test edge cases like paths with spaces, options in different orders,
+and the [[Clone]] and [[Debug]] trait implementations that make the type
+convenient to use throughout the application.
