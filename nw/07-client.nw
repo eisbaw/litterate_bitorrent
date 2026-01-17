@@ -1833,6 +1833,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<incoming message handlers>>
 
+<<request pipelining>>
+
 <<peer connection manager>>
 
 <<client tests>>
@@ -1850,6 +1852,8 @@ The client module exports the [[Client]] struct and associated types.
 <<framed message writing tests>>
 
 <<peer request queue tests>>
+
+<<request pipelining tests>>
 @
 
 \subsection{Testing}
@@ -6062,6 +6066,506 @@ mod peer_request_queue_tests {
         // With very long timeout, nothing is timed out
         let timed_out = queue.timed_out(Duration::from_secs(3600));
         assert_eq!(timed_out.len(), 0);
+    }
+}
+@
+
+\subsection{Request Pipelining}
+
+Request pipelining is fundamental to achieving good download throughput in
+BitTorrent. Without pipelining, each block request would incur a full
+round-trip latency before the next could be sent. With pipelining, we send
+multiple requests before receiving responses, keeping the network pipe full.
+
+The challenge is deciding \emph{which} blocks to request. Our strategy has
+two phases:
+
+\begin{enumerate}
+\item \textbf{Complete in-progress pieces first}: If we're already downloading
+  a piece, finish it before starting new ones. This reduces memory pressure
+  (fewer partial pieces) and gets pieces to verification faster.
+
+\item \textbf{Rarest-first for new pieces}: When starting a new piece, choose
+  the rarest one the peer has. This distributes download load and reduces
+  the risk of pieces becoming unavailable.
+\end{enumerate}
+
+The [[PeerRequestQueue]] provides natural backpressure: when the queue is full,
+we stop generating new requests until responses arrive. This prevents
+overwhelming slow peers while allowing fast peers to serve more requests.
+
+<<request pipelining>>=
+use crate::pieces::{PieceState, select_rarest, BLOCK_SIZE};
+use std::collections::HashSet;
+
+/// Generates block requests to fill a peer's request queue.
+///
+/// This function implements the core request scheduling strategy:
+/// 1. First, complete in-progress pieces the peer has
+/// 2. Then, start new pieces using rarest-first selection
+///
+/// The queue's capacity limit provides natural backpressure: we generate
+/// requests until the queue is full, then stop. When responses arrive and
+/// space opens up, the caller should call this function again.
+///
+/// # Arguments
+///
+/// * `peer_state` - The peer's protocol state (has bitfield, choke status)
+/// * `request_queue` - The peer's bounded request queue
+/// * `piece_manager` - Tracks piece states (Missing, InProgress, Verified)
+/// * `availability` - Global piece availability for rarest-first selection
+///
+/// # Returns
+///
+/// Vector of new [`BlockRequest`] to send to the peer. The caller should
+/// serialize these as `request` messages on the wire.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::{PeerState, PeerRequestQueue, fill_request_queue};
+/// use literate_bittorrent::pieces::{PieceManager, PieceAvailability};
+///
+/// let mut peer_state = PeerState::new(4);
+/// peer_state.peer_choking = false;  // Peer has unchoked us
+/// peer_state.set_piece(0);          // Peer has piece 0
+/// peer_state.set_piece(1);          // Peer has piece 1
+///
+/// let mut request_queue = PeerRequestQueue::new(3);
+/// let hashes = vec![[0u8; 20]; 4];
+/// let mut manager = PieceManager::new(16384 * 4, 16384 * 4 * 4, hashes).unwrap();
+/// let mut availability = PieceAvailability::new(4);
+/// availability.add_peer_bitfield(&[0b11110000]);
+///
+/// let peer_id = *b"-LB0001-test12345678";
+/// let requests = fill_request_queue(
+///     &peer_state,
+///     &mut request_queue,
+///     &mut manager,
+///     &availability,
+///     peer_id,
+/// );
+///
+/// // Should have generated requests up to queue capacity
+/// assert!(!requests.is_empty());
+/// ```
+pub fn fill_request_queue(
+    peer_state: &PeerState,
+    request_queue: &mut PeerRequestQueue,
+    piece_manager: &mut PieceManager,
+    availability: &PieceAvailability,
+    peer_id: [u8; 20],
+) -> Vec<BlockRequest> {
+    let mut new_requests = Vec::new();
+
+    // Can't request if peer is choking us
+    if peer_state.peer_choking {
+        return new_requests;
+    }
+
+    let num_pieces = piece_manager.num_pieces() as usize;
+
+    // Collect in-flight offsets for deduplication
+    let in_flight: HashSet<(u32, u32)> = request_queue
+        .iter()
+        .map(|r| (r.request.piece_index, r.request.offset))
+        .collect();
+
+    // Fill queue up to capacity
+    while !request_queue.is_full() {
+        // Try to get a block to request
+        if let Some(request) = select_next_block(
+            peer_state,
+            &in_flight,
+            &new_requests,
+            piece_manager,
+            availability,
+            num_pieces,
+            peer_id,
+        ) {
+            // Add to queue (will succeed since not full)
+            if request_queue.push(request.clone()) {
+                new_requests.push(request);
+            }
+        } else {
+            // No more blocks available to request from this peer
+            break;
+        }
+    }
+
+    new_requests
+}
+
+/// Selects the next block to request from a peer.
+///
+/// Priority:
+/// 1. Blocks from in-progress pieces that peer has
+/// 2. First block of a new piece using rarest-first
+///
+/// Returns None if no suitable block is available.
+fn select_next_block(
+    peer_state: &PeerState,
+    in_flight: &HashSet<(u32, u32)>,
+    new_requests: &[BlockRequest],
+    piece_manager: &mut PieceManager,
+    availability: &PieceAvailability,
+    num_pieces: usize,
+    peer_id: [u8; 20],
+) -> Option<BlockRequest> {
+    // Build combined set of already-requested blocks
+    let mut all_requested: HashSet<(u32, u32)> = in_flight.clone();
+    for req in new_requests {
+        all_requested.insert((req.piece_index, req.offset));
+    }
+
+    // First try in-progress pieces that peer has
+    for piece_index in 0..num_pieces {
+        let piece_idx = piece_index as u32;
+        if !peer_state.has_piece(piece_idx) {
+            continue;
+        }
+
+        let state = match piece_manager.get_state(piece_idx) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if let PieceState::InProgress { ref blocks_received } = state {
+            // Find unrequested block in this piece
+            let piece_size = match piece_manager.get_piece_size(piece_idx) {
+                Ok(size) => size,
+                Err(_) => continue,
+            };
+
+            if let Some(request) = find_unrequested_block(
+                piece_idx,
+                blocks_received,
+                &all_requested,
+                piece_size,
+                peer_id,
+            ) {
+                return Some(request);
+            }
+        }
+    }
+
+    // Then try starting a new piece (rarest-first)
+    let rarest_pieces = select_rarest(piece_manager, availability, &peer_state.bitfield);
+
+    for piece_idx in rarest_pieces {
+        // Start the piece if not already started
+        if piece_manager.start_piece(piece_idx).is_err() {
+            continue;
+        }
+
+        // Get piece size and state (now it should be InProgress after start_piece)
+        let piece_size = match piece_manager.get_piece_size(piece_idx) {
+            Ok(size) => size,
+            Err(_) => continue,
+        };
+
+        let state = match piece_manager.get_state(piece_idx) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Find first unrequested block in this newly started piece
+        if let PieceState::InProgress { ref blocks_received } = state {
+            if let Some(request) = find_unrequested_block(
+                piece_idx,
+                blocks_received,
+                &all_requested,
+                piece_size,
+                peer_id,
+            ) {
+                return Some(request);
+            }
+        }
+    }
+
+    None
+}
+
+/// Finds an unrequested block within an in-progress piece.
+///
+/// Scans the piece's block tracking bitvec to find a block that:
+/// 1. Has not been received yet
+/// 2. Is not already in the request queue or pending requests
+///
+/// Returns the first such block found, or None if all blocks are
+/// either received or already requested.
+fn find_unrequested_block(
+    piece_index: u32,
+    blocks_received: &bitvec::vec::BitVec<u8, bitvec::order::Msb0>,
+    already_requested: &HashSet<(u32, u32)>,
+    piece_size: u32,
+    peer_id: [u8; 20],
+) -> Option<BlockRequest> {
+    let num_blocks = piece_size.div_ceil(BLOCK_SIZE);
+
+    for block_index in 0..num_blocks {
+        // Skip if already received
+        if block_index < blocks_received.len() as u32
+            && blocks_received[block_index as usize]
+        {
+            continue;
+        }
+
+        let offset = block_index * BLOCK_SIZE;
+
+        // Skip if already in request queue
+        if already_requested.contains(&(piece_index, offset)) {
+            continue;
+        }
+
+        // Calculate actual block length (handle last block)
+        let remaining = piece_size - offset;
+        let length = remaining.min(BLOCK_SIZE);
+
+        return Some(BlockRequest::new(piece_index, offset, length, peer_id));
+    }
+
+    None
+}
+@
+
+\subsubsection{Request Pipelining Tests}
+
+We test the request pipelining logic with the specific scenarios from the
+acceptance criteria, plus edge cases to ensure robust behavior.
+
+<<request pipelining tests>>=
+#[cfg(test)]
+mod request_pipelining_tests {
+    use super::*;
+    use crate::pieces::{PieceManager, PieceAvailability, BLOCK_SIZE};
+
+    fn test_peer_id() -> [u8; 20] {
+        *b"-LB0001-test12345678"
+    }
+
+    #[test]
+    fn fill_request_queue_fills_to_capacity() {
+        // Create queue with max_size 3
+        let mut queue = PeerRequestQueue::new(3);
+
+        // Peer has all pieces and is not choking
+        let mut peer_state = PeerState::new(4);
+        peer_state.peer_choking = false;
+        for i in 0..4 {
+            peer_state.set_piece(i);
+        }
+
+        // 4 pieces, each with 4 blocks (64KB pieces)
+        let hashes = vec![[0u8; 20]; 4];
+        let piece_size = BLOCK_SIZE * 4;
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
+
+        let mut availability = PieceAvailability::new(4);
+        availability.add_peer_bitfield(&[0b11110000]);
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // Should generate exactly 3 requests (queue capacity)
+        assert_eq!(requests.len(), 3);
+        assert!(queue.is_full());
+    }
+
+    #[test]
+    fn fill_request_queue_prefers_in_progress() {
+        let mut queue = PeerRequestQueue::new(5);
+
+        let mut peer_state = PeerState::new(4);
+        peer_state.peer_choking = false;
+        for i in 0..4 {
+            peer_state.set_piece(i);
+        }
+
+        let hashes = vec![[0u8; 20]; 4];
+        let piece_size = BLOCK_SIZE * 2; // 2 blocks per piece
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
+
+        // Start piece 2 (make it in-progress)
+        manager.start_piece(2).unwrap();
+
+        let mut availability = PieceAvailability::new(4);
+        // Piece 0 is rarest (count=1), but piece 2 should be preferred (in-progress)
+        availability.add_peer_bitfield(&[0b11110000]);
+        availability.add_peer_bitfield(&[0b01110000]); // Not piece 0
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // First requests should be from piece 2 (the in-progress piece)
+        assert!(!requests.is_empty());
+        assert_eq!(requests[0].piece_index, 2, "Should prefer in-progress piece");
+    }
+
+    #[test]
+    fn fill_request_queue_returns_empty_when_choked() {
+        let mut queue = PeerRequestQueue::new(5);
+
+        let mut peer_state = PeerState::new(4);
+        peer_state.peer_choking = true; // Peer is choking us
+        for i in 0..4 {
+            peer_state.set_piece(i);
+        }
+
+        let hashes = vec![[0u8; 20]; 4];
+        let piece_size = BLOCK_SIZE * 2;
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
+
+        let mut availability = PieceAvailability::new(4);
+        availability.add_peer_bitfield(&[0b11110000]);
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // Should return empty when choked
+        assert!(requests.is_empty());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn fill_request_queue_returns_empty_when_peer_has_nothing_needed() {
+        let mut queue = PeerRequestQueue::new(5);
+
+        let mut peer_state = PeerState::new(4);
+        peer_state.peer_choking = false;
+        // Peer has no pieces (bitfield is all zeros)
+
+        let hashes = vec![[0u8; 20]; 4];
+        let piece_size = BLOCK_SIZE * 2;
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
+
+        let mut availability = PieceAvailability::new(4);
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // Peer has nothing we need
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn fill_request_queue_skips_verified_pieces() {
+        let mut queue = PeerRequestQueue::new(5);
+
+        let mut peer_state = PeerState::new(2);
+        peer_state.peer_choking = false;
+        peer_state.set_piece(0);
+        peer_state.set_piece(1);
+
+        let hashes = vec![[0u8; 20]; 2];
+        let piece_size = BLOCK_SIZE;
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 2, hashes).unwrap();
+
+        // Mark piece 0 as verified
+        manager.start_piece(0).unwrap();
+        manager.mark_verified(0).unwrap();
+
+        let mut availability = PieceAvailability::new(2);
+        availability.add_peer_bitfield(&[0b11000000]);
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // Should only request piece 1 (piece 0 is verified)
+        assert!(!requests.is_empty());
+        for req in &requests {
+            assert_ne!(req.piece_index, 0, "Should not request verified piece");
+        }
+    }
+
+    #[test]
+    fn fill_request_queue_uses_rarest_first_for_new_pieces() {
+        let mut queue = PeerRequestQueue::new(2);
+
+        let mut peer_state = PeerState::new(4);
+        peer_state.peer_choking = false;
+        for i in 0..4 {
+            peer_state.set_piece(i);
+        }
+
+        let hashes = vec![[0u8; 20]; 4];
+        let piece_size = BLOCK_SIZE;
+        let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
+
+        let mut availability = PieceAvailability::new(4);
+        // Piece 0: 3 peers, Piece 1: 1 peer (rarest), Piece 2: 2 peers, Piece 3: 4 peers
+        availability.add_peer_bitfield(&[0b11110000]);
+        availability.add_peer_bitfield(&[0b10110000]);
+        availability.add_peer_bitfield(&[0b10010000]);
+        availability.add_peer_bitfield(&[0b10010000]);
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // First request should be for piece 1 (rarest)
+        assert!(!requests.is_empty());
+        assert_eq!(requests[0].piece_index, 1, "Should select rarest piece first");
+    }
+
+    #[test]
+    fn fill_request_queue_does_not_duplicate_requests() {
+        let mut queue = PeerRequestQueue::new(5);
+
+        let mut peer_state = PeerState::new(1);
+        peer_state.peer_choking = false;
+        peer_state.set_piece(0);
+
+        let hashes = vec![[0u8; 20]; 1];
+        let piece_size = BLOCK_SIZE * 2; // 2 blocks
+        let mut manager = PieceManager::new(piece_size, piece_size as u64, hashes).unwrap();
+
+        let mut availability = PieceAvailability::new(1);
+        availability.add_peer_bitfield(&[0b10000000]);
+
+        // Pre-populate queue with one request
+        queue.push(BlockRequest::new(0, 0, BLOCK_SIZE, test_peer_id()));
+
+        let requests = fill_request_queue(
+            &peer_state,
+            &mut queue,
+            &mut manager,
+            &availability,
+            test_peer_id(),
+        );
+
+        // Should only return block 1 (block 0 already in queue)
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, BLOCK_SIZE, "Should skip already-queued block");
     }
 }
 @
