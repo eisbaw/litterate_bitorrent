@@ -651,6 +651,29 @@ The manager deliberately does not handle networking or disk I/O---those are
 separate concerns handled by other components. This makes the manager easy to
 test and reason about: it is a pure state machine with well-defined transitions.
 
+\subsubsection{Progress Tracking}
+
+Download progress is tracked via simple queries against [[piece\_states]]:
+
+\begin{itemize}
+\item [[progress()]] returns verified and total piece counts
+\item [[bytes\_verified()]] returns the byte count of verified pieces
+\item [[is\_complete()]] returns true when all pieces are verified
+\item [[percent\_complete()]] returns the percentage as a float
+\end{itemize}
+
+Progress is computed on demand rather than cached, following the single source
+of truth principle. This ensures correctness: progress always reflects the
+current state without risk of stale cached values.
+
+Failed pieces are not counted as progress---they must be retried and verified
+before contributing to completion. This correctly represents that a failed
+piece contains no useful data.
+
+The [[bytes\_verified()]] method accounts for the last piece being potentially
+smaller than the standard piece length. A torrent with 10 pieces of 16KiB but
+only 150KiB total would have a final piece of 6KiB.
+
 <<piece manager>>=
 /// Central coordinator for piece download state.
 ///
@@ -1014,6 +1037,109 @@ impl PieceManager {
         self.piece_states.iter().all(|s| s.is_verified())
     }
 
+    /// Returns download progress as (verified_count, total_count).
+    ///
+    /// Progress is computed by counting Verified pieces in piece_states.
+    /// Failed pieces are not counted as progress (they will be retried).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// let hashes = vec![[0u8; 20]; 10];
+    /// let mut manager = PieceManager::new(16384, 163840, hashes).unwrap();
+    ///
+    /// let (verified, total) = manager.progress();
+    /// assert_eq!(verified, 0);
+    /// assert_eq!(total, 10);
+    ///
+    /// manager.mark_verified(0).unwrap();
+    /// let (verified, _) = manager.progress();
+    /// assert_eq!(verified, 1);
+    /// ```
+    pub fn progress(&self) -> (usize, usize) {
+        (self.verified_count(), self.piece_states.len())
+    }
+
+    /// Returns the number of bytes in verified pieces.
+    ///
+    /// Computes bytes by multiplying verified count by piece_length,
+    /// accounting for the last piece which may be smaller.
+    ///
+    /// # Details
+    ///
+    /// The last piece in a torrent may be smaller than the standard piece_length
+    /// if total_length is not evenly divisible. This method correctly accounts
+    /// for this when computing verified bytes.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// // 3 pieces: 100 + 100 + 50 = 250 bytes
+    /// let hashes = vec![[0u8; 20]; 3];
+    /// let mut manager = PieceManager::new(100, 250, hashes).unwrap();
+    ///
+    /// assert_eq!(manager.bytes_verified(), 0);
+    /// manager.mark_verified(0).unwrap();
+    /// assert_eq!(manager.bytes_verified(), 100); // Full piece
+    /// manager.mark_verified(2).unwrap();
+    /// assert_eq!(manager.bytes_verified(), 150); // 100 + 50 (last piece smaller)
+    /// ```
+    pub fn bytes_verified(&self) -> u64 {
+        let num_pieces = self.piece_states.len();
+        if num_pieces == 0 {
+            return 0;
+        }
+
+        let mut total_bytes: u64 = 0;
+
+        for (idx, state) in self.piece_states.iter().enumerate() {
+            if state.is_verified() {
+                // Last piece may be smaller
+                if idx == num_pieces - 1 {
+                    let last_piece_size = self.total_length
+                        - (num_pieces as u64 - 1) * self.piece_length as u64;
+                    total_bytes += last_piece_size;
+                } else {
+                    total_bytes += self.piece_length as u64;
+                }
+            }
+        }
+
+        total_bytes
+    }
+
+    /// Returns the percentage complete (0.0 to 100.0).
+    ///
+    /// Percentage is calculated based on the number of verified pieces
+    /// relative to total pieces. An empty torrent (0 pieces) is considered
+    /// 100% complete.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// let hashes = vec![[0u8; 20]; 4];
+    /// let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+    ///
+    /// assert_eq!(manager.percent_complete(), 0.0);
+    /// manager.mark_verified(0).unwrap();
+    /// assert_eq!(manager.percent_complete(), 25.0);
+    /// manager.mark_verified(1).unwrap();
+    /// assert_eq!(manager.percent_complete(), 50.0);
+    /// ```
+    pub fn percent_complete(&self) -> f64 {
+        let (verified, total) = self.progress();
+        if total == 0 {
+            return 100.0; // Empty torrent is complete
+        }
+        (verified as f64 / total as f64) * 100.0
+    }
+
     /// Checks if a specific piece has been verified (hash matched).
     ///
     /// This is used to determine if we still need a piece when deciding
@@ -1235,6 +1361,146 @@ fn piece_manager_implements_debug() {
     let manager = PieceManager::new(100, 200, hashes).unwrap();
     let debug_str = format!("{:?}", manager);
     assert!(debug_str.contains("PieceManager"));
+}
+
+#[test]
+fn piece_manager_progress_starts_at_zero() {
+    let hashes = vec![[0u8; 20]; 10];
+    let manager = PieceManager::new(16384, 163840, hashes).unwrap();
+
+    let (verified, total) = manager.progress();
+    assert_eq!(verified, 0);
+    assert_eq!(total, 10);
+}
+
+#[test]
+fn piece_manager_progress_increases_with_verification() {
+    let hashes = vec![[0u8; 20]; 10];
+    let mut manager = PieceManager::new(16384, 163840, hashes).unwrap();
+
+    manager.mark_verified(0).unwrap();
+    let (verified, _) = manager.progress();
+    assert_eq!(verified, 1);
+
+    manager.mark_verified(5).unwrap();
+    let (verified, _) = manager.progress();
+    assert_eq!(verified, 2);
+}
+
+#[test]
+fn piece_manager_failed_not_counted_as_progress() {
+    let hashes = vec![[0u8; 20]; 10];
+    let mut manager = PieceManager::new(16384, 163840, hashes).unwrap();
+
+    manager.mark_verified(0).unwrap();
+    manager.mark_failed(1).unwrap();
+
+    let (verified, _) = manager.progress();
+    assert_eq!(verified, 1); // Only 1, not 2
+}
+
+#[test]
+fn piece_manager_is_complete_all_verified() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    assert!(!manager.is_complete());
+    manager.mark_verified(0).unwrap();
+    manager.mark_verified(1).unwrap();
+    manager.mark_verified(2).unwrap();
+    assert!(manager.is_complete());
+}
+
+#[test]
+fn piece_manager_bytes_verified_full_pieces() {
+    // 10 pieces of 16384 bytes each = 163840 bytes total
+    let hashes = vec![[0u8; 20]; 10];
+    let mut manager = PieceManager::new(16384, 163840, hashes).unwrap();
+
+    assert_eq!(manager.bytes_verified(), 0);
+    manager.mark_verified(0).unwrap();
+    assert_eq!(manager.bytes_verified(), 16384);
+    manager.mark_verified(1).unwrap();
+    assert_eq!(manager.bytes_verified(), 32768);
+}
+
+#[test]
+fn piece_manager_bytes_verified_partial_last_piece() {
+    // 3 pieces: 100 + 100 + 50 = 250 bytes total
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 250, hashes).unwrap();
+
+    assert_eq!(manager.bytes_verified(), 0);
+    manager.mark_verified(0).unwrap();
+    assert_eq!(manager.bytes_verified(), 100); // Full piece
+    manager.mark_verified(2).unwrap();
+    assert_eq!(manager.bytes_verified(), 150); // 100 + 50 (last piece smaller)
+    manager.mark_verified(1).unwrap();
+    assert_eq!(manager.bytes_verified(), 250); // All pieces
+}
+
+#[test]
+fn piece_manager_percent_complete() {
+    let hashes = vec![[0u8; 20]; 4];
+    let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+
+    assert_eq!(manager.percent_complete(), 0.0);
+    manager.mark_verified(0).unwrap();
+    assert_eq!(manager.percent_complete(), 25.0);
+    manager.mark_verified(1).unwrap();
+    assert_eq!(manager.percent_complete(), 50.0);
+    manager.mark_verified(2).unwrap();
+    assert_eq!(manager.percent_complete(), 75.0);
+    manager.mark_verified(3).unwrap();
+    assert_eq!(manager.percent_complete(), 100.0);
+}
+
+#[test]
+fn piece_manager_percent_complete_empty_torrent() {
+    let hashes: Vec<[u8; 20]> = vec![];
+    let manager = PieceManager::new(100, 0, hashes).unwrap();
+
+    // Empty torrent is 100% complete
+    assert_eq!(manager.percent_complete(), 100.0);
+}
+
+#[test]
+fn piece_manager_progress_simulation_sequence() {
+    // Simulate a download sequence with verification, failure, and retry
+    let hashes = vec![[0u8; 20]; 5];
+    let mut manager = PieceManager::new(1000, 5000, hashes).unwrap();
+
+    // Initial state
+    let (v, t) = manager.progress();
+    assert_eq!((v, t), (0, 5));
+    assert_eq!(manager.percent_complete(), 0.0);
+
+    // Download and verify piece 0
+    manager.start_piece(0).unwrap();
+    manager.mark_verified(0).unwrap();
+    let (v, _) = manager.progress();
+    assert_eq!(v, 1);
+
+    // Download piece 1 but it fails
+    manager.start_piece(1).unwrap();
+    manager.mark_failed(1).unwrap();
+    let (v, _) = manager.progress();
+    assert_eq!(v, 1); // Failed doesn't count
+
+    // Retry piece 1 and succeed
+    manager.start_piece(1).unwrap();
+    manager.mark_verified(1).unwrap();
+    let (v, _) = manager.progress();
+    assert_eq!(v, 2);
+
+    // Verify remaining pieces
+    manager.mark_verified(2).unwrap();
+    manager.mark_verified(3).unwrap();
+    manager.mark_verified(4).unwrap();
+
+    assert!(manager.is_complete());
+    assert_eq!(manager.percent_complete(), 100.0);
+    assert_eq!(manager.bytes_verified(), 5000);
 }
 @
 
