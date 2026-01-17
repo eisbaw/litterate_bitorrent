@@ -1930,6 +1930,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<request pipelining>>
 
+<<request timeout handling>>
+
 <<peer connection manager>>
 
 <<client tests>>
@@ -1949,6 +1951,8 @@ The client module exports the [[Client]] struct and associated types.
 <<peer request queue tests>>
 
 <<request pipelining tests>>
+
+<<request timeout handling tests>>
 @
 
 \subsection{Testing}
@@ -6723,6 +6727,468 @@ mod request_pipelining_tests {
         // Should only return block 1 (block 0 already in queue)
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].offset, BLOCK_SIZE, "Should skip already-queued block");
+    }
+}
+@
+
+\subsection{Request Timeout Handling}
+
+When a block request times out (no response within 30 seconds), the client must:
+
+\begin{enumerate}
+\item \textbf{Cancel with the original peer}: Send a \texttt{cancel} message to
+  the peer that failed to respond. While the BitTorrent protocol does not
+  \emph{require} cancel messages for correctness (peers may ignore requests
+  silently), sending them is good citizenship: it allows the peer to free
+  resources and avoids duplicate data transmission if the peer was merely slow.
+
+\item \textbf{Remove from the original queue}: The timed-out request must be
+  removed from the original peer's request queue. This frees a slot for new
+  requests and prevents the request from being counted against our pipeline
+  depth.
+
+\item \textbf{Find an alternative peer}: Search for another peer that:
+  \begin{itemize}
+  \item Has the piece (checked via their bitfield)
+  \item Is not choking us (willing to send data)
+  \item Is not the original peer (avoid retry loops)
+  \end{itemize}
+
+\item \textbf{Re-request from the alternative}: If an alternative is found,
+  queue the block request to that peer. If no alternative exists, the block
+  remains unassigned until conditions change (new peer connects, existing peer
+  unchokes).
+
+\item \textbf{Mark block as not in-flight}: The block must be unmarked in the
+  piece manager so it can be re-requested. Without this step, the block would
+  be considered ``in progress'' forever.
+\end{enumerate}
+
+The [[TimeoutHandleResult]] struct captures the outcome of timeout handling,
+providing all information needed by the caller to send the cancel message and
+potentially queue a new request.
+
+<<request timeout handling>>=
+/// Result of handling a timed-out block request.
+///
+/// This struct provides all information needed to complete timeout handling:
+/// - The cancel message to send to the original peer
+/// - An alternative peer to re-request from (if available)
+/// - The original request details for re-queuing
+///
+/// # Usage
+///
+/// ```ignore
+/// let result = handle_request_timeout(&request, addr, &mut queue, &peers);
+///
+/// // Always send the cancel to the original peer
+/// send_message(original_peer, result.cancel).await;
+///
+/// // Re-request from alternative if available
+/// if let Some(alt_addr) = result.alternative_peer {
+///     let new_request = BlockRequest::new(
+///         result.request.piece_index,
+///         result.request.offset,
+///         result.request.length,
+///         new_peer_id,
+///     );
+///     queue_request(alt_addr, new_request);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct TimeoutHandleResult {
+    /// Cancel message to send to the original peer.
+    ///
+    /// This message tells the peer we no longer need the block. The peer
+    /// may have already sent it (in which case we'll receive it as an
+    /// unrequested block) or may be about to send it (in which case this
+    /// prevents unnecessary bandwidth usage).
+    pub cancel: Message,
+
+    /// Alternative peer to re-request from, if one was found.
+    ///
+    /// `None` if no suitable peer is available (no peer has the piece,
+    /// all peers with the piece are choking us, or the only peer with
+    /// the piece is the original timed-out peer).
+    pub alternative_peer: Option<SocketAddr>,
+
+    /// The block request that timed out.
+    ///
+    /// Preserved so the caller can re-create a new request with updated
+    /// timestamp and potentially different peer_id for the alternative peer.
+    pub request: BlockRequest,
+}
+
+/// Handles a timed-out block request.
+///
+/// This function implements the timeout handling strategy:
+/// 1. Remove the request from the original peer's queue
+/// 2. Create a cancel message for the original peer
+/// 3. Find an alternative peer that has the piece and isn't choking us
+///
+/// The caller is responsible for:
+/// - Sending the cancel message to the original peer
+/// - Creating a new request for the alternative peer (if any)
+/// - Marking the block as not-in-flight in the piece manager
+///
+/// # Arguments
+///
+/// * `timed_out_request` - The request that timed out
+/// * `original_peer_addr` - Address of the peer that timed out
+/// * `original_queue` - The original peer's request queue (for removal)
+/// * `peers` - All active peer connections for finding alternative
+///
+/// # Returns
+///
+/// `TimeoutHandleResult` containing the cancel message, optional alternative
+/// peer address, and the original request.
+///
+/// # Example
+///
+/// ```ignore
+/// let timed_out = queue.check_timeouts();
+/// for req in timed_out {
+///     let result = handle_request_timeout(
+///         &req.request,
+///         peer_addr,
+///         &mut peer_queue,
+///         &connections,
+///     );
+///
+///     // Send cancel to original peer
+///     send_message(peer_addr, result.cancel).await;
+///
+///     // Mark block as available for re-request
+///     piece_manager.mark_block_not_in_flight(
+///         result.request.piece_index,
+///         result.request.offset,
+///     );
+///
+///     // Re-request from alternative if available
+///     if let Some(alt) = result.alternative_peer {
+///         // ... queue new request to alt ...
+///     }
+/// }
+/// ```
+pub fn handle_request_timeout(
+    timed_out_request: &BlockRequest,
+    original_peer_addr: SocketAddr,
+    original_queue: &mut PeerRequestQueue,
+    peers: &HashMap<SocketAddr, PeerConnection>,
+) -> TimeoutHandleResult {
+    // Remove the timed-out request from the original peer's queue
+    // This frees a slot and prevents duplicate timeout handling
+    original_queue.remove(timed_out_request.piece_index, timed_out_request.offset);
+
+    // Create the cancel message with the same parameters as the original request
+    let cancel = Message::Cancel {
+        index: timed_out_request.piece_index,
+        begin: timed_out_request.offset,
+        length: timed_out_request.length,
+    };
+
+    // Find an alternative peer that can serve this block
+    let alternative = find_alternative_peer(
+        timed_out_request.piece_index,
+        original_peer_addr,
+        peers,
+    );
+
+    TimeoutHandleResult {
+        cancel,
+        alternative_peer: alternative,
+        request: timed_out_request.clone(),
+    }
+}
+
+/// Finds an alternative peer that has the piece and isn't choking us.
+///
+/// This function searches through active peer connections to find a peer
+/// that can serve the requested piece. The selection criteria are:
+///
+/// 1. **Not the original peer**: We exclude the peer that timed out to avoid
+///    retry loops with an unresponsive peer.
+///
+/// 2. **Has the piece**: The peer's bitfield must indicate they have the
+///    piece. A peer without the piece cannot serve our request.
+///
+/// 3. **Not choking us**: The peer must be willing to send data. A choking
+///    peer will ignore our requests (per protocol).
+///
+/// # Selection Strategy
+///
+/// Currently uses simple first-match selection. Future improvements could:
+/// - Prefer peers with lower latency (based on historical response times)
+/// - Prefer peers with fewer pending requests (less loaded)
+/// - Randomize selection to distribute load
+///
+/// # Arguments
+///
+/// * `piece_index` - The piece we need
+/// * `exclude_addr` - Address to exclude (typically the timed-out peer)
+/// * `peers` - Map of active peer connections
+///
+/// # Returns
+///
+/// `Some(SocketAddr)` of a suitable peer, or `None` if no alternative exists.
+///
+/// # Example
+///
+/// ```ignore
+/// if let Some(alt_peer) = find_alternative_peer(piece_idx, failed_peer, &peers) {
+///     // Queue request to alt_peer
+/// } else {
+///     // No alternative available, block remains unassigned
+/// }
+/// ```
+fn find_alternative_peer(
+    piece_index: u32,
+    exclude_addr: SocketAddr,
+    peers: &HashMap<SocketAddr, PeerConnection>,
+) -> Option<SocketAddr> {
+    peers.iter()
+        // Skip the original peer that timed out
+        .filter(|(addr, _)| **addr != exclude_addr)
+        // Only consider peers that have the piece
+        .filter(|(_, conn)| conn.state.has_piece(piece_index))
+        // Only consider peers that are not choking us
+        .filter(|(_, conn)| !conn.state.peer_choking)
+        // Return the first matching peer's address
+        .map(|(addr, _)| *addr)
+        .next()
+}
+@
+
+We test the timeout handling logic to verify:
+\begin{itemize}
+\item Cancel messages are generated with correct parameters
+\item Requests are properly removed from the queue
+\item Alternative peers are found when available
+\item No alternative is returned when none qualify
+\item The original peer is excluded from consideration
+\end{itemize}
+
+<<request timeout handling tests>>=
+#[cfg(test)]
+mod timeout_handling_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use crate::pieces::BlockRequest;
+
+    fn test_peer_id() -> [u8; 20] {
+        *b"-LB0001-test12345678"
+    }
+
+    /// Creates a mock PeerConnection for testing timeout handling.
+    ///
+    /// Note: We need to create a real TcpStream for PeerConnection, so we
+    /// use a mock server approach similar to other tests in this file.
+    async fn create_test_connection(
+        num_pieces: usize,
+        has_piece: Option<u32>,
+        peer_choking: bool,
+    ) -> (SocketAddr, PeerConnection) {
+        use tokio::net::TcpListener;
+        use crate::messages::Handshake;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        drop(listener);
+
+        let client_stream = connect_handle.await.unwrap();
+        drop(server_stream);
+
+        let peer_handshake = Handshake::new([0xAB; 20], test_peer_id());
+        let mut conn = PeerConnection::new(client_stream, addr, &peer_handshake, num_pieces);
+
+        // Set up the peer's state
+        conn.state.peer_choking = peer_choking;
+        if let Some(piece_idx) = has_piece {
+            conn.state.set_piece(piece_idx);
+        }
+
+        (addr, conn)
+    }
+
+    #[test]
+    fn handle_request_timeout_creates_cancel_message() {
+        let request = BlockRequest::new(5, 16384, 16384, test_peer_id());
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        let peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+
+        let result = handle_request_timeout(&request, addr, &mut queue, &peers);
+
+        // Verify cancel message has correct parameters
+        match result.cancel {
+            Message::Cancel { index, begin, length } => {
+                assert_eq!(index, 5, "Cancel index should match request");
+                assert_eq!(begin, 16384, "Cancel begin should match request");
+                assert_eq!(length, 16384, "Cancel length should match request");
+            }
+            _ => panic!("Expected Cancel message"),
+        }
+    }
+
+    #[test]
+    fn handle_request_timeout_removes_from_queue() {
+        let request = BlockRequest::new(0, 0, 16384, test_peer_id());
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+
+        // Add the request to the queue
+        queue.push(request.clone());
+        assert_eq!(queue.len(), 1, "Queue should have 1 request before timeout handling");
+
+        let peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+
+        let _result = handle_request_timeout(&request, addr, &mut queue, &peers);
+
+        // Verify request was removed
+        assert_eq!(queue.len(), 0, "Request should be removed from queue");
+        assert!(queue.remove(0, 0).is_none(), "Request should not be findable");
+    }
+
+    #[tokio::test]
+    async fn handle_request_timeout_finds_alternative_peer() {
+        let request = BlockRequest::new(0, 0, 16384, test_peer_id());
+        let original_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        // Create an alternative peer that has the piece and is not choking
+        let (alt_addr, alt_conn) = create_test_connection(
+            10,           // num_pieces
+            Some(0),      // has piece 0
+            false,        // not choking us
+        ).await;
+
+        let mut peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        peers.insert(alt_addr, alt_conn);
+
+        let result = handle_request_timeout(&request, original_addr, &mut queue, &peers);
+
+        assert!(result.alternative_peer.is_some(), "Should find alternative peer");
+        assert_eq!(result.alternative_peer.unwrap(), alt_addr, "Should return the alternative's address");
+    }
+
+    #[tokio::test]
+    async fn handle_request_timeout_returns_none_when_no_alternative() {
+        let request = BlockRequest::new(0, 0, 16384, test_peer_id());
+        let original_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        // Create a peer that is choking us (even though it has the piece)
+        let (choking_addr, choking_conn) = create_test_connection(
+            10,          // num_pieces
+            Some(0),     // has piece 0
+            true,        // IS choking us
+        ).await;
+
+        let mut peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        peers.insert(choking_addr, choking_conn);
+
+        let result = handle_request_timeout(&request, original_addr, &mut queue, &peers);
+
+        assert!(result.alternative_peer.is_none(), "Should not find alternative when all are choking");
+    }
+
+    #[tokio::test]
+    async fn handle_request_timeout_returns_none_when_no_peer_has_piece() {
+        let request = BlockRequest::new(5, 0, 16384, test_peer_id()); // piece 5
+        let original_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        // Create a peer that has a different piece (not piece 5)
+        let (other_addr, other_conn) = create_test_connection(
+            10,          // num_pieces
+            Some(0),     // has piece 0, NOT piece 5
+            false,       // not choking
+        ).await;
+
+        let mut peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        peers.insert(other_addr, other_conn);
+
+        let result = handle_request_timeout(&request, original_addr, &mut queue, &peers);
+
+        assert!(result.alternative_peer.is_none(), "Should not find alternative when no peer has the piece");
+    }
+
+    #[tokio::test]
+    async fn handle_request_timeout_excludes_original_peer() {
+        let request = BlockRequest::new(0, 0, 16384, test_peer_id());
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        // Create a peer that has the piece and is not choking
+        let (peer_addr, peer_conn) = create_test_connection(
+            10,          // num_pieces
+            Some(0),     // has piece 0
+            false,       // not choking
+        ).await;
+
+        let mut peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        peers.insert(peer_addr, peer_conn);
+
+        // Use the same address as the original - should be excluded
+        let result = handle_request_timeout(&request, peer_addr, &mut queue, &peers);
+
+        assert!(result.alternative_peer.is_none(), "Should exclude original peer from alternatives");
+    }
+
+    #[test]
+    fn handle_request_timeout_preserves_request_details() {
+        let request = BlockRequest::new(7, 32768, 16384, test_peer_id());
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(request.clone());
+
+        let peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+
+        let result = handle_request_timeout(&request, addr, &mut queue, &peers);
+
+        // Verify request details are preserved
+        assert_eq!(result.request.piece_index, 7);
+        assert_eq!(result.request.offset, 32768);
+        assert_eq!(result.request.length, 16384);
+    }
+
+    #[tokio::test]
+    async fn find_alternative_peer_selects_unchoked_peer_with_piece() {
+        // Create two peers: one choking, one not
+        let (choking_addr, choking_conn) = create_test_connection(10, Some(0), true).await;
+        let (unchoked_addr, unchoked_conn) = create_test_connection(10, Some(0), false).await;
+
+        let mut peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        peers.insert(choking_addr, choking_conn);
+        peers.insert(unchoked_addr, unchoked_conn);
+
+        let exclude_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let result = find_alternative_peer(0, exclude_addr, &peers);
+
+        assert!(result.is_some(), "Should find unchoked peer");
+        assert_eq!(result.unwrap(), unchoked_addr, "Should select the unchoked peer");
+    }
+
+    #[test]
+    fn find_alternative_peer_returns_none_for_empty_peers() {
+        let peers: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        let exclude_addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+
+        let result = find_alternative_peer(0, exclude_addr, &peers);
+
+        assert!(result.is_none(), "Should return None for empty peers map");
     }
 }
 @
