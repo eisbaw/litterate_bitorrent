@@ -759,7 +759,7 @@ implement this integration logic, coordinating between per-peer state and
 global availability tracking.
 
 <<incoming message handlers>>=
-use crate::pieces::PieceAvailability;
+use crate::pieces::{PieceAvailability, InProgressPiece, verify_piece};
 
 /// Handles an incoming bitfield message from a peer.
 ///
@@ -1015,6 +1015,262 @@ pub fn handle_incoming_choke(conn: &mut PeerConnection) -> Vec<BlockRequest> {
     }
 
     cancelled
+}
+@
+
+\subsubsection{Piece (Block) Message Handler}
+
+The piece message handler is the core data reception path in BitTorrent. When a
+peer sends us block data, we need to:
+
+\begin{enumerate}
+\item \textbf{Validate}: Ensure the block matches a pending request. This prevents
+  amplification attacks where a malicious peer sends unrequested data to consume
+  memory or overwrite legitimate data with garbage.
+\item \textbf{Store}: Copy the block data into the in-progress piece buffer at the
+  correct offset.
+\item \textbf{Verify}: When all blocks are received, compute the SHA1 hash and compare
+  it against the expected hash from the torrent metadata.
+\end{enumerate}
+
+The data flow for incoming blocks is:
+
+\begin{verbatim}
+peer sends Piece { index, begin, block }
+    |
+    v
+validate against pending_requests
+    |
+    +-- no match --> return UnexpectedBlock
+    |
+    v (match found, remove from pending)
+store in InProgressPiece via receive_block()
+    |
+    +-- error --> return UnexpectedBlock
+    |
+    v
+check is_complete()
+    |
+    +-- false --> return BlockStored
+    |
+    v (piece complete)
+verify_piece(data, expected_hash)
+    |
+    +-- Ok --> return PieceVerified(index)
+    +-- Err --> return PieceHashFailed(index)
+\end{verbatim}
+
+The [[PieceHandleResult]] enum captures these outcomes, allowing the caller to
+take appropriate action (write to disk, broadcast have, retry download, etc.).
+
+<<incoming message handlers>>=
+/// Result of processing a piece (block) message.
+///
+/// This enum captures the possible outcomes when a peer sends us block data.
+/// The variants allow the caller to take appropriate action:
+///
+/// - `BlockStored`: Normal case, continue downloading
+/// - `PieceVerified`: Celebrate, write to disk, broadcast have
+/// - `PieceHashFailed`: Log warning, mark piece for retry
+/// - `UnexpectedBlock`: Possible protocol violation or duplicate, ignore
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::PieceHandleResult;
+///
+/// fn process_result(result: PieceHandleResult) {
+///     match result {
+///         PieceHandleResult::BlockStored => {
+///             // Continue downloading, nothing special to do
+///         }
+///         PieceHandleResult::PieceVerified(index) => {
+///             println!("Piece {} complete and verified!", index);
+///             // Write to disk, broadcast have message
+///         }
+///         PieceHandleResult::PieceHashFailed(index) => {
+///             println!("Piece {} failed verification, will retry", index);
+///             // Mark piece for re-download
+///         }
+///         PieceHandleResult::UnexpectedBlock => {
+///             // Ignore, possibly log at debug level
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PieceHandleResult {
+    /// Block received and stored, piece still incomplete.
+    BlockStored,
+    /// Piece is now complete and verified successfully.
+    ///
+    /// The contained value is the piece index that was verified.
+    PieceVerified(usize),
+    /// Piece is complete but hash verification failed.
+    ///
+    /// The contained value is the piece index that failed verification.
+    /// The piece should be marked for retry.
+    PieceHashFailed(usize),
+    /// Block was unexpected (no matching pending request).
+    ///
+    /// This can happen due to:
+    /// - Duplicate blocks after a request timeout and retry
+    /// - Malicious peers sending unrequested data
+    /// - Race conditions during choke/unchoke
+    UnexpectedBlock,
+}
+
+/// Handles an incoming piece (block) message.
+///
+/// This is the core data reception path. The function:
+/// 1. Validates the block matches a pending request
+/// 2. Stores the block in the in-progress piece
+/// 3. If piece is complete, verifies the SHA1 hash
+///
+/// # Security: Request Validation
+///
+/// We validate that incoming blocks match pending requests to prevent
+/// amplification attacks and data corruption. Without this check, a
+/// malicious peer could:
+/// - Send unrequested blocks to consume memory
+/// - Overwrite legitimate data with garbage
+/// - Cause hash verification failures
+///
+/// # Data Integrity: Hash Verification
+///
+/// When a piece is complete, we immediately verify its SHA1 hash against
+/// the expected hash from the torrent metadata. This is critical because:
+/// - Peers may be malicious or buggy
+/// - Network corruption can occur
+/// - The torrent file's hashes are the only source of truth
+///
+/// # Arguments
+///
+/// * `conn` - The peer connection that sent the block
+/// * `index` - Piece index (0-based)
+/// * `begin` - Byte offset within the piece
+/// * `block` - The block data
+/// * `in_progress` - The in-progress piece being assembled
+/// * `expected_hash` - The expected SHA1 hash for verification
+///
+/// # Returns
+///
+/// `PieceHandleResult` indicating what happened:
+/// - `BlockStored`: block saved, piece incomplete
+/// - `PieceVerified`: piece complete and hash matches
+/// - `PieceHashFailed`: piece complete but hash mismatch
+/// - `UnexpectedBlock`: no matching pending request or receive failed
+///
+/// # Example
+///
+/// ```no_run
+/// use literate_bittorrent::client::{PeerConnection, PieceHandleResult, handle_incoming_piece};
+/// use literate_bittorrent::pieces::InProgressPiece;
+///
+/// fn process_piece_message(
+///     conn: &mut PeerConnection,
+///     index: u32,
+///     begin: u32,
+///     block: &[u8],
+///     in_progress: &mut InProgressPiece,
+///     expected_hash: &[u8; 20],
+/// ) {
+///     match handle_incoming_piece(conn, index, begin, block, in_progress, expected_hash) {
+///         PieceHandleResult::BlockStored => {
+///             // Request more blocks if needed
+///         }
+///         PieceHandleResult::PieceVerified(idx) => {
+///             // Write piece to disk
+///             // Broadcast have message to all peers
+///         }
+///         PieceHandleResult::PieceHashFailed(idx) => {
+///             // Reset the in-progress piece
+///             // Re-request all blocks
+///         }
+///         PieceHandleResult::UnexpectedBlock => {
+///             // Ignore or track for rate limiting
+///         }
+///     }
+/// }
+/// ```
+pub fn handle_incoming_piece(
+    conn: &mut PeerConnection,
+    index: u32,
+    begin: u32,
+    block: &[u8],
+    in_progress: &mut InProgressPiece,
+    expected_hash: &[u8; 20],
+) -> PieceHandleResult {
+    // Find and remove matching pending request
+    let request_pos = conn.state.pending_requests.iter().position(|req| {
+        req.piece_index == index && req.offset == begin && req.length == block.len() as u32
+    });
+
+    match request_pos {
+        None => {
+            debug!(
+                piece = index,
+                offset = begin,
+                len = block.len(),
+                "received unexpected block - no matching request"
+            );
+            return PieceHandleResult::UnexpectedBlock;
+        }
+        Some(pos) => {
+            conn.state.pending_requests.remove(pos);
+        }
+    }
+
+    // Store the block
+    match in_progress.receive_block(begin, block) {
+        Err(e) => {
+            warn!(
+                piece = index,
+                offset = begin,
+                error = %e,
+                "block receive failed"
+            );
+            return PieceHandleResult::UnexpectedBlock;
+        }
+        Ok(false) => {
+            // Duplicate block, already received
+            debug!(
+                piece = index,
+                offset = begin,
+                "duplicate block received"
+            );
+            return PieceHandleResult::BlockStored;
+        }
+        Ok(true) => {
+            // Block stored successfully
+        }
+    }
+
+    // Check if piece is complete
+    if !in_progress.is_complete() {
+        return PieceHandleResult::BlockStored;
+    }
+
+    // Verify hash
+    let data = in_progress.data();
+    match verify_piece(index, data, expected_hash) {
+        Ok(()) => {
+            info!(
+                piece = index,
+                bytes = data.len(),
+                "piece verified successfully"
+            );
+            PieceHandleResult::PieceVerified(index as usize)
+        }
+        Err(e) => {
+            warn!(
+                piece = index,
+                error = %e,
+                "piece hash verification failed"
+            );
+            PieceHandleResult::PieceHashFailed(index as usize)
+        }
+    }
 }
 @
 
@@ -2286,6 +2542,261 @@ mod tests {
 
         assert_eq!(formatted, "ff00abcd12345678");
     }
+
+    // Tests for handle_incoming_piece
+
+    #[tokio::test]
+    async fn handle_incoming_piece_stores_block() {
+        use crate::pieces::{InProgressPiece, BlockRequest};
+        use sha1::{Sha1, Digest};
+
+        let mut conn = create_test_peer_connection(100).await;
+        let peer_id = conn.peer_id;
+
+        // Create a small piece (1000 bytes, fits in one block)
+        let piece_size = 1000u32;
+        let mut in_progress = InProgressPiece::new(0, piece_size);
+
+        // Create block data
+        let block_data = vec![42u8; piece_size as usize];
+
+        // Compute expected hash for verification
+        let mut hasher = Sha1::new();
+        hasher.update(&block_data);
+        let hash_result = hasher.finalize();
+        let mut expected_hash = [0u8; 20];
+        expected_hash.copy_from_slice(&hash_result);
+
+        // Add matching pending request
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: 0,
+            length: piece_size,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+
+        assert_eq!(conn.state.pending_requests.len(), 1);
+
+        // Call handler - piece will be complete after this block
+        let result = handle_incoming_piece(
+            &mut conn,
+            0,      // index
+            0,      // begin
+            &block_data,
+            &mut in_progress,
+            &expected_hash,
+        );
+
+        // Should verify successfully since we computed the correct hash
+        assert_eq!(result, PieceHandleResult::PieceVerified(0));
+        assert!(conn.state.pending_requests.is_empty(), "pending request should be removed");
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_piece_rejects_unexpected_block() {
+        use crate::pieces::InProgressPiece;
+
+        let mut conn = create_test_peer_connection(100).await;
+
+        // Create an in-progress piece
+        let mut in_progress = InProgressPiece::new(0, 1000);
+        let expected_hash = [0u8; 20];
+
+        // Don't add any pending request - this block is unexpected
+        assert!(conn.state.pending_requests.is_empty());
+
+        let result = handle_incoming_piece(
+            &mut conn,
+            0,
+            0,
+            &[0u8; 1000],
+            &mut in_progress,
+            &expected_hash,
+        );
+
+        assert_eq!(result, PieceHandleResult::UnexpectedBlock);
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_piece_verifies_complete_piece() {
+        use crate::pieces::{InProgressPiece, BlockRequest};
+        use sha1::{Sha1, Digest};
+
+        let mut conn = create_test_peer_connection(100).await;
+        let peer_id = conn.peer_id;
+
+        // Small piece that completes with one block
+        let piece_size = 500u32;
+        let mut in_progress = InProgressPiece::new(5, piece_size);
+
+        let block_data = vec![0xAB; piece_size as usize];
+
+        // Compute correct hash
+        let mut hasher = Sha1::new();
+        hasher.update(&block_data);
+        let hash_result = hasher.finalize();
+        let mut expected_hash = [0u8; 20];
+        expected_hash.copy_from_slice(&hash_result);
+
+        // Add matching request
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 5,
+            offset: 0,
+            length: piece_size,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+
+        let result = handle_incoming_piece(
+            &mut conn,
+            5,
+            0,
+            &block_data,
+            &mut in_progress,
+            &expected_hash,
+        );
+
+        assert_eq!(result, PieceHandleResult::PieceVerified(5));
+        assert!(in_progress.is_complete());
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_piece_detects_hash_failure() {
+        use crate::pieces::{InProgressPiece, BlockRequest};
+
+        let mut conn = create_test_peer_connection(100).await;
+        let peer_id = conn.peer_id;
+
+        let piece_size = 500u32;
+        let mut in_progress = InProgressPiece::new(3, piece_size);
+
+        let block_data = vec![0xCD; piece_size as usize];
+
+        // Use a wrong hash (all zeros won't match actual data)
+        let wrong_hash = [0u8; 20];
+
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 3,
+            offset: 0,
+            length: piece_size,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+
+        let result = handle_incoming_piece(
+            &mut conn,
+            3,
+            0,
+            &block_data,
+            &mut in_progress,
+            &wrong_hash,
+        );
+
+        assert_eq!(result, PieceHandleResult::PieceHashFailed(3));
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_piece_stores_partial_block() {
+        use crate::pieces::{InProgressPiece, BlockRequest, BLOCK_SIZE};
+
+        let mut conn = create_test_peer_connection(100).await;
+        let peer_id = conn.peer_id;
+
+        // Piece that requires 2 blocks (more than BLOCK_SIZE)
+        let piece_size = BLOCK_SIZE + 1000;
+        let mut in_progress = InProgressPiece::new(0, piece_size);
+
+        let block_data = vec![0x11; BLOCK_SIZE as usize];
+        let expected_hash = [0u8; 20]; // Won't be checked since piece won't complete
+
+        // Add matching request for first block only
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: 0,
+            length: BLOCK_SIZE,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+
+        let result = handle_incoming_piece(
+            &mut conn,
+            0,
+            0,
+            &block_data,
+            &mut in_progress,
+            &expected_hash,
+        );
+
+        // Piece not complete yet, should return BlockStored
+        assert_eq!(result, PieceHandleResult::BlockStored);
+        assert!(!in_progress.is_complete());
+        assert_eq!(in_progress.blocks_received_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_piece_removes_matching_request() {
+        use crate::pieces::{InProgressPiece, BlockRequest, BLOCK_SIZE};
+
+        let mut conn = create_test_peer_connection(100).await;
+        let peer_id = conn.peer_id;
+
+        let piece_size = BLOCK_SIZE * 2;
+        let mut in_progress = InProgressPiece::new(0, piece_size);
+
+        // Add multiple pending requests
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: 0,
+            length: BLOCK_SIZE,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: BLOCK_SIZE,
+            length: BLOCK_SIZE,
+            requested_at: std::time::Instant::now(),
+            peer: peer_id,
+        });
+
+        assert_eq!(conn.state.pending_requests.len(), 2);
+
+        let block_data = vec![0u8; BLOCK_SIZE as usize];
+        let expected_hash = [0u8; 20];
+
+        // Receive first block
+        let result = handle_incoming_piece(
+            &mut conn,
+            0,
+            0,
+            &block_data,
+            &mut in_progress,
+            &expected_hash,
+        );
+
+        assert_eq!(result, PieceHandleResult::BlockStored);
+        // Only one request should be removed
+        assert_eq!(conn.state.pending_requests.len(), 1);
+        // The remaining request should be the second block
+        assert_eq!(conn.state.pending_requests[0].offset, BLOCK_SIZE);
+    }
+
+    #[test]
+    fn piece_handle_result_debug_and_eq() {
+        // Test Debug and PartialEq implementations
+        let result1 = PieceHandleResult::BlockStored;
+        let result2 = PieceHandleResult::BlockStored;
+        let result3 = PieceHandleResult::PieceVerified(5);
+
+        assert_eq!(result1, result2);
+        assert_ne!(result1, result3);
+
+        // Debug should work
+        let debug_str = format!("{:?}", result3);
+        assert!(debug_str.contains("PieceVerified"));
+        assert!(debug_str.contains("5"));
+    }
 }
 @
 
@@ -2313,10 +2824,14 @@ The tests verify each aspect of client construction:
   \item [[handle\_incoming\_have]] updates peer state, availability for single piece, determines interest
   \item [[handle\_incoming\_unchoke]] updates peer state and logs unchoke transitions
   \item [[handle\_incoming\_choke]] updates peer state, returns cancelled requests for reassignment
+  \item [[handle\_incoming\_piece]] validates blocks against pending requests, stores data, and verifies completed pieces
   \item Both bitfield/have handlers correctly return whether we should send an Interested message
   \item Availability counts are incremented for pieces the peer has
   \item Invalid bitfield lengths are rejected with appropriate errors
   \item Cancelled requests on choke are returned to caller for reassignment
+  \item Unexpected blocks (no matching request) are rejected
+  \item Completed pieces are verified against expected SHA1 hash
+  \item Hash verification failures are detected and reported
   \end{itemize}
 \end{itemize}
 
@@ -2580,7 +3095,7 @@ The shutdown announce has special requirements compared to regular announces:
 
 <<shutdown announce>>=
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use crate::tracker::{TrackerRequest, TrackerEvent, build_announce_url, TrackerError};
 
 /// Timeout for shutdown announce, in seconds.
