@@ -125,6 +125,7 @@ reused. The library root re-exports all public modules.
 pub mod bencode;
 pub mod metainfo;
 pub mod tracker;
+pub mod messages;
 @
 
 \section{Next Steps}

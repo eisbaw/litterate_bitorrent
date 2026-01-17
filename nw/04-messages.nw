@@ -1,0 +1,412 @@
+% Peer Wire Protocol Messages
+% Chapter 4 of the literate BitTorrent client
+
+\section{Peer Wire Protocol Messages}
+
+After obtaining a list of peers from the tracker, our client must communicate
+with them using the BitTorrent peer wire protocol. This protocol operates over
+TCP and enables peers to negotiate which pieces they have, request blocks, and
+transfer data. Before implementing the message types themselves, we define
+error types that capture all the ways peer communication can fail.
+
+\subsection{Peer Protocol Error Types}
+
+Communication with a peer involves several distinct phases, each with its own
+failure modes. We design our error types to distinguish between these phases,
+enabling appropriate recovery strategies:
+
+\begin{description}
+\item[Handshake failures] The initial handshake establishes identity and
+  verifies both peers want the same torrent. Failures here indicate either
+  a protocol mismatch (wrong protocol string, mismatched info hash) or
+  a peer that rejects our connection.
+
+\item[Message parsing errors] After a successful handshake, peers exchange
+  length-prefixed messages. Parsing can fail if the message type is unknown,
+  the payload is malformed, or the message violates protocol constraints.
+
+\item[Protocol violations] Even well-formed messages can violate protocol
+  semantics---for example, receiving a bitfield after the first message,
+  or a bitfield of the wrong length for the torrent.
+
+\item[Connection-level errors] Underlying I/O failures, timeouts, and
+  unexpected disconnections. These are often transient; the peer may be
+  reachable again later.
+\end{description}
+
+<<peer errors>>=
+/// Errors that can occur during peer wire protocol communication.
+///
+/// These errors cover the full lifecycle of peer communication: connection,
+/// handshake, message parsing, and protocol-level violations. The error
+/// variants are designed to provide actionable information for debugging
+/// while maintaining clean error messages for logging.
+///
+/// # Recovery Strategies
+///
+/// - **Connection/IO errors**: Often transient. Retry with backoff or try
+///   different peers.
+/// - **Handshake failures**: Usually permanent for this peer/torrent combo.
+///   Move on to other peers.
+/// - **Protocol violations**: Indicates buggy or malicious peer. Disconnect
+///   and blacklist temporarily.
+/// - **Timeouts**: Transient. Retry or try other peers.
+#[derive(Debug, thiserror::Error)]
+pub enum PeerError {
+    /// The peer handshake failed.
+    ///
+    /// Handshake failures occur during the initial 68-byte exchange when:
+    /// - The peer closed the connection before completing handshake
+    /// - The protocol string was not "BitTorrent protocol"
+    /// - The info hash did not match (peer is serving a different torrent)
+    /// - The peer rejected our connection for any other reason
+    ///
+    /// The contained string provides details about what specifically failed.
+    /// Handshake failures are typically permanent for this peer---retrying
+    /// immediately is unlikely to succeed.
+    #[error("handshake failed: {0}")]
+    HandshakeFailed(String),
+
+    /// A received message could not be parsed correctly.
+    ///
+    /// This indicates the peer sent data that does not conform to the
+    /// BitTorrent wire protocol message format. Possible causes:
+    /// - Corrupted data in transit (rare with TCP)
+    /// - Bug in the peer's implementation
+    /// - Incompatible protocol extension
+    ///
+    /// The contained string describes what was invalid about the message.
+    /// This typically indicates a buggy peer; disconnection is recommended.
+    #[error("invalid message: {0}")]
+    InvalidMessage(String),
+
+    /// The message type ID is not recognized.
+    ///
+    /// BitTorrent defines message IDs 0-8 for the core protocol (BEP 3).
+    /// Extensions like BEP 10 (Extension Protocol) use ID 20. Receiving
+    /// an ID outside these ranges indicates either:
+    /// - A protocol extension we don't support
+    /// - A malformed or corrupted message
+    ///
+    /// The unknown ID is preserved for logging and debugging. We should
+    /// disconnect from peers sending unknown message types.
+    #[error("unexpected message ID: {0}")]
+    UnexpectedMessageId(u8),
+
+    /// The message length exceeds protocol limits.
+    ///
+    /// BitTorrent messages use a 4-byte big-endian length prefix. While
+    /// technically allowing messages up to 4GB, practical limits are much
+    /// lower. The largest legitimate message is a `piece` message containing
+    /// one block (typically 16KB) plus overhead. We reject messages larger
+    /// than a reasonable threshold (e.g., 32KB) as likely malformed or
+    /// malicious.
+    ///
+    /// The actual length that was rejected is preserved for logging.
+    /// This could indicate a bug, memory exhaustion attack, or corruption.
+    #[error("message too large: {0} bytes")]
+    MessageTooLarge(u32),
+
+    /// The bitfield length does not match the number of pieces in the torrent.
+    ///
+    /// A bitfield message contains one bit per piece, padded to byte boundaries.
+    /// For a torrent with N pieces, the bitfield must be exactly
+    /// `ceil(N / 8)` bytes. A mismatch indicates either:
+    /// - The peer thinks this is a different torrent
+    /// - Bug in the peer's bitfield generation
+    /// - Corrupted message
+    ///
+    /// Both the expected and actual lengths are preserved for debugging.
+    #[error("bitfield wrong length: expected {expected} bytes, got {actual}")]
+    BitfieldWrongLength {
+        /// Expected bitfield length in bytes (ceil(num_pieces / 8)).
+        expected: usize,
+        /// Actual bitfield length received.
+        actual: usize,
+    },
+
+    /// The peer did not respond within the timeout period.
+    ///
+    /// Different operations have different timeouts (per PRD):
+    /// - TCP connection: 10 seconds
+    /// - Handshake completion: 10 seconds
+    /// - Block request: 30 seconds
+    /// - Idle disconnect: 180 seconds
+    ///
+    /// Timeouts are transient failures. The peer may be overloaded, have
+    /// high latency, or be temporarily unreachable. Retry with backoff
+    /// or try other peers.
+    #[error("operation timed out")]
+    Timeout,
+
+    /// The peer closed the connection.
+    ///
+    /// This occurs when the peer gracefully closes the TCP connection
+    /// (we receive EOF when reading). The peer may have:
+    /// - Shut down normally
+    /// - Decided to drop us in favor of better peers
+    /// - Detected a protocol error on their side
+    ///
+    /// Connection closure is normal in swarm operation. Simply move on
+    /// to other peers.
+    #[error("connection closed by peer")]
+    ConnectionClosed,
+
+    /// An underlying I/O error occurred.
+    ///
+    /// This wraps `std::io::Error` for errors that don't fit the more
+    /// specific categories above. Examples:
+    /// - Connection refused
+    /// - Connection reset
+    /// - Network unreachable
+    /// - Socket read/write failures
+    ///
+    /// I/O errors are often transient. Consider retry with backoff.
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+}
+@
+
+The error enum uses several features of [[thiserror]]:
+
+\begin{itemize}
+\item The [[#[derive(Debug, thiserror::Error)]]] automatically implements both
+  [[Debug]] and [[std::error::Error]].
+
+\item The [[#[error("...")]]] attribute defines the [[Display]] implementation.
+  Placeholders like [[{0}]] interpolate tuple struct fields, while named
+  fields like [[{expected}]] work with struct variants.
+
+\item The [[#[from]]] attribute on [[IoError]] enables automatic conversion
+  from [[std::io::Error]] using the [[?]] operator. This simplifies code
+  that wraps I/O operations: [[socket.read(&mut buf)?]] automatically converts
+  any I/O error into [[PeerError::IoError]].
+\end{itemize}
+
+Note that we choose to wrap [[std::io::Error]] rather than convert it to a
+string. This preserves the original error's details (error kind, OS error code)
+for debugging while still providing clean error messages for logging.
+
+\subsubsection{Error Variants Explained}
+
+Let us examine each error variant in more detail:
+
+\paragraph{HandshakeFailed} The BitTorrent handshake is a fixed 68-byte exchange:
+\begin{verbatim}
+<pstrlen><pstr><reserved><info_hash><peer_id>
+   1       19      8         20        20     = 68 bytes
+\end{verbatim}
+If any of these fields are wrong---wrong protocol string, wrong info hash, or
+the connection closes mid-handshake---we get [[HandshakeFailed]].
+
+\paragraph{InvalidMessage and UnexpectedMessageId} After the handshake, messages
+have the format:
+\begin{verbatim}
+<length><id><payload>
+   4     1    varies
+\end{verbatim}
+If the [[id]] byte is unknown, we get [[UnexpectedMessageId]]. If the payload
+doesn't match what's expected for that ID, we get [[InvalidMessage]].
+
+\paragraph{MessageTooLarge} A safety valve. The largest legitimate message is
+a [[piece]] message, which contains a 9-byte header plus one block (16KB by
+convention). We reject anything suspiciously large to prevent memory exhaustion.
+
+\paragraph{BitfieldWrongLength} The bitfield is sent once, immediately after
+handshake, to indicate which pieces a peer has. It must have exactly the
+right number of bits. This error is a struct variant to preserve both the
+expected and actual values---useful for debugging.
+
+\paragraph{Timeout} A catch-all for operations that take too long. Different
+operations have different timeout values (defined in the PRD), but they all
+result in the same error variant since the recovery strategy is the same.
+
+\paragraph{ConnectionClosed} Distinct from [[Timeout]] and [[IoError]] because
+it's a clean closure, not a failure. It's normal for peers to close connections;
+we just move on.
+
+\paragraph{IoError} The fallback for any I/O failure not captured above.
+
+\subsection{Module Structure}
+
+The messages module will eventually define all peer wire protocol message types,
+parsing, and serialization. For now, we define just the error types needed as
+a foundation.
+
+<<messages.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/04-messages.nw
+// Regenerate with: just tangle
+
+//! Peer wire protocol message types and error handling.
+//!
+//! This module implements the BitTorrent peer wire protocol as specified in
+//! BEP 3. The wire protocol is used for all communication between peers after
+//! initial discovery via the tracker.
+//!
+//! # Protocol Overview
+//!
+//! After TCP connection, peers exchange:
+//! 1. A 68-byte handshake (not length-prefixed, unlike other messages)
+//! 2. Length-prefixed messages for state and data exchange
+//!
+//! # Message Types
+//!
+//! | ID | Name | Payload |
+//! |----|------|---------|
+//! | - | keep-alive | (length = 0, no ID) |
+//! | 0 | choke | none |
+//! | 1 | unchoke | none |
+//! | 2 | interested | none |
+//! | 3 | not interested | none |
+//! | 4 | have | piece index (4 bytes) |
+//! | 5 | bitfield | bitfield |
+//! | 6 | request | index, begin, length (12 bytes) |
+//! | 7 | piece | index, begin, block |
+//! | 8 | cancel | index, begin, length (12 bytes) |
+//!
+//! # Error Handling
+//!
+//! Peer communication can fail in many ways. The [`PeerError`] enum captures
+//! all failure modes with appropriate detail for debugging and recovery.
+
+<<peer errors>>
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    <<peer error display tests>>
+
+    <<peer error trait tests>>
+}
+@
+
+\subsection{Error Display Tests}
+
+We verify that each error variant produces a human-readable message containing
+the relevant information. These tests document the expected error message format.
+
+<<peer error display tests>>=
+#[test]
+fn handshake_failed_displays_reason() {
+    let err = PeerError::HandshakeFailed("wrong info hash".to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("handshake failed"), "msg: {}", msg);
+    assert!(msg.contains("wrong info hash"), "msg: {}", msg);
+}
+
+#[test]
+fn invalid_message_displays_details() {
+    let err = PeerError::InvalidMessage("request payload too short".to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("invalid message"), "msg: {}", msg);
+    assert!(msg.contains("request payload too short"), "msg: {}", msg);
+}
+
+#[test]
+fn unexpected_message_id_displays_id() {
+    let err = PeerError::UnexpectedMessageId(99);
+    let msg = err.to_string();
+    assert!(msg.contains("99"), "msg: {}", msg);
+    assert!(msg.contains("unexpected message ID") || msg.contains("message ID"), "msg: {}", msg);
+}
+
+#[test]
+fn message_too_large_displays_size() {
+    let err = PeerError::MessageTooLarge(1_048_576);
+    let msg = err.to_string();
+    assert!(msg.contains("1048576"), "msg: {}", msg);
+    assert!(msg.contains("too large"), "msg: {}", msg);
+}
+
+#[test]
+fn bitfield_wrong_length_displays_both_lengths() {
+    let err = PeerError::BitfieldWrongLength {
+        expected: 100,
+        actual: 50,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("100"), "msg: {}", msg);
+    assert!(msg.contains("50"), "msg: {}", msg);
+    assert!(msg.contains("bitfield") || msg.contains("wrong length"), "msg: {}", msg);
+}
+
+#[test]
+fn timeout_has_clear_message() {
+    let err = PeerError::Timeout;
+    let msg = err.to_string();
+    assert!(msg.contains("timed out") || msg.contains("timeout"), "msg: {}", msg);
+}
+
+#[test]
+fn connection_closed_has_clear_message() {
+    let err = PeerError::ConnectionClosed;
+    let msg = err.to_string();
+    assert!(msg.contains("connection") || msg.contains("closed"), "msg: {}", msg);
+}
+
+#[test]
+fn io_error_wraps_underlying_error() {
+    let io_err = io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused");
+    let err = PeerError::IoError(io_err);
+    let msg = err.to_string();
+    assert!(msg.contains("I/O error") || msg.contains("connection refused"), "msg: {}", msg);
+}
+@
+
+\subsection{Error Trait Tests}
+
+We verify that [[PeerError]] implements the required traits correctly.
+
+<<peer error trait tests>>=
+#[test]
+fn peer_error_implements_std_error() {
+    fn assert_error<E: std::error::Error>() {}
+    assert_error::<PeerError>();
+}
+
+#[test]
+fn peer_error_implements_debug() {
+    let err = PeerError::Timeout;
+    let debug = format!("{:?}", err);
+    assert!(!debug.is_empty());
+}
+
+#[test]
+fn peer_error_implements_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    // Note: PeerError contains io::Error which is Send + Sync
+    // but we should verify our enum is too
+    assert_send_sync::<PeerError>();
+}
+
+#[test]
+fn io_error_conversion_works() {
+    fn produces_io_error() -> Result<(), PeerError> {
+        let io_err = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        Err(io_err)?
+    }
+
+    let result = produces_io_error();
+    assert!(matches!(result, Err(PeerError::IoError(_))));
+}
+@
+
+The [[io_error_conversion_works]] test verifies that the [[#[from]]] attribute
+works correctly, allowing [[?]] to automatically convert [[std::io::Error]]
+into [[PeerError::IoError]]. This is important for ergonomic error handling
+in async code where I/O operations are frequent.
+
+\subsection{Next Steps}
+
+With error types defined, the messages module is ready for:
+\begin{enumerate}
+\item Handshake struct and parsing
+\item Message enum with serialization/deserialization
+\item Length-prefix framing helpers
+\end{enumerate}
+
+These will be added in subsequent development as we build out the peer
+protocol implementation.
