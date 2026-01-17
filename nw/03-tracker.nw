@@ -1,0 +1,203 @@
+% Tracker Protocol: HTTP Tracker Communication
+% Chapter 3 of the literate BitTorrent client
+
+\section{Tracker Protocol}
+
+A tracker is a server that helps peers find each other. When our client wants
+to download a torrent, it contacts the tracker to announce its presence and
+receive a list of other peers sharing the same content. This chapter implements
+HTTP tracker communication as specified in BEP 3.
+
+\subsection{Tracker Error Types}
+
+Communicating with a tracker can fail in several ways. We define a dedicated
+error type that distinguishes between different failure modes, enabling
+appropriate recovery strategies:
+
+\begin{description}
+\item[HTTP errors] Network-level failures: connection refused, DNS resolution
+  failure, TLS handshake errors, or HTTP status codes indicating server errors.
+  These are typically transient and worth retrying with backoff.
+
+\item[Tracker error response] The tracker successfully responded but indicated
+  an error via the ``failure reason'' field in its bencoded response. This
+  happens when the tracker rejects our request---perhaps the torrent is not
+  registered, or the info hash is banned. These are usually not worth retrying.
+
+\item[Invalid response] The tracker returned data that isn't valid bencode,
+  is missing required fields, or has fields of unexpected types. This suggests
+  a misbehaving or incompatible tracker.
+
+\item[Timeout] The tracker didn't respond within the allotted time (30 seconds
+  per the PRD). This is transient and worth retrying, possibly with a different
+  tracker if announce-list provides alternatives.
+\end{description}
+
+<<tracker errors>>=
+/// Errors that can occur when communicating with a BitTorrent tracker.
+///
+/// These errors are categorized by their likely cause and appropriate recovery
+/// strategy. HTTP errors and timeouts are typically transient and worth retrying.
+/// Error responses from the tracker usually indicate a permanent problem with
+/// the request. Invalid responses suggest tracker incompatibility.
+#[derive(Debug, thiserror::Error)]
+pub enum TrackerError {
+    /// HTTP-level failure during tracker communication.
+    ///
+    /// This wraps errors from the HTTP client library (reqwest), including:
+    /// - Connection refused or reset
+    /// - DNS resolution failure
+    /// - TLS/SSL handshake errors
+    /// - HTTP 4xx/5xx status codes
+    ///
+    /// These errors are often transient. Retry with exponential backoff is
+    /// recommended before giving up.
+    #[error("HTTP request failed: {0}")]
+    TrackerHttpError(#[from] reqwest::Error),
+
+    /// The tracker returned a valid response containing a failure reason.
+    ///
+    /// Per BEP 3, trackers indicate errors by returning a bencoded dictionary
+    /// with a "failure reason" key containing a human-readable error message.
+    /// Common reasons include:
+    /// - "torrent not registered with this tracker"
+    /// - "invalid info_hash"
+    /// - "client banned"
+    ///
+    /// These errors are usually permanent for the given request. Retrying
+    /// with the same parameters is unlikely to succeed.
+    #[error("tracker returned error: {0}")]
+    TrackerErrorResponse(String),
+
+    /// The tracker's response could not be parsed or was missing required fields.
+    ///
+    /// This error occurs when:
+    /// - The response body is not valid bencode
+    /// - Required fields (like "peers") are missing
+    /// - Fields have unexpected types (e.g., "interval" is a string instead of integer)
+    ///
+    /// The contained string describes what was wrong with the response.
+    /// This suggests tracker incompatibility or a bug in the tracker software.
+    #[error("invalid tracker response: {0}")]
+    TrackerInvalidResponse(String),
+
+    /// The tracker did not respond within the timeout period.
+    ///
+    /// The timeout is 30 seconds as specified in the PRD. This error is
+    /// distinct from HTTP timeout errors (which are wrapped in TrackerHttpError)
+    /// to allow for explicit handling of announce timeouts.
+    ///
+    /// Timeouts are transient. The client should retry, possibly with a
+    /// different tracker from the announce-list if available.
+    #[error("tracker request timed out after 30 seconds")]
+    TrackerTimeout,
+}
+@
+
+The error enum uses [[thiserror]]'s derive macro to automatically implement
+the [[std::error::Error]] trait. The [[#[from]]] attribute on [[TrackerHttpError]]
+enables automatic conversion from [[reqwest::Error]] using the [[?]] operator,
+which simplifies error handling in async code.
+
+Note that [[TrackerHttpError]] wraps [[reqwest::Error]] directly rather than
+converting it to a string. This preserves the original error's details (like
+HTTP status codes) for debugging while still providing a clean display message.
+
+\subsection{Module Structure}
+
+The tracker module will eventually contain the announce logic and response
+parsing. For now, we define just the error types needed by other modules.
+
+<<tracker.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/03-tracker.nw
+// Regenerate with: just tangle
+
+//! HTTP tracker protocol implementation.
+//!
+//! This module handles communication with BitTorrent trackers. Trackers are
+//! servers that help peers discover each other. The client announces itself
+//! to the tracker and receives a list of peers sharing the same torrent.
+//!
+//! # Protocol Overview
+//!
+//! 1. Client sends HTTP GET request to tracker's announce URL with parameters:
+//!    - `info_hash`: 20-byte torrent identifier
+//!    - `peer_id`: 20-byte client identifier
+//!    - `port`: port client is listening on
+//!    - `uploaded`, `downloaded`, `left`: transfer statistics
+//!    - `event`: started, stopped, or completed (optional)
+//!
+//! 2. Tracker responds with bencoded dictionary containing:
+//!    - `interval`: seconds until next announce
+//!    - `peers`: list of peers (compact or dictionary format)
+//!    - Optionally: `tracker id`, `complete`, `incomplete`
+//!
+//! # Error Handling
+//!
+//! Tracker communication can fail in several ways. The [`TrackerError`] enum
+//! provides detailed error information to enable appropriate recovery strategies.
+
+<<tracker errors>>
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    <<tracker error tests>>
+}
+@
+
+\subsection{Error Handling Tests}
+
+We test that our error types work correctly with the standard error traits
+and provide useful error messages.
+
+<<tracker error tests>>=
+#[test]
+fn tracker_error_response_displays_reason() {
+    let err = TrackerError::TrackerErrorResponse("torrent not registered".to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("torrent not registered"), "msg: {}", msg);
+    assert!(msg.contains("tracker returned error"), "msg: {}", msg);
+}
+
+#[test]
+fn tracker_invalid_response_displays_details() {
+    let err = TrackerError::TrackerInvalidResponse("missing 'peers' field".to_string());
+    let msg = err.to_string();
+    assert!(msg.contains("missing 'peers' field"), "msg: {}", msg);
+    assert!(msg.contains("invalid tracker response"), "msg: {}", msg);
+}
+
+#[test]
+fn tracker_timeout_has_clear_message() {
+    let err = TrackerError::TrackerTimeout;
+    let msg = err.to_string();
+    assert!(msg.contains("30 seconds"), "msg: {}", msg);
+    assert!(msg.contains("timed out"), "msg: {}", msg);
+}
+
+#[test]
+fn tracker_error_implements_std_error() {
+    // Verify TrackerError implements std::error::Error
+    fn assert_error<E: std::error::Error>() {}
+    assert_error::<TrackerError>();
+}
+
+#[test]
+fn tracker_error_implements_debug() {
+    // Verify TrackerError implements Debug
+    let err = TrackerError::TrackerTimeout;
+    let debug = format!("{:?}", err);
+    assert!(!debug.is_empty());
+}
+@
+
+These tests verify that:
+\begin{enumerate}
+\item Error messages include the relevant context (failure reasons, field names).
+\item The timeout error clearly states the 30-second timeout period.
+\item [[TrackerError]] implements [[std::error::Error]] as required.
+\item [[TrackerError]] implements [[Debug]] for diagnostic purposes.
+\end{enumerate}

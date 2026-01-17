@@ -17,6 +17,7 @@ tangle:
     notangle -Rlib.rs nw/00-main.nw > src/lib.rs
     notangle -Rbencode.rs nw/01-bencode.nw > src/bencode.rs
     notangle -Rmetainfo.rs nw/02-metainfo.nw > src/metainfo.rs
+    notangle -Rtracker.rs nw/03-tracker.nw > src/tracker.rs
 
 # Weave: generate PDF documentation from noweb source
 # Creates doc/ directory and produces doc/literate-bittorrent.pdf
