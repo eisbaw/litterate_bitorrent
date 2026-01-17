@@ -142,6 +142,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<url encoding>>
 
+<<peer id generation>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,6 +151,8 @@ mod tests {
     <<tracker error tests>>
 
     <<url encoding tests>>
+
+    <<peer id tests>>
 }
 @
 
@@ -448,4 +452,149 @@ These tests cover the key scenarios:
   are outside the ASCII range.
 \item \textbf{Round-trip}: Decodes the encoded output and verifies it matches
   the original bytes, ensuring no data loss.
+\end{enumerate}
+
+\subsection{Peer Identification}
+
+Every BitTorrent client announces itself to trackers and other peers using a
+20-byte \emph{peer ID}. This identifier serves two purposes: it uniquely
+identifies this particular client session (allowing peers to recognize
+reconnections), and it indicates which software the client is running (useful
+for debugging interoperability issues in swarms).
+
+BEP 20 defines conventions for encoding client information into the peer ID.
+The most widely adopted is the \textbf{Azureus-style} format:
+
+\begin{verbatim}
+-XX1234-xxxxxxxxxxxx
+\end{verbatim}
+
+The structure is:
+\begin{description}
+\item[Byte 0]: Hyphen (\texttt{-})
+\item[Bytes 1--2]: Two-character client identifier (e.g., \texttt{AZ} for
+  Azureus, \texttt{TR} for Transmission, \texttt{qB} for qBittorrent)
+\item[Bytes 3--6]: Four ASCII digits encoding the version number (e.g.,
+  \texttt{0001} for version 0.0.01)
+\item[Byte 7]: Hyphen (\texttt{-})
+\item[Bytes 8--19]: Twelve random bytes ensuring uniqueness across sessions
+\end{description}
+
+For our Literate Torrent client, we use \texttt{LT} as the client identifier
+and \texttt{0001} as the initial version. The random suffix ensures that even
+if multiple instances run on the same machine, they will have distinct peer
+IDs and can participate in the same swarm without confusion.
+
+The peer ID is generated once when the client starts and reused for all
+tracker announces and peer connections during that session. Changing the peer
+ID mid-session would confuse trackers and peers, potentially causing them to
+count us multiple times or fail to recognize our announce events.
+
+<<peer id generation>>=
+/// The Azureus-style client identifier prefix for Literate Torrent.
+///
+/// Format: "-LT0001-" where:
+/// - LT = Literate Torrent (our client identifier)
+/// - 0001 = version 0.0.01
+///
+/// This prefix is followed by 12 random bytes to form the complete 20-byte peer_id.
+pub const PEER_ID_PREFIX: &[u8; 8] = b"-LT0001-";
+
+/// Generate a unique 20-byte peer ID for this client session.
+///
+/// The peer ID follows the Azureus-style convention defined in BEP 20:
+/// - First 8 bytes: "-LT0001-" (client identifier and version)
+/// - Last 12 bytes: cryptographically random data
+///
+/// This function should be called once at client startup. The returned peer ID
+/// should be reused for all tracker announces and peer handshakes during the
+/// session.
+///
+/// # Returns
+///
+/// A 20-byte array suitable for use in tracker announces and peer handshakes.
+///
+/// # Example
+///
+/// ```ignore
+/// let peer_id = generate_peer_id();
+/// assert_eq!(&peer_id[0..8], b"-LT0001-");
+/// assert_eq!(peer_id.len(), 20);
+/// ```
+pub fn generate_peer_id() -> [u8; 20] {
+    use rand::RngCore;
+
+    let mut peer_id = [0u8; 20];
+
+    // Copy the client identifier prefix
+    peer_id[0..8].copy_from_slice(PEER_ID_PREFIX);
+
+    // Fill remaining 12 bytes with random data
+    rand::thread_rng().fill_bytes(&mut peer_id[8..]);
+
+    peer_id
+}
+@
+
+The implementation is straightforward: we start with our fixed 8-byte prefix
+and fill the remaining 12 bytes with random data from the operating system's
+cryptographically secure random number generator (via the [[rand]] crate's
+default thread-local RNG).
+
+Note that we use [[fill_bytes]] rather than generating individual random bytes
+in a loop. This is both more efficient and clearer in intent---we want 12
+random bytes, not 12 random numbers that happen to be bytes.
+
+\subsection{Peer ID Tests}
+
+We verify that the generated peer ID has the correct format and length.
+
+<<peer id tests>>=
+#[test]
+fn peer_id_has_correct_length() {
+    let peer_id = generate_peer_id();
+    assert_eq!(peer_id.len(), 20, "peer_id must be exactly 20 bytes");
+}
+
+#[test]
+fn peer_id_has_correct_prefix() {
+    let peer_id = generate_peer_id();
+    assert_eq!(
+        &peer_id[0..8],
+        b"-LT0001-",
+        "peer_id must start with Azureus-style client identifier"
+    );
+}
+
+#[test]
+fn peer_id_random_suffix_varies() {
+    // Generate multiple peer IDs and verify the random portions differ
+    let id1 = generate_peer_id();
+    let id2 = generate_peer_id();
+    let id3 = generate_peer_id();
+
+    // The prefixes should all be identical
+    assert_eq!(&id1[0..8], &id2[0..8]);
+    assert_eq!(&id2[0..8], &id3[0..8]);
+
+    // The random suffixes should (almost certainly) differ
+    // There's a 1 in 2^96 chance of collision, which is negligible
+    assert_ne!(&id1[8..], &id2[8..], "random suffixes should differ");
+    assert_ne!(&id2[8..], &id3[8..], "random suffixes should differ");
+}
+
+#[test]
+fn peer_id_prefix_constant_matches() {
+    // Verify the constant matches what we expect
+    assert_eq!(PEER_ID_PREFIX, b"-LT0001-");
+    assert_eq!(PEER_ID_PREFIX.len(), 8);
+}
+@
+
+These tests verify:
+\begin{enumerate}
+\item The peer ID is exactly 20 bytes as required by the BitTorrent protocol.
+\item The first 8 bytes match our Azureus-style client identifier.
+\item Different calls to [[generate_peer_id]] produce different random suffixes.
+\item The [[PEER_ID_PREFIX]] constant has the expected value and length.
 \end{enumerate}

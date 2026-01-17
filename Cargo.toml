@@ -15,6 +15,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # SHA1 hashing for info hash and piece verification
 sha1 = "0.10"
 
+# Random number generation for peer_id
+rand = "0.8"
+
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
 
