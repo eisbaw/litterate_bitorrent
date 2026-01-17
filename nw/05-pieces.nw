@@ -1204,6 +1204,608 @@ fn piece_manager_implements_debug() {
 }
 @
 
+\subsection{Piece Availability Tracking}
+
+In order to implement the rarest-first piece selection strategy, we need to track
+how many peers in the swarm have each piece. A piece that only one peer has is
+``rarer'' than a piece that twenty peers have. By preferentially downloading rare
+pieces, we improve the overall health of the swarm: if the one peer holding a rare
+piece disconnects before we download it, that piece becomes unavailable to everyone.
+
+The [[PieceAvailability]] struct maintains a count for each piece, indicating how
+many connected peers have that piece. The count is updated in three ways:
+
+\begin{enumerate}
+\item \textbf{add\_peer\_bitfield}: When a new peer connects and sends its bitfield
+  message, we increment the count for every piece that peer has.
+\item \textbf{remove\_peer\_bitfield}: When a peer disconnects, we decrement the
+  count for every piece that peer had. This requires us to remember what pieces
+  each peer reported having.
+\item \textbf{add\_piece}: When a peer sends a ``have'' message announcing they
+  now have a piece they previously lacked, we increment that piece's count.
+\end{enumerate}
+
+The design deliberately uses [[Vec<u32>]] rather than a more complex structure.
+With typical torrents having thousands of pieces and swarms having tens to hundreds
+of peers, a [[u32]] per piece provides ample headroom (over 4 billion peers per
+piece) while maintaining O(1) lookup and minimal memory overhead.
+
+<<piece availability>>=
+/// Tracks how many peers have each piece across the swarm.
+///
+/// PieceAvailability maintains a per-piece count of how many connected peers
+/// have reported having that piece. This information is used for rarest-first
+/// piece selection: by downloading the pieces that fewer peers have, we
+/// improve swarm health and reduce the risk of pieces becoming unavailable.
+///
+/// # Usage Pattern
+///
+/// 1. Create with the number of pieces: `PieceAvailability::new(num_pieces)`
+/// 2. When a peer connects and sends bitfield: `add_peer_bitfield(&bitfield)`
+/// 3. When a peer sends `have`: `add_piece(piece_index)`
+/// 4. When a peer disconnects: `remove_peer_bitfield(&bitfield)`
+/// 5. Query availability for piece selection: `get_availability(piece_index)`
+///
+/// # Thread Safety
+///
+/// This struct is not thread-safe. In a multi-threaded context, wrap it in
+/// a `Mutex` or use message-passing to serialize access.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::PieceAvailability;
+///
+/// // Torrent with 8 pieces
+/// let mut availability = PieceAvailability::new(8);
+///
+/// // Peer 1 has pieces 0, 2, 4, 6 (0b10101010)
+/// let peer1_bitfield = vec![0b10101010];
+/// availability.add_peer_bitfield(&peer1_bitfield);
+///
+/// // Peer 2 has pieces 0, 1, 2, 3 (0b11110000)
+/// let peer2_bitfield = vec![0b11110000];
+/// availability.add_peer_bitfield(&peer2_bitfield);
+///
+/// // Piece 0 is held by both peers
+/// assert_eq!(availability.get_availability(0), Some(2));
+///
+/// // Piece 4 is only held by peer 1
+/// assert_eq!(availability.get_availability(4), Some(1));
+///
+/// // Piece 5 is not held by anyone
+/// assert_eq!(availability.get_availability(5), Some(0));
+/// ```
+#[derive(Debug, Clone)]
+pub struct PieceAvailability {
+    /// Count of how many peers have each piece.
+    /// Indexed by piece number, so `counts[i]` is the number of peers
+    /// that have reported having piece `i`.
+    counts: Vec<u32>,
+}
+
+impl PieceAvailability {
+    /// Creates a new PieceAvailability tracker for a torrent with the given
+    /// number of pieces.
+    ///
+    /// All counts are initialized to zero, indicating no peers have any pieces.
+    ///
+    /// # Arguments
+    ///
+    /// * `num_pieces` - The number of pieces in the torrent
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let availability = PieceAvailability::new(100);
+    /// assert_eq!(availability.num_pieces(), 100);
+    /// assert_eq!(availability.get_availability(0), Some(0));
+    /// ```
+    pub fn new(num_pieces: usize) -> Self {
+        PieceAvailability {
+            counts: vec![0; num_pieces],
+        }
+    }
+
+    /// Returns the number of pieces being tracked.
+    #[inline]
+    pub fn num_pieces(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// Returns the availability count for a specific piece.
+    ///
+    /// The count indicates how many peers have reported having this piece.
+    /// Returns `None` if the piece index is out of range.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let availability = PieceAvailability::new(10);
+    /// assert_eq!(availability.get_availability(5), Some(0));
+    /// assert_eq!(availability.get_availability(100), None);
+    /// ```
+    #[inline]
+    pub fn get_availability(&self, piece_index: u32) -> Option<u32> {
+        self.counts.get(piece_index as usize).copied()
+    }
+
+    /// Adds a peer's bitfield to the availability counts.
+    ///
+    /// For each piece that the peer has (indicated by a set bit in the
+    /// bitfield), the count for that piece is incremented by one.
+    ///
+    /// The bitfield format follows the BitTorrent protocol: bit 0 of byte 0
+    /// represents piece 0, bit 1 of byte 0 represents piece 1, and so on.
+    /// The bits are numbered from the high bit (MSB) to the low bit (LSB)
+    /// within each byte.
+    ///
+    /// If the bitfield is shorter than expected, only the pieces covered by
+    /// the bitfield are updated. If the bitfield is longer, extra bits are
+    /// ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `bitfield` - The raw bitfield bytes from the peer's bitfield message
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let mut availability = PieceAvailability::new(8);
+    ///
+    /// // Bitfield where pieces 0, 2, 4, 6 are set (0b10101010)
+    /// availability.add_peer_bitfield(&[0b10101010]);
+    ///
+    /// assert_eq!(availability.get_availability(0), Some(1));
+    /// assert_eq!(availability.get_availability(1), Some(0));
+    /// assert_eq!(availability.get_availability(2), Some(1));
+    /// ```
+    pub fn add_peer_bitfield(&mut self, bitfield: &[u8]) {
+        for (piece_index, count) in self.counts.iter_mut().enumerate() {
+            let byte_index = piece_index / 8;
+            let bit_index = 7 - (piece_index % 8); // MSB first within byte
+
+            if byte_index < bitfield.len() {
+                if (bitfield[byte_index] >> bit_index) & 1 == 1 {
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Removes a peer's bitfield from the availability counts.
+    ///
+    /// This is the inverse of `add_peer_bitfield`: for each piece that the
+    /// peer has, the count is decremented by one. This should be called when
+    /// a peer disconnects, using the same bitfield that was used when the
+    /// peer connected.
+    ///
+    /// The decrement uses saturating subtraction to prevent underflow. This
+    /// provides safety against bugs where a bitfield might be removed without
+    /// having been added, or removed multiple times.
+    ///
+    /// # Arguments
+    ///
+    /// * `bitfield` - The raw bitfield bytes representing pieces the peer had
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let mut availability = PieceAvailability::new(8);
+    ///
+    /// // Add then remove the same bitfield
+    /// let bitfield = vec![0b10101010];
+    /// availability.add_peer_bitfield(&bitfield);
+    /// assert_eq!(availability.get_availability(0), Some(1));
+    ///
+    /// availability.remove_peer_bitfield(&bitfield);
+    /// assert_eq!(availability.get_availability(0), Some(0));
+    /// ```
+    pub fn remove_peer_bitfield(&mut self, bitfield: &[u8]) {
+        for (piece_index, count) in self.counts.iter_mut().enumerate() {
+            let byte_index = piece_index / 8;
+            let bit_index = 7 - (piece_index % 8); // MSB first within byte
+
+            if byte_index < bitfield.len() {
+                if (bitfield[byte_index] >> bit_index) & 1 == 1 {
+                    *count = count.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Increments the availability count for a single piece.
+    ///
+    /// This is called when a peer sends a `have` message, announcing that
+    /// they now have a piece they previously lacked. Unlike `add_peer_bitfield`
+    /// which processes the entire bitfield, this updates just one piece.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the piece index was valid and the count was
+    /// incremented, `false` if the index was out of range.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let mut availability = PieceAvailability::new(10);
+    ///
+    /// assert!(availability.add_piece(5));
+    /// assert_eq!(availability.get_availability(5), Some(1));
+    ///
+    /// assert!(!availability.add_piece(100)); // Out of range
+    /// ```
+    pub fn add_piece(&mut self, piece_index: u32) -> bool {
+        if let Some(count) = self.counts.get_mut(piece_index as usize) {
+            *count = count.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns an iterator over (piece_index, count) pairs.
+    ///
+    /// This is useful for finding the rarest pieces or generating statistics.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let mut availability = PieceAvailability::new(4);
+    /// availability.add_peer_bitfield(&[0b11000000]); // pieces 0, 1
+    ///
+    /// let counts: Vec<_> = availability.iter().collect();
+    /// assert_eq!(counts, vec![(0, 1), (1, 1), (2, 0), (3, 0)]);
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.counts
+            .iter()
+            .enumerate()
+            .map(|(idx, &count)| (idx as u32, count))
+    }
+
+    /// Returns the piece index with the lowest non-zero availability count.
+    ///
+    /// If multiple pieces are tied for the lowest count, returns the first one
+    /// (lowest index). Returns `None` if all pieces have zero availability
+    /// (no peers have any pieces we need).
+    ///
+    /// This method does not filter based on which pieces we already have;
+    /// the caller should combine this with the piece state to select only
+    /// pieces we still need.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceAvailability;
+    ///
+    /// let mut availability = PieceAvailability::new(4);
+    /// // Piece 0: 3 peers, Piece 1: 1 peer, Piece 2: 2 peers, Piece 3: 0 peers
+    /// availability.add_peer_bitfield(&[0b11110000]);
+    /// availability.add_peer_bitfield(&[0b10100000]);
+    /// availability.add_peer_bitfield(&[0b10000000]);
+    ///
+    /// // Piece 1 has count 1 (rarest non-zero)
+    /// assert_eq!(availability.rarest_piece(), Some(1));
+    /// ```
+    pub fn rarest_piece(&self) -> Option<u32> {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|(_, &count)| count > 0)
+            .min_by_key(|(_, &count)| count)
+            .map(|(idx, _)| idx as u32)
+    }
+}
+@
+
+\subsubsection{Piece Availability Tests}
+
+We test the availability tracking thoroughly, focusing on the bitfield parsing
+and the interaction between multiple peers with overlapping pieces.
+
+<<piece availability tests>>=
+#[test]
+fn piece_availability_new_creates_zero_counts() {
+    let availability = PieceAvailability::new(10);
+
+    assert_eq!(availability.num_pieces(), 10);
+    for i in 0..10 {
+        assert_eq!(availability.get_availability(i), Some(0));
+    }
+}
+
+#[test]
+fn piece_availability_new_zero_pieces() {
+    let availability = PieceAvailability::new(0);
+    assert_eq!(availability.num_pieces(), 0);
+    assert_eq!(availability.get_availability(0), None);
+}
+
+#[test]
+fn piece_availability_get_out_of_range() {
+    let availability = PieceAvailability::new(5);
+
+    assert_eq!(availability.get_availability(4), Some(0));
+    assert_eq!(availability.get_availability(5), None);
+    assert_eq!(availability.get_availability(100), None);
+}
+
+#[test]
+fn piece_availability_add_peer_bitfield_single_byte() {
+    let mut availability = PieceAvailability::new(8);
+
+    // Bitfield: 0b10101010 = pieces 0, 2, 4, 6 are set
+    availability.add_peer_bitfield(&[0b10101010]);
+
+    assert_eq!(availability.get_availability(0), Some(1));
+    assert_eq!(availability.get_availability(1), Some(0));
+    assert_eq!(availability.get_availability(2), Some(1));
+    assert_eq!(availability.get_availability(3), Some(0));
+    assert_eq!(availability.get_availability(4), Some(1));
+    assert_eq!(availability.get_availability(5), Some(0));
+    assert_eq!(availability.get_availability(6), Some(1));
+    assert_eq!(availability.get_availability(7), Some(0));
+}
+
+#[test]
+fn piece_availability_add_peer_bitfield_all_ones() {
+    let mut availability = PieceAvailability::new(8);
+
+    availability.add_peer_bitfield(&[0xFF]);
+
+    for i in 0..8 {
+        assert_eq!(availability.get_availability(i), Some(1),
+            "piece {} should have count 1", i);
+    }
+}
+
+#[test]
+fn piece_availability_add_peer_bitfield_multiple_bytes() {
+    let mut availability = PieceAvailability::new(16);
+
+    // First byte: 0xFF (pieces 0-7 all set)
+    // Second byte: 0x0F (pieces 12-15 set, 8-11 not set)
+    availability.add_peer_bitfield(&[0xFF, 0x0F]);
+
+    // Pieces 0-7: all set
+    for i in 0..8 {
+        assert_eq!(availability.get_availability(i), Some(1),
+            "piece {} should have count 1", i);
+    }
+
+    // Pieces 8-11: not set
+    for i in 8..12 {
+        assert_eq!(availability.get_availability(i), Some(0),
+            "piece {} should have count 0", i);
+    }
+
+    // Pieces 12-15: set
+    for i in 12..16 {
+        assert_eq!(availability.get_availability(i), Some(1),
+            "piece {} should have count 1", i);
+    }
+}
+
+#[test]
+fn piece_availability_add_two_peers_overlapping() {
+    let mut availability = PieceAvailability::new(8);
+
+    // Peer 1 has pieces 0, 1, 2, 3 (0b11110000)
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // Peer 2 has pieces 0, 2, 4, 6 (0b10101010)
+    availability.add_peer_bitfield(&[0b10101010]);
+
+    // Piece 0: both peers have it
+    assert_eq!(availability.get_availability(0), Some(2));
+
+    // Piece 1: only peer 1
+    assert_eq!(availability.get_availability(1), Some(1));
+
+    // Piece 2: both peers
+    assert_eq!(availability.get_availability(2), Some(2));
+
+    // Piece 3: only peer 1
+    assert_eq!(availability.get_availability(3), Some(1));
+
+    // Piece 4: only peer 2
+    assert_eq!(availability.get_availability(4), Some(1));
+
+    // Piece 5: neither peer
+    assert_eq!(availability.get_availability(5), Some(0));
+
+    // Piece 6: only peer 2
+    assert_eq!(availability.get_availability(6), Some(1));
+
+    // Piece 7: neither peer
+    assert_eq!(availability.get_availability(7), Some(0));
+}
+
+#[test]
+fn piece_availability_remove_peer_decrements_correctly() {
+    let mut availability = PieceAvailability::new(8);
+
+    // Add two peers with same bitfield
+    let bitfield = vec![0b11110000];
+    availability.add_peer_bitfield(&bitfield);
+    availability.add_peer_bitfield(&bitfield);
+
+    // Pieces 0-3 should have count 2
+    for i in 0..4 {
+        assert_eq!(availability.get_availability(i), Some(2),
+            "piece {} should have count 2 after adding two peers", i);
+    }
+
+    // Remove one peer
+    availability.remove_peer_bitfield(&bitfield);
+
+    // Pieces 0-3 should now have count 1
+    for i in 0..4 {
+        assert_eq!(availability.get_availability(i), Some(1),
+            "piece {} should have count 1 after removing one peer", i);
+    }
+
+    // Pieces 4-7 should still be 0
+    for i in 4..8 {
+        assert_eq!(availability.get_availability(i), Some(0),
+            "piece {} should have count 0", i);
+    }
+}
+
+#[test]
+fn piece_availability_remove_saturates_at_zero() {
+    let mut availability = PieceAvailability::new(4);
+
+    // Remove without adding - should not underflow
+    availability.remove_peer_bitfield(&[0xFF]);
+
+    for i in 0..4 {
+        assert_eq!(availability.get_availability(i), Some(0),
+            "piece {} should remain at 0 after remove without add", i);
+    }
+}
+
+#[test]
+fn piece_availability_add_piece_single() {
+    let mut availability = PieceAvailability::new(10);
+
+    assert!(availability.add_piece(5));
+    assert_eq!(availability.get_availability(5), Some(1));
+
+    // Other pieces unchanged
+    assert_eq!(availability.get_availability(4), Some(0));
+    assert_eq!(availability.get_availability(6), Some(0));
+
+    // Add again
+    assert!(availability.add_piece(5));
+    assert_eq!(availability.get_availability(5), Some(2));
+}
+
+#[test]
+fn piece_availability_add_piece_out_of_range() {
+    let mut availability = PieceAvailability::new(5);
+
+    assert!(!availability.add_piece(5));
+    assert!(!availability.add_piece(100));
+}
+
+#[test]
+fn piece_availability_rarest_piece_finds_minimum() {
+    let mut availability = PieceAvailability::new(4);
+
+    // Set up counts: piece 0 = 3, piece 1 = 1, piece 2 = 2, piece 3 = 0
+    availability.add_peer_bitfield(&[0b11110000]);
+    availability.add_peer_bitfield(&[0b10100000]);
+    availability.add_peer_bitfield(&[0b10000000]);
+
+    // Piece 1 has count 1 (rarest non-zero)
+    assert_eq!(availability.rarest_piece(), Some(1));
+}
+
+#[test]
+fn piece_availability_rarest_piece_none_when_all_zero() {
+    let availability = PieceAvailability::new(10);
+    assert_eq!(availability.rarest_piece(), None);
+}
+
+#[test]
+fn piece_availability_rarest_piece_tie_returns_lowest_index() {
+    let mut availability = PieceAvailability::new(4);
+
+    // All pieces have count 1
+    availability.add_peer_bitfield(&[0b11110000]);
+
+    // With ties, should return lowest index (0)
+    assert_eq!(availability.rarest_piece(), Some(0));
+}
+
+#[test]
+fn piece_availability_iter_returns_all_pairs() {
+    let mut availability = PieceAvailability::new(4);
+    availability.add_peer_bitfield(&[0b11000000]); // pieces 0, 1
+
+    let pairs: Vec<_> = availability.iter().collect();
+    assert_eq!(pairs, vec![(0, 1), (1, 1), (2, 0), (3, 0)]);
+}
+
+#[test]
+fn piece_availability_partial_bitfield_handled() {
+    // When bitfield is shorter than expected (e.g., truncated)
+    let mut availability = PieceAvailability::new(16);
+
+    // Only provide 1 byte for 16 pieces
+    availability.add_peer_bitfield(&[0xFF]);
+
+    // First 8 pieces should be set
+    for i in 0..8 {
+        assert_eq!(availability.get_availability(i), Some(1),
+            "piece {} should be set from bitfield", i);
+    }
+
+    // Remaining pieces should be 0 (not covered by bitfield)
+    for i in 8..16 {
+        assert_eq!(availability.get_availability(i), Some(0),
+            "piece {} should be 0 (not in bitfield)", i);
+    }
+}
+
+#[test]
+fn piece_availability_extra_bitfield_bits_ignored() {
+    // When bitfield has more bits than pieces (spare bits)
+    let mut availability = PieceAvailability::new(5);
+
+    // Provide full byte (8 bits) but only 5 pieces exist
+    availability.add_peer_bitfield(&[0xFF]);
+
+    // All 5 pieces should be set
+    for i in 0..5 {
+        assert_eq!(availability.get_availability(i), Some(1));
+    }
+
+    // Piece 5+ don't exist
+    assert_eq!(availability.get_availability(5), None);
+}
+
+#[test]
+fn piece_availability_implements_clone() {
+    let mut availability = PieceAvailability::new(4);
+    availability.add_peer_bitfield(&[0xFF]);
+
+    let cloned = availability.clone();
+    assert_eq!(cloned.num_pieces(), 4);
+    assert_eq!(cloned.get_availability(0), Some(1));
+}
+
+#[test]
+fn piece_availability_implements_debug() {
+    let availability = PieceAvailability::new(3);
+    let debug_str = format!("{:?}", availability);
+    assert!(debug_str.contains("PieceAvailability"));
+    assert!(debug_str.contains("counts"));
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -1254,6 +1856,8 @@ The pieces module combines the error types and helpers.
 
 <<piece manager>>
 
+<<piece availability>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1276,6 +1880,8 @@ mod tests {
     <<piece verification tests>>
 
     <<piece manager tests>>
+
+    <<piece availability tests>>
 }
 @
 
