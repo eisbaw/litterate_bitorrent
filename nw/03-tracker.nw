@@ -148,6 +148,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<peer id generation>>
 
+<<announce url construction>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +163,8 @@ mod tests {
     <<url encoding tests>>
 
     <<peer id tests>>
+
+    <<announce url tests>>
 }
 @
 
@@ -1000,4 +1004,369 @@ These tests verify:
 \item The first 8 bytes match our Azureus-style client identifier.
 \item Different calls to [[generate_peer_id]] produce different random suffixes.
 \item The [[PEER_ID_PREFIX]] constant has the expected value and length.
+\end{enumerate}
+
+\subsection{Announce URL Construction}
+
+With all the request parameters defined and URL encoding implemented, we can now
+construct the complete announce URL. BEP 3 specifies that the client sends an
+HTTP GET request to the tracker's announce URL with all parameters encoded in
+the query string.
+
+The URL construction process involves several steps:
+
+\begin{enumerate}
+\item \textbf{Determine the query separator}: If the announce URL already contains
+  a question mark (indicating existing query parameters), we append with \texttt{\&}.
+  Otherwise, we start the query string with \texttt{?}. Some trackers embed
+  authentication tokens or other parameters in their announce URLs, so we must
+  handle this case correctly.
+
+\item \textbf{Encode binary parameters}: The [[info_hash]] and [[peer_id]] are
+  20-byte binary values that must be percent-encoded. We use our [[url_encode]]
+  function from the previous section.
+
+\item \textbf{Format numeric parameters}: The [[port]], [[uploaded]], [[downloaded]],
+  and [[left]] values are formatted as decimal strings. No encoding is needed
+  since digits are unreserved characters.
+
+\item \textbf{Include optional parameters}: The [[event]] parameter is only
+  included when present (started, stopped, or completed). Regular periodic
+  announces omit this parameter entirely.
+
+\item \textbf{Request compact format}: When [[compact]] is true, we include
+  \texttt{compact=1}. This requests the more efficient BEP-23 peer list format
+  where each peer is represented as 6 bytes instead of a dictionary.
+\end{enumerate}
+
+The order of query parameters does not matter per the HTTP specification, but
+we use a consistent order that matches common client conventions. This makes
+debugging easier when comparing URLs across different clients or examining
+tracker logs.
+
+<<announce url construction>>=
+/// Construct the complete tracker announce URL from the base URL and request parameters.
+///
+/// This function builds the HTTP GET URL that will be sent to the tracker. It properly
+/// handles URL encoding of binary parameters and correctly appends to URLs that may
+/// already contain query parameters.
+///
+/// # Arguments
+///
+/// * `announce_url` - The base announce URL from the torrent's metainfo file
+/// * `request` - The tracker request parameters
+///
+/// # Returns
+///
+/// A complete URL string ready to be used for an HTTP GET request.
+///
+/// # URL Structure
+///
+/// The resulting URL has this structure:
+/// ```text
+/// {announce_url}?info_hash={encoded}&peer_id={encoded}&port={port}
+///   &uploaded={uploaded}&downloaded={downloaded}&left={left}
+///   [&event={event}][&compact=1]
+/// ```
+///
+/// # Example
+///
+/// ```ignore
+/// let url = build_announce_url("http://tracker.example.com/announce", &request);
+/// // Returns: "http://tracker.example.com/announce?info_hash=...&peer_id=...&..."
+/// ```
+pub fn build_announce_url(announce_url: &str, request: &TrackerRequest) -> String {
+    // Determine if we need ? or & to start/continue the query string
+    let separator = if announce_url.contains('?') { '&' } else { '?' };
+
+    // Start building the URL
+    let mut url = String::with_capacity(announce_url.len() + 256);
+    url.push_str(announce_url);
+    url.push(separator);
+
+    // Required parameters (BEP 3)
+    url.push_str("info_hash=");
+    url.push_str(&url_encode(&request.info_hash));
+
+    url.push_str("&peer_id=");
+    url.push_str(&url_encode(&request.peer_id));
+
+    url.push_str("&port=");
+    url.push_str(&request.port.to_string());
+
+    url.push_str("&uploaded=");
+    url.push_str(&request.uploaded.to_string());
+
+    url.push_str("&downloaded=");
+    url.push_str(&request.downloaded.to_string());
+
+    url.push_str("&left=");
+    url.push_str(&request.left.to_string());
+
+    // Optional event parameter
+    if let Some(event) = &request.event {
+        url.push_str("&event=");
+        url.push_str(event.as_str());
+    }
+
+    // Compact peer list request (BEP 23)
+    if request.compact {
+        url.push_str("&compact=1");
+    }
+
+    url
+}
+@
+
+The implementation uses [[String::with_capacity]] to pre-allocate enough space
+for the typical announce URL. The capacity estimate of 256 bytes accounts for:
+\begin{itemize}
+\item Info hash: up to 60 characters (20 bytes, worst case all encoded)
+\item Peer ID: up to 60 characters (same reasoning)
+\item Numeric parameters: approximately 80 characters for typical values
+\item Parameter names and separators: approximately 50 characters
+\item Small buffer for the event parameter and compact flag
+\end{itemize}
+
+This avoids multiple reallocations during string building, which matters when
+the client is announcing to many trackers rapidly.
+
+\subsection{Announce URL Tests}
+
+We test the URL construction with various configurations to ensure correctness.
+
+<<announce url tests>>=
+#[test]
+fn build_announce_url_basic() {
+    let request = TrackerRequest {
+        info_hash: [0u8; 20],
+        peer_id: [0u8; 20],
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 1000,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+    assert!(url.starts_with("http://tracker.example.com/announce?"));
+    assert!(url.contains("info_hash="));
+    assert!(url.contains("peer_id="));
+    assert!(url.contains("port=6881"));
+    assert!(url.contains("uploaded=0"));
+    assert!(url.contains("downloaded=0"));
+    assert!(url.contains("left=1000"));
+    assert!(url.contains("event=started"));
+    assert!(url.contains("compact=1"));
+}
+
+#[test]
+fn build_announce_url_with_existing_query_params() {
+    // Some trackers include passkeys or other params in the announce URL
+    let request = TrackerRequest {
+        info_hash: [0xAAu8; 20],
+        peer_id: [0xBBu8; 20],
+        port: 51413,
+        uploaded: 1024,
+        downloaded: 2048,
+        left: 0,
+        event: None,
+        compact: true,
+    };
+
+    let url = build_announce_url(
+        "http://tracker.example.com/announce?passkey=secret123",
+        &request,
+    );
+
+    // Should use & not ? since URL already has query params
+    assert!(url.starts_with("http://tracker.example.com/announce?passkey=secret123&"));
+    assert!(url.contains("&info_hash="));
+    // Should not have two ?
+    assert_eq!(url.matches('?').count(), 1);
+}
+
+#[test]
+fn build_announce_url_without_event() {
+    // Regular periodic announce (no event)
+    let request = TrackerRequest {
+        info_hash: [0x12u8; 20],
+        peer_id: [0x34u8; 20],
+        port: 6881,
+        uploaded: 5000,
+        downloaded: 10000,
+        left: 50000,
+        event: None,
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+    // Event parameter should be absent
+    assert!(!url.contains("event="));
+    // Other params should still be present
+    assert!(url.contains("port=6881"));
+    assert!(url.contains("uploaded=5000"));
+}
+
+#[test]
+fn build_announce_url_without_compact() {
+    let request = TrackerRequest {
+        info_hash: [0u8; 20],
+        peer_id: [0u8; 20],
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 1000,
+        event: None,
+        compact: false,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+    // compact=1 should not be present when compact is false
+    assert!(!url.contains("compact="));
+}
+
+#[test]
+fn build_announce_url_stopped_event() {
+    let request = TrackerRequest {
+        info_hash: [0u8; 20],
+        peer_id: [0u8; 20],
+        port: 6881,
+        uploaded: 1000000,
+        downloaded: 5000000,
+        left: 0,
+        event: Some(TrackerEvent::Stopped),
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+    assert!(url.contains("event=stopped"));
+}
+
+#[test]
+fn build_announce_url_completed_event() {
+    let request = TrackerRequest {
+        info_hash: [0u8; 20],
+        peer_id: [0u8; 20],
+        port: 6881,
+        uploaded: 500,
+        downloaded: 1000000,
+        left: 0,
+        event: Some(TrackerEvent::Completed),
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+    assert!(url.contains("event=completed"));
+    assert!(url.contains("left=0"));
+}
+
+#[test]
+fn build_announce_url_encodes_info_hash_correctly() {
+    // Use a known hash with specific bytes to verify encoding
+    let request = TrackerRequest {
+        info_hash: [
+            0x00, 0x01, 0x02, 0x20, 0x3F, // Bytes that need encoding
+            b'A', b'Z', b'a', b'z', b'0', // Unreserved chars
+            b'9', b'-', b'_', b'.', b'~', // More unreserved
+            0xFF, 0xFE, 0x80, 0x7F, 0x2F, // More bytes to encode
+        ],
+        peer_id: [0u8; 20],
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 0,
+        event: None,
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+    // Extract the info_hash parameter value
+    let info_hash_start = url.find("info_hash=").unwrap() + 10;
+    let info_hash_end = url[info_hash_start..].find('&').unwrap() + info_hash_start;
+    let info_hash_encoded = &url[info_hash_start..info_hash_end];
+
+    // Verify encoding of specific bytes
+    assert!(info_hash_encoded.contains("%00")); // null byte
+    assert!(info_hash_encoded.contains("%20")); // space
+    assert!(info_hash_encoded.contains("%3F")); // '?'
+    assert!(info_hash_encoded.contains("A"));   // unreserved
+    assert!(info_hash_encoded.contains("z"));   // unreserved
+    assert!(info_hash_encoded.contains("%FF")); // high byte
+    assert!(info_hash_encoded.contains("%2F")); // '/'
+}
+
+#[test]
+fn build_announce_url_large_values() {
+    // Test with maximum realistic values
+    let request = TrackerRequest {
+        info_hash: [0xFFu8; 20],
+        peer_id: [0xFFu8; 20],
+        port: 65535,
+        uploaded: u64::MAX,
+        downloaded: u64::MAX,
+        left: u64::MAX,
+        event: None,
+        compact: true,
+    };
+
+    let url = build_announce_url("http://tracker.example.com/announce", &request);
+
+    assert!(url.contains("port=65535"));
+    assert!(url.contains(&format!("uploaded={}", u64::MAX)));
+    assert!(url.contains(&format!("downloaded={}", u64::MAX)));
+    assert!(url.contains(&format!("left={}", u64::MAX)));
+}
+
+#[test]
+fn build_announce_url_known_output() {
+    // Test with known inputs to verify exact output format
+    let request = TrackerRequest {
+        info_hash: *b"01234567890123456789",
+        peer_id: *b"-LT0001-abcdefghijkl",
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: 12345,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    let url = build_announce_url("http://t.co/a", &request);
+
+    // info_hash and peer_id are all printable ASCII, so no encoding needed
+    assert!(url.contains("info_hash=01234567890123456789"));
+    assert!(url.contains("peer_id=-LT0001-abcdefghijkl"));
+    assert!(url.contains("port=6881"));
+    assert!(url.contains("uploaded=0"));
+    assert!(url.contains("downloaded=0"));
+    assert!(url.contains("left=12345"));
+    assert!(url.contains("event=started"));
+    assert!(url.contains("compact=1"));
+}
+@
+
+These tests cover the key scenarios specified in the acceptance criteria:
+\begin{enumerate}
+\item \textbf{Basic URL construction}: Verifies all parameters are present and
+  correctly formatted.
+\item \textbf{Existing query parameters}: Ensures we use \texttt{\&} instead of
+  \texttt{?} when the announce URL already has query parameters.
+\item \textbf{Optional event parameter}: Confirms the event is omitted for
+  regular periodic announces.
+\item \textbf{Compact flag}: Tests both [[compact: true]] (includes [[compact=1]])
+  and [[compact: false]] (omits the parameter).
+\item \textbf{All event types}: Verifies started, stopped, and completed events
+  are correctly formatted.
+\item \textbf{Binary encoding}: Uses a carefully chosen info hash to test that
+  URL encoding works correctly for both encodable and unreserved bytes.
+\item \textbf{Large values}: Confirms the URL handles maximum [[u64]] values
+  without overflow or formatting errors.
+\item \textbf{Known output}: Tests with printable ASCII to verify exact output
+  format without encoding ambiguity.
 \end{enumerate}
