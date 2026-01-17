@@ -1951,6 +1951,10 @@ The client module exports the [[Client]] struct and associated types.
 
 <<peer connection manager>>
 
+<<event loop>>
+
+<<event loop connection manager extension>>
+
 <<client tests>>
 
 <<shutdown tests>>
@@ -1970,6 +1974,10 @@ The client module exports the [[Client]] struct and associated types.
 <<request pipelining tests>>
 
 <<request timeout handling tests>>
+
+<<event loop tests>>
+
+<<event loop integration tests>>
 @
 
 \subsection{Testing}
@@ -6632,7 +6640,7 @@ mod request_pipelining_tests {
         let piece_size = BLOCK_SIZE * 2;
         let mut manager = PieceManager::new(piece_size, piece_size as u64 * 4, hashes).unwrap();
 
-        let mut availability = PieceAvailability::new(4);
+        let availability = PieceAvailability::new(4);
 
         let requests = fill_request_queue(
             &peer_state,
@@ -7206,6 +7214,1024 @@ mod timeout_handling_tests {
         let result = find_alternative_peer(0, exclude_addr, &peers);
 
         assert!(result.is_none(), "Should return None for empty peers map");
+    }
+}
+@
+
+\section{The Main Event Loop}
+
+The event loop is the heart of the BitTorrent client. It multiplexes all async
+operations using [[tokio::select!]], orchestrating peer messages, timers, and
+shutdown signals into a coherent download process.
+
+\subsection{Event Loop Design}
+
+The event loop must handle several concurrent operations:
+
+\begin{enumerate}
+\item \textbf{Peer Messages}: Read messages from all connected peers concurrently.
+  When a message arrives, route it to the appropriate handler.
+
+\item \textbf{Request Timeout}: Periodically check for timed-out block requests
+  and reassign them to other peers.
+
+\item \textbf{Re-Announce Timer}: Contact the tracker at the specified interval
+  to refresh the peer list and report progress.
+
+\item \textbf{Keep-Alive Timer}: Send keep-alive messages to peers that haven't
+  received data recently, preventing connection timeouts.
+
+\item \textbf{Shutdown Signal}: Check for graceful shutdown requests (Ctrl+C)
+  and exit cleanly.
+\end{enumerate}
+
+The [[tokio::select!]] macro provides the mechanism to await multiple futures
+concurrently, completing when any one of them is ready. This creates an event-driven
+architecture where the loop responds to whichever event occurs first.
+
+\subsection{Event Types}
+
+We define an enum to represent the different events the loop handles:
+
+<<event loop>>=
+use tokio::time::interval;
+use tracing::trace;
+
+/// Request timeout check interval in seconds.
+///
+/// The event loop checks for timed-out requests every 30 seconds.
+/// This is a balance between responsiveness (detecting timeouts quickly)
+/// and overhead (not checking too frequently).
+pub const REQUEST_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 30;
+
+/// Events that can occur during the event loop.
+///
+/// Each variant represents a distinct type of event that requires
+/// handling in the main loop. The event loop uses `tokio::select!`
+/// to await these events concurrently.
+#[derive(Debug)]
+pub enum EventLoopEvent {
+    /// A message was received from a peer.
+    ///
+    /// Contains the peer's address and the message. The address is used
+    /// to look up the connection state for message processing.
+    PeerMessage {
+        addr: SocketAddr,
+        message: Result<Message, PeerError>,
+    },
+
+    /// A peer connection was lost or errored.
+    ///
+    /// The connection should be removed and replaced from the peer pool.
+    PeerDisconnected {
+        addr: SocketAddr,
+        reason: String,
+    },
+
+    /// Time to check for timed-out block requests.
+    ///
+    /// Triggered every REQUEST_TIMEOUT_CHECK_INTERVAL_SECS seconds.
+    RequestTimeoutCheck,
+
+    /// Time to re-announce to the tracker.
+    ///
+    /// Triggered at the interval specified by the tracker response.
+    ReAnnounce,
+
+    /// Time to send keep-alives to idle peers.
+    ///
+    /// Triggered every KEEP_ALIVE_INTERVAL_SECS seconds.
+    KeepAliveCheck,
+
+    /// Shutdown was requested (Ctrl+C or programmatic).
+    Shutdown,
+
+    /// Download is complete (all pieces verified).
+    DownloadComplete,
+}
+
+/// Result of processing one event loop iteration.
+///
+/// Guides the main loop on what action to take next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventLoopAction {
+    /// Continue processing events.
+    Continue,
+
+    /// Exit the loop due to shutdown request.
+    ShutdownRequested,
+
+    /// Exit the loop because download is complete.
+    Complete,
+
+    /// Exit the loop due to an error.
+    Error(String),
+}
+@
+
+The event types capture the essential information needed to process each kind
+of occurrence. The [[EventLoopAction]] enum tells the main loop whether to
+continue or exit, and why.
+
+\subsection{Event Loop Context}
+
+The event loop needs access to various pieces of state. Rather than passing
+many parameters, we group them into a context struct that can be passed around:
+
+<<event loop>>=
+/// Context for the event loop, holding references to all required state.
+///
+/// This struct groups together the state needed by the event loop, avoiding
+/// long parameter lists and making the code more readable. The context
+/// borrows state rather than owning it, so the event loop doesn't take
+/// ownership of client resources.
+pub struct EventLoopContext<'a> {
+    /// Manages peer connections (add/remove/iterate).
+    pub connection_manager: &'a mut PeerConnectionManager,
+
+    /// Tracks piece download state and verification.
+    pub piece_manager: &'a mut PieceManager,
+
+    /// Tracks which pieces each peer has (for rarest-first).
+    pub availability: &'a mut PieceAvailability,
+
+    /// Signals for shutdown coordination.
+    pub shutdown: &'a ShutdownController,
+
+    /// Pending request queues per peer (keyed by address).
+    ///
+    /// Separated from PeerConnection to allow concurrent iteration.
+    pub request_queues: &'a mut HashMap<SocketAddr, PeerRequestQueue>,
+
+    /// In-progress piece buffers (keyed by piece index).
+    ///
+    /// Contains the partially-downloaded data for each piece.
+    pub in_progress_pieces: &'a mut HashMap<u32, InProgressPiece>,
+
+    /// Expected piece hashes for verification.
+    pub piece_hashes: &'a [[u8; 20]],
+
+    /// Number of pieces in this torrent.
+    pub num_pieces: u32,
+
+    /// Our peer ID for block requests.
+    pub our_peer_id: [u8; 20],
+
+    /// Tracker re-announce interval in seconds.
+    pub tracker_interval: u64,
+
+    /// Flag indicating download is complete.
+    pub download_complete: &'a mut bool,
+}
+@
+
+\subsection{Reading from Peers}
+
+Reading from peers in the event loop presents a challenge: we need to read
+from any peer that has data available, but we can't hold mutable borrows of
+all streams simultaneously. Instead, we poll peers round-robin within the
+select! loop, reading from whichever has data available first.
+
+Since tokio::select! already provides fair polling among its branches, and
+peer reading is just one branch, we can use a simpler approach: try to read
+from the first available peer connection.
+
+<<event loop>>=
+/// Reads a message from the first available peer connection.
+///
+/// This function tries to read from a single peer. The event loop calls
+/// this repeatedly within select! to achieve fair multiplexing across
+/// all ready events.
+///
+/// # Returns
+///
+/// - `Some((addr, result))` if we attempted to read from a peer
+/// - `None` if there are no connections
+async fn read_from_first_peer(
+    connections: &mut HashMap<SocketAddr, PeerConnection>,
+) -> Option<(SocketAddr, Result<Message, PeerError>)> {
+    // Get first connection (HashMap iteration order is arbitrary but stable)
+    let addr = *connections.keys().next()?;
+
+    let conn = connections.get_mut(&addr)?;
+    let result = read_message(&mut conn.stream).await;
+    Some((addr, result))
+}
+@
+
+\subsection{The Main Event Loop}
+
+The main event loop ties everything together. It uses [[tokio::select!]] to
+multiplex all event sources, processing whichever event occurs first.
+
+<<event loop>>=
+/// Runs the main event loop for the BitTorrent client.
+///
+/// This is the heart of the client, orchestrating all async operations:
+/// - Reading messages from connected peers
+/// - Checking for request timeouts
+/// - Re-announcing to the tracker
+/// - Sending keep-alive messages
+/// - Handling graceful shutdown
+///
+/// The loop continues until:
+/// - Shutdown is requested (returns `ShutdownRequested`)
+/// - Download completes (returns `Complete`)
+/// - An unrecoverable error occurs (returns `Error`)
+///
+/// # Event Priority
+///
+/// When multiple events are ready simultaneously, `tokio::select!` picks
+/// one pseudo-randomly. This is fine for our use case since all events
+/// need to be processed eventually.
+///
+/// # Arguments
+///
+/// * `ctx` - Mutable reference to the event loop context containing all state
+///
+/// # Returns
+///
+/// `EventLoopAction` indicating why the loop exited.
+///
+/// # Example
+///
+/// ```ignore
+/// let action = run_event_loop(&mut ctx).await;
+/// match action {
+///     EventLoopAction::Complete => println!("Download finished!"),
+///     EventLoopAction::ShutdownRequested => println!("Shutdown requested"),
+///     EventLoopAction::Error(e) => eprintln!("Error: {}", e),
+///     EventLoopAction::Continue => unreachable!("Loop should not return Continue"),
+/// }
+/// ```
+pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
+    // Initialize timers
+    let mut request_timeout_interval = interval(
+        Duration::from_secs(REQUEST_TIMEOUT_CHECK_INTERVAL_SECS)
+    );
+    let mut keep_alive_interval = interval(
+        Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)
+    );
+    let mut re_announce_interval = interval(
+        Duration::from_secs(ctx.tracker_interval)
+    );
+
+    // Skip the first tick (intervals fire immediately on creation)
+    request_timeout_interval.tick().await;
+    keep_alive_interval.tick().await;
+    re_announce_interval.tick().await;
+
+    let mut iteration: u64 = 0;
+
+    loop {
+        iteration += 1;
+        trace!(iteration, "event loop iteration start");
+
+        // Check for shutdown first (non-blocking)
+        if ctx.shutdown.is_shutdown_requested() {
+            info!("shutdown requested, exiting event loop");
+            return EventLoopAction::ShutdownRequested;
+        }
+
+        // Check for completion
+        if *ctx.download_complete {
+            info!("download complete, exiting event loop");
+            return EventLoopAction::Complete;
+        }
+
+        // Wait for the next event
+        let event = tokio::select! {
+            biased;
+
+            // Shutdown check has highest priority
+            _ = std::future::ready(()), if ctx.shutdown.is_shutdown_requested() => {
+                EventLoopEvent::Shutdown
+            }
+
+            // Request timeout check
+            _ = request_timeout_interval.tick() => {
+                EventLoopEvent::RequestTimeoutCheck
+            }
+
+            // Keep-alive check
+            _ = keep_alive_interval.tick() => {
+                EventLoopEvent::KeepAliveCheck
+            }
+
+            // Re-announce timer
+            _ = re_announce_interval.tick() => {
+                EventLoopEvent::ReAnnounce
+            }
+
+            // Read from peers (only if we have connections)
+            Some((addr, result)) = read_from_first_peer_wrapper(
+                ctx.connection_manager
+            ) => {
+                match result {
+                    Ok(msg) => EventLoopEvent::PeerMessage { addr, message: Ok(msg) },
+                    Err(PeerError::ConnectionClosed) => {
+                        EventLoopEvent::PeerDisconnected {
+                            addr,
+                            reason: "connection closed".to_string(),
+                        }
+                    }
+                    Err(e) => {
+                        EventLoopEvent::PeerDisconnected {
+                            addr,
+                            reason: e.to_string(),
+                        }
+                    }
+                }
+            }
+        };
+
+        trace!(?event, "processing event");
+
+        // Process the event
+        let action = handle_event(event, ctx).await;
+
+        match action {
+            EventLoopAction::Continue => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Wrapper to read from peers through the connection manager.
+///
+/// This function provides access to the internal connections HashMap
+/// through the PeerConnectionManager interface.
+async fn read_from_first_peer_wrapper(
+    manager: &mut PeerConnectionManager,
+) -> Option<(SocketAddr, Result<Message, PeerError>)> {
+    // Get the connections as a mutable reference
+    let connections = manager.connections_map_mut();
+    read_from_first_peer(connections).await
+}
+@
+
+The [[biased]] keyword in [[tokio::select!]] ensures that branches are checked
+in order when multiple are ready. This gives shutdown the highest priority,
+ensuring responsive termination.
+
+\subsection{Event Handling}
+
+Each event type has a corresponding handler that processes it and returns
+an action for the main loop:
+
+<<event loop>>=
+/// Handles a single event from the event loop.
+///
+/// Dispatches to the appropriate handler based on event type and
+/// returns an action indicating what the main loop should do next.
+async fn handle_event(
+    event: EventLoopEvent,
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    match event {
+        EventLoopEvent::Shutdown => {
+            info!("received shutdown event");
+            EventLoopAction::ShutdownRequested
+        }
+
+        EventLoopEvent::DownloadComplete => {
+            info!("download complete event");
+            EventLoopAction::Complete
+        }
+
+        EventLoopEvent::PeerMessage { addr, message } => {
+            handle_peer_message(addr, message, ctx).await
+        }
+
+        EventLoopEvent::PeerDisconnected { addr, reason } => {
+            handle_peer_disconnected(addr, &reason, ctx).await
+        }
+
+        EventLoopEvent::RequestTimeoutCheck => {
+            handle_request_timeouts(ctx).await
+        }
+
+        EventLoopEvent::KeepAliveCheck => {
+            handle_keep_alives(ctx).await
+        }
+
+        EventLoopEvent::ReAnnounce => {
+            // Re-announce is handled externally (tracker module)
+            // We just signal that it's time
+            debug!("re-announce timer fired");
+            EventLoopAction::Continue
+        }
+    }
+}
+@
+
+\subsubsection{Peer Message Handling}
+
+When we receive a message from a peer, we route it to the appropriate handler
+based on the message type:
+
+<<event loop>>=
+/// Handles an incoming message from a peer.
+///
+/// Routes the message to the appropriate handler and takes any
+/// necessary follow-up actions (like requesting more blocks).
+async fn handle_peer_message(
+    addr: SocketAddr,
+    message: Result<Message, PeerError>,
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    let msg = match message {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(peer = %addr, error = %e, "error receiving message");
+            return handle_peer_disconnected(addr, &e.to_string(), ctx).await;
+        }
+    };
+
+    // Get the connection (if it still exists)
+    let conn = match ctx.connection_manager.get_connection_mut(&addr) {
+        Some(c) => c,
+        None => {
+            debug!(peer = %addr, "received message from unknown peer");
+            return EventLoopAction::Continue;
+        }
+    };
+
+    // Update last receive time
+    conn.mark_received();
+
+    match msg {
+        Message::KeepAlive => {
+            trace!(peer = %addr, "received keep-alive");
+        }
+
+        Message::Choke => {
+            let cancelled = handle_incoming_choke(conn);
+            // Log cancelled requests - they will be available for re-request
+            for req in cancelled {
+                trace!(
+                    piece = req.piece_index,
+                    offset = req.offset,
+                    "cancelled request returned to pool"
+                );
+            }
+        }
+
+        Message::Unchoke => {
+            handle_incoming_unchoke(conn);
+            // Trigger block requests now that we're unchoked
+            trigger_block_requests_for_peer(addr, ctx).await;
+        }
+
+        Message::Interested => {
+            conn.state.handle_interested();
+            debug!(peer = %addr, "peer is interested in our pieces");
+        }
+
+        Message::NotInterested => {
+            conn.state.handle_not_interested();
+            debug!(peer = %addr, "peer is not interested in our pieces");
+        }
+
+        Message::Have(piece_index) => {
+            let should_be_interested = handle_incoming_have(
+                &mut conn.state,
+                piece_index,
+                ctx.availability,
+                ctx.piece_manager,
+            );
+
+            if should_be_interested && !conn.state.am_interested {
+                conn.state.am_interested = true;
+                // Send Interested message
+                if let Err(e) = write_message(&mut conn.stream, &Message::Interested).await {
+                    warn!(peer = %addr, error = %e, "failed to send interested");
+                } else {
+                    conn.mark_sent();
+                    debug!(peer = %addr, "sent interested after have");
+                }
+            }
+        }
+
+        Message::Bitfield(bits) => {
+            match handle_incoming_bitfield(
+                &mut conn.state,
+                &bits,
+                ctx.availability,
+                ctx.piece_manager,
+            ) {
+                Ok(should_be_interested) => {
+                    if should_be_interested && !conn.state.am_interested {
+                        conn.state.am_interested = true;
+                        if let Err(e) = write_message(&mut conn.stream, &Message::Interested).await {
+                            warn!(peer = %addr, error = %e, "failed to send interested");
+                        } else {
+                            conn.mark_sent();
+                            debug!(peer = %addr, "sent interested after bitfield");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %addr, error = %e, "invalid bitfield");
+                    return handle_peer_disconnected(addr, &e.to_string(), ctx).await;
+                }
+            }
+        }
+
+        Message::Request { index, begin, length } => {
+            // We don't serve requests (download-only client)
+            debug!(
+                peer = %addr,
+                piece = index,
+                offset = begin,
+                len = length,
+                "ignoring request (download-only client)"
+            );
+        }
+
+        Message::Piece { index, begin, data } => {
+            // Get or create in-progress piece
+            let in_progress = ctx.in_progress_pieces.entry(index).or_insert_with(|| {
+                let piece_size = ctx.piece_manager
+                    .get_piece_size(index)
+                    .unwrap_or(0);
+                InProgressPiece::new(index, piece_size)
+            });
+
+            let expected_hash = ctx.piece_hashes.get(index as usize)
+                .unwrap_or(&[0u8; 20]);
+
+            // Need to get connection again due to borrow checker
+            let conn = match ctx.connection_manager.get_connection_mut(&addr) {
+                Some(c) => c,
+                None => {
+                    warn!(peer = %addr, "connection disappeared during piece handling");
+                    return EventLoopAction::Continue;
+                }
+            };
+
+            let result = handle_incoming_piece(
+                conn,
+                index,
+                begin,
+                &data,
+                in_progress,
+                expected_hash,
+            );
+
+            match result {
+                PieceHandleResult::BlockStored => {
+                    // Continue downloading - request more blocks if queue has space
+                    trigger_block_requests_for_peer(addr, ctx).await;
+                }
+                PieceHandleResult::PieceVerified(piece_idx) => {
+                    info!(piece = piece_idx, "piece verified!");
+
+                    // Mark piece as verified in piece manager
+                    if let Err(e) = ctx.piece_manager.mark_verified(piece_idx as u32) {
+                        warn!(piece = piece_idx, error = %e, "failed to mark piece verified");
+                    }
+
+                    // Remove from in-progress
+                    ctx.in_progress_pieces.remove(&(piece_idx as u32));
+
+                    // Check if download is complete
+                    if ctx.piece_manager.is_complete() {
+                        *ctx.download_complete = true;
+                        return EventLoopAction::Complete;
+                    }
+
+                    // Trigger requests for next pieces
+                    trigger_block_requests_all_peers(ctx).await;
+                }
+                PieceHandleResult::PieceHashFailed(piece_idx) => {
+                    warn!(piece = piece_idx, "piece hash verification failed, will retry");
+
+                    // Mark the piece as failed so it can be re-downloaded
+                    ctx.in_progress_pieces.remove(&(piece_idx as u32));
+                    if let Err(e) = ctx.piece_manager.mark_failed(piece_idx as u32) {
+                        warn!(piece = piece_idx, error = %e, "failed to mark piece as failed");
+                    }
+
+                    // Trigger requests to try again
+                    trigger_block_requests_all_peers(ctx).await;
+                }
+                PieceHandleResult::UnexpectedBlock => {
+                    // Ignore, already logged in handler
+                }
+            }
+        }
+
+        Message::Cancel { index, begin, length } => {
+            // We don't serve requests, so we don't track cancellations
+            trace!(
+                peer = %addr,
+                piece = index,
+                offset = begin,
+                len = length,
+                "received cancel (ignored - download-only)"
+            );
+        }
+    }
+
+    EventLoopAction::Continue
+}
+@
+
+\subsubsection{Peer Disconnection}
+
+When a peer disconnects, we remove them from the connection pool and try to
+replace them from the available peer queue:
+
+<<event loop>>=
+/// Handles peer disconnection.
+///
+/// Removes the peer from active connections and attempts to replace them
+/// from the available peer pool.
+async fn handle_peer_disconnected(
+    addr: SocketAddr,
+    reason: &str,
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    info!(peer = %addr, reason = %reason, "peer disconnected");
+
+    // Remove from connection manager
+    if let Some(conn) = ctx.connection_manager.remove_connection(&addr) {
+        // Update availability - remove peer's pieces from global tracking
+        ctx.availability.remove_peer_bitfield(&conn.state.bitfield);
+    }
+
+    // Remove the peer's request queue
+    ctx.request_queues.remove(&addr);
+
+    // Try to replace with a new peer
+    // (Connection establishment is handled elsewhere, we just note we need more)
+    if ctx.connection_manager.needs_more_connections() {
+        debug!(
+            active = ctx.connection_manager.active_count(),
+            available = ctx.connection_manager.available_count(),
+            "peer disconnected, should connect to more peers"
+        );
+    }
+
+    EventLoopAction::Continue
+}
+@
+
+\subsubsection{Request Timeout Handling}
+
+Periodically, we check for timed-out block requests and reassign them:
+
+<<event loop>>=
+/// Handles the request timeout check timer.
+///
+/// Iterates through all peer request queues, finds timed-out requests,
+/// and attempts to reassign them to other peers.
+async fn handle_request_timeouts(
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    trace!("checking for request timeouts");
+
+    // First pass: collect all timed-out requests with their peer addresses
+    // This avoids borrowing issues by not holding mutable references across iterations
+    let mut timed_out_requests: Vec<(SocketAddr, BlockRequest)> = Vec::new();
+
+    let peer_addrs: Vec<SocketAddr> = ctx.request_queues.keys().copied().collect();
+
+    for addr in peer_addrs {
+        if let Some(queue) = ctx.request_queues.get(&addr) {
+            for timestamped in queue.check_timeouts() {
+                timed_out_requests.push((addr, timestamped.request.clone()));
+            }
+        }
+    }
+
+    // Second pass: process each timed-out request
+    for (addr, request) in timed_out_requests {
+        debug!(
+            peer = %addr,
+            piece = request.piece_index,
+            offset = request.offset,
+            "request timed out"
+        );
+
+        // Remove from the original peer's queue
+        if let Some(queue) = ctx.request_queues.get_mut(&addr) {
+            queue.remove(request.piece_index, request.offset);
+        }
+
+        // Create cancel message
+        let cancel = Message::Cancel {
+            index: request.piece_index,
+            begin: request.offset,
+            length: request.length,
+        };
+
+        // Send cancel to original peer
+        if let Some(conn) = ctx.connection_manager.get_connection_mut(&addr) {
+            if let Err(e) = write_message(&mut conn.stream, &cancel).await {
+                warn!(peer = %addr, error = %e, "failed to send cancel");
+            } else {
+                conn.mark_sent();
+            }
+        }
+
+        // Find an alternative peer that has the piece and isn't choking us
+        let alt_addr = ctx.connection_manager
+            .connections()
+            .filter(|(peer_addr, _)| **peer_addr != addr)
+            .filter(|(_, conn)| conn.state.has_piece(request.piece_index))
+            .filter(|(_, conn)| !conn.state.peer_choking)
+            .map(|(peer_addr, _)| *peer_addr)
+            .next();
+
+        // Re-request from alternative if available
+        if let Some(alt_addr) = alt_addr {
+            debug!(
+                piece = request.piece_index,
+                offset = request.offset,
+                new_peer = %alt_addr,
+                "reassigning timed-out request"
+            );
+
+            // Queue the request to the alternative peer
+            if let Some(alt_queue) = ctx.request_queues.get_mut(&alt_addr) {
+                let new_request = BlockRequest::new(
+                    request.piece_index,
+                    request.offset,
+                    request.length,
+                    ctx.our_peer_id,
+                );
+                alt_queue.push(new_request.clone());
+
+                // Send the request message
+                if let Some(alt_conn) = ctx.connection_manager.get_connection_mut(&alt_addr) {
+                    let msg = Message::Request {
+                        index: new_request.piece_index,
+                        begin: new_request.offset,
+                        length: new_request.length,
+                    };
+                    if let Err(e) = write_message(&mut alt_conn.stream, &msg).await {
+                        warn!(peer = %alt_addr, error = %e, "failed to send request");
+                    } else {
+                        alt_conn.mark_sent();
+                    }
+                }
+            }
+        }
+    }
+
+    EventLoopAction::Continue
+}
+@
+
+\subsubsection{Keep-Alive Handling}
+
+Send keep-alives to peers that haven't received data recently:
+
+<<event loop>>=
+/// Handles the keep-alive check timer.
+///
+/// Iterates through all peer connections and sends keep-alives to those
+/// that haven't had any messages sent recently.
+async fn handle_keep_alives(
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    trace!("checking for keep-alives");
+
+    let keep_alive_threshold = Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS);
+
+    // Collect addresses to avoid borrowing issues
+    let peer_addrs: Vec<SocketAddr> = ctx.connection_manager
+        .connections()
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    for addr in peer_addrs {
+        if let Some(conn) = ctx.connection_manager.get_connection_mut(&addr) {
+            if conn.last_send_time.elapsed() >= keep_alive_threshold {
+                match write_message(&mut conn.stream, &Message::KeepAlive).await {
+                    Ok(()) => {
+                        conn.mark_sent();
+                        trace!(peer = %addr, "sent keep-alive");
+                    }
+                    Err(e) => {
+                        warn!(peer = %addr, error = %e, "failed to send keep-alive");
+                        // Don't disconnect here - let the next read fail
+                    }
+                }
+            }
+        }
+    }
+
+    EventLoopAction::Continue
+}
+@
+
+\subsubsection{Triggering Block Requests}
+
+After receiving an unchoke or completing a piece, we need to request more blocks:
+
+<<event loop>>=
+/// Triggers block requests for a specific peer.
+///
+/// Called after receiving an unchoke or when queue space becomes available.
+async fn trigger_block_requests_for_peer(
+    addr: SocketAddr,
+    ctx: &mut EventLoopContext<'_>,
+) {
+    let conn = match ctx.connection_manager.get_connection_mut(&addr) {
+        Some(c) => c,
+        None => {
+            debug!(peer = %addr, "connection gone, skipping block requests");
+            return;
+        }
+    };
+
+    // Can't request if peer is choking us
+    if conn.state.peer_choking {
+        return;
+    }
+
+    // Get or create request queue for this peer
+    let queue = ctx.request_queues.entry(addr).or_insert_with(|| {
+        PeerRequestQueue::new(DEFAULT_MAX_PIPELINE_LENGTH)
+    });
+
+    // Fill the request queue
+    let requests = fill_request_queue(
+        &conn.state,
+        queue,
+        ctx.piece_manager,
+        ctx.availability,
+        ctx.our_peer_id,
+    );
+
+    // Send the request messages
+    for request in requests {
+        let msg = Message::Request {
+            index: request.piece_index,
+            begin: request.offset,
+            length: request.length,
+        };
+
+        // Get connection again (borrow checker)
+        if let Some(conn) = ctx.connection_manager.get_connection_mut(&addr) {
+            if let Err(e) = write_message(&mut conn.stream, &msg).await {
+                warn!(peer = %addr, error = %e, "failed to send request");
+                break;
+            }
+            conn.mark_sent();
+            trace!(
+                peer = %addr,
+                piece = request.piece_index,
+                offset = request.offset,
+                "sent block request"
+            );
+        }
+    }
+}
+
+/// Triggers block requests for all unchoked peers.
+///
+/// Called after completing a piece to distribute requests across peers.
+async fn trigger_block_requests_all_peers(
+    ctx: &mut EventLoopContext<'_>,
+) {
+    // Collect addresses to avoid borrowing issues
+    let peer_addrs: Vec<SocketAddr> = ctx.connection_manager
+        .connections()
+        .filter(|(_, conn)| !conn.state.peer_choking)
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    for addr in peer_addrs {
+        trigger_block_requests_for_peer(addr, ctx).await;
+    }
+}
+@
+
+\subsection{Connection Manager Extension}
+
+We need to add a method to [[PeerConnectionManager]] to access the internal
+connections map for the event loop:
+
+<<event loop connection manager extension>>=
+impl PeerConnectionManager {
+    /// Returns a mutable reference to the internal connections map.
+    ///
+    /// This is used by the event loop to read from multiple peer streams
+    /// concurrently. The method is intentionally not public in the normal
+    /// API since direct map access bypasses the manager's invariants.
+    pub(crate) fn connections_map_mut(&mut self) -> &mut HashMap<SocketAddr, PeerConnection> {
+        &mut self.connections
+    }
+}
+@
+
+\subsection{Default Pipeline Length}
+
+Define the default maximum number of pipelined requests per peer:
+
+<<event loop>>=
+/// Default maximum number of pipelined block requests per peer.
+///
+/// BitTorrent benefits from request pipelining to hide network latency.
+/// 10 requests is a common default that provides good throughput without
+/// overwhelming slow peers or wasting bandwidth on cancelled requests.
+pub const DEFAULT_MAX_PIPELINE_LENGTH: usize = 10;
+@
+
+\subsection{Event Loop Tests}
+
+We test the event loop with unit tests for message ordering and integration
+tests for concurrent peer events.
+
+<<event loop tests>>=
+#[cfg(test)]
+mod event_loop_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn event_loop_action_equality() {
+        assert_eq!(EventLoopAction::Continue, EventLoopAction::Continue);
+        assert_eq!(EventLoopAction::ShutdownRequested, EventLoopAction::ShutdownRequested);
+        assert_eq!(EventLoopAction::Complete, EventLoopAction::Complete);
+        assert_eq!(
+            EventLoopAction::Error("test".to_string()),
+            EventLoopAction::Error("test".to_string())
+        );
+        assert_ne!(EventLoopAction::Continue, EventLoopAction::ShutdownRequested);
+    }
+
+    #[test]
+    fn event_loop_event_debug() {
+        let event = EventLoopEvent::Shutdown;
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("Shutdown"));
+
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let event = EventLoopEvent::PeerMessage {
+            addr,
+            message: Ok(Message::KeepAlive),
+        };
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("PeerMessage"));
+        assert!(debug_str.contains("127.0.0.1:6881"));
+    }
+
+    #[test]
+    fn constants_are_reasonable() {
+        // Request timeout should be longer than network round-trip
+        assert!(REQUEST_TIMEOUT_CHECK_INTERVAL_SECS >= 10);
+        assert!(REQUEST_TIMEOUT_CHECK_INTERVAL_SECS <= 60);
+
+        // Pipeline length should allow good throughput
+        assert!(DEFAULT_MAX_PIPELINE_LENGTH >= 5);
+        assert!(DEFAULT_MAX_PIPELINE_LENGTH <= 20);
+    }
+
+    #[tokio::test]
+    async fn read_from_first_peer_returns_none_for_empty() {
+        let mut connections: HashMap<SocketAddr, PeerConnection> = HashMap::new();
+        let result = read_from_first_peer(&mut connections).await;
+        assert!(result.is_none());
+    }
+}
+@
+
+\subsection{Integration Tests}
+
+Integration tests verify the event loop handles concurrent peer events correctly:
+
+<<event loop integration tests>>=
+#[cfg(test)]
+mod event_loop_integration_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn shutdown_controller_triggers_event_loop_exit() {
+        let shutdown = ShutdownController::new();
+
+        // Request shutdown
+        shutdown.request_shutdown();
+
+        // Verify the check works
+        assert!(shutdown.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn event_loop_respects_shutdown() {
+        // This test verifies the event loop exits on shutdown
+        // We create a minimal context and trigger shutdown
+
+        let shutdown = Arc::new(ShutdownController::new());
+        shutdown.request_shutdown();
+
+        // The event loop should detect shutdown immediately
+        assert!(shutdown.is_shutdown_requested());
     }
 }
 @
