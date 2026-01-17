@@ -552,8 +552,19 @@ The pieces module combines the error types and helpers.
 //! outstanding block requests. A [`BlockRequest`] represents a request
 //! sent to a peer, and [`RequestState`] tracks the lifecycle of that
 //! request from pending through completion or timeout.
+//!
+//! # Piece and Block Geometry
+//!
+//! This module also provides pure functions for calculating piece and block
+//! geometry: how many blocks per piece, the actual size of the last piece,
+//! the size of the last block, and block offsets. These are essential for
+//! correctly requesting and assembling data.
 
 <<peer id type>>
+
+<<piece geometry constants>>
+
+<<piece geometry functions>>
 
 <<piece state>>
 
@@ -569,6 +580,8 @@ The pieces module combines the error types and helpers.
 mod tests {
     use super::*;
     use std::io;
+
+    <<piece geometry tests>>
 
     <<piece state tests>>
 
@@ -1314,5 +1327,465 @@ fn request_state_derives_copy() {
 fn request_state_implements_debug() {
     let debug_str = format!("{:?}", RequestState::InFlight);
     assert!(debug_str.contains("InFlight"));
+}
+@
+
+\subsection{Piece and Block Geometry}
+
+BitTorrent divides files into fixed-size pieces, and each piece is further divided
+into blocks for transmission. Understanding this geometry is fundamental to correct
+piece management. The calculations here are pure functions with no state, making
+them easy to test and reason about.
+
+\subsubsection{The Block Size Constant}
+
+The de facto standard block size in BitTorrent is 16384 bytes ($2^{14}$). While the
+protocol does not mandate this specific value, nearly all clients use it. Using a
+power of two simplifies offset calculations and aligns well with typical disk
+sector sizes and memory page boundaries.
+
+<<piece geometry constants>>=
+/// The standard block size used in BitTorrent, in bytes.
+///
+/// Blocks are the units of data actually transferred between peers. While
+/// pieces are the units of integrity (each piece has a SHA1 hash), blocks
+/// are the units of transfer (each `request` and `piece` message deals with
+/// a single block).
+///
+/// The value 16384 bytes (16 KiB, or $2^{14}$) is the de facto standard used
+/// by virtually all BitTorrent clients. This size was chosen as a balance
+/// between:
+///
+/// - **Overhead**: Smaller blocks mean more protocol overhead (each request
+///   and piece message has a fixed header cost).
+/// - **Latency**: Larger blocks increase latency before data can be processed.
+/// - **Flexibility**: Smaller blocks allow finer-grained request scheduling.
+///
+/// The protocol theoretically allows other sizes, but using a non-standard
+/// block size may cause compatibility issues with some peers.
+pub const BLOCK_SIZE: u32 = 16384;
+@
+
+\subsubsection{Blocks Per Piece}
+
+Given a piece length, we need to calculate how many blocks it contains. Since the
+last block may be smaller than [[BLOCK_SIZE]], we use ceiling division. For
+example, a 262144-byte piece (256 KiB) contains exactly 16 blocks, while a
+270000-byte piece would contain 17 blocks (the last one being partial).
+
+<<piece geometry functions>>=
+/// Calculates the number of blocks in a piece of the given length.
+///
+/// Uses ceiling division to account for a potentially partial last block.
+/// For standard 256 KiB pieces, this returns 16 (since 262144 / 16384 = 16).
+///
+/// # Arguments
+///
+/// * `piece_length` - The length of the piece in bytes
+///
+/// # Returns
+///
+/// The number of blocks needed to cover the piece. Always at least 1 for
+/// any non-zero piece length.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::pieces::blocks_per_piece;
+///
+/// // Standard 256 KiB piece = 16 blocks
+/// assert_eq!(blocks_per_piece(262144), 16);
+///
+/// // Partial piece still needs ceiling division
+/// assert_eq!(blocks_per_piece(270000), 17);
+///
+/// // Smaller than one block = 1 block
+/// assert_eq!(blocks_per_piece(1000), 1);
+/// ```
+#[inline]
+pub fn blocks_per_piece(piece_length: u32) -> u32 {
+    // Ceiling division: (a + b - 1) / b
+    // This avoids floating point and handles the edge case correctly.
+    (piece_length + BLOCK_SIZE - 1) / BLOCK_SIZE
+}
+@
+
+\subsubsection{Actual Piece Size}
+
+While most pieces have the standard piece length from the metainfo, the last piece
+of a torrent is often smaller. This happens when the total file size is not evenly
+divisible by the piece length. We must handle this correctly to avoid requesting
+more data than exists.
+
+The calculation is:
+\begin{itemize}
+\item For all pieces except the last: return the standard piece length
+\item For the last piece: return [[total\_length - (num\_pieces - 1) * piece\_length]]
+\end{itemize}
+
+<<piece geometry functions>>=
+
+/// Calculates the actual size of a specific piece.
+///
+/// Most pieces have the standard `piece_length` from the torrent metadata.
+/// However, the last piece may be smaller if the total file length is not
+/// evenly divisible by the piece length.
+///
+/// # Arguments
+///
+/// * `piece_index` - Zero-based index of the piece
+/// * `piece_length` - Standard piece length from torrent metadata
+/// * `total_length` - Total length of the torrent content in bytes
+/// * `num_pieces` - Total number of pieces in the torrent
+///
+/// # Returns
+///
+/// The actual size of the specified piece in bytes.
+///
+/// # Panics
+///
+/// Panics if `piece_index >= num_pieces`. Use [`PieceError::invalid_index`]
+/// for error handling in contexts where invalid indices are possible.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::pieces::piece_size;
+///
+/// // A torrent with 3 pieces: piece_length=100, total_length=250
+/// // Pieces 0 and 1 are full (100 bytes each), piece 2 is partial (50 bytes)
+/// assert_eq!(piece_size(0, 100, 250, 3), 100);
+/// assert_eq!(piece_size(1, 100, 250, 3), 100);
+/// assert_eq!(piece_size(2, 100, 250, 3), 50);
+/// ```
+#[inline]
+pub fn piece_size(piece_index: u32, piece_length: u32, total_length: u64, num_pieces: u32) -> u32 {
+    assert!(piece_index < num_pieces, "piece_index {} >= num_pieces {}", piece_index, num_pieces);
+
+    let is_last_piece = piece_index == num_pieces - 1;
+    if is_last_piece {
+        // Last piece size = total_length - (bytes in all previous pieces)
+        let previous_bytes = (num_pieces - 1) as u64 * piece_length as u64;
+        (total_length - previous_bytes) as u32
+    } else {
+        piece_length
+    }
+}
+@
+
+\subsubsection{Actual Block Size}
+
+Similarly, the last block of a piece may be smaller than [[BLOCK_SIZE]]. This
+requires knowing both which piece we are in (to determine the piece size) and
+which block within that piece.
+
+<<piece geometry functions>>=
+
+/// Calculates the actual size of a specific block within a piece.
+///
+/// Most blocks are exactly `BLOCK_SIZE` (16384 bytes). However, the last
+/// block of a piece may be smaller if the piece size is not evenly divisible
+/// by the block size.
+///
+/// # Arguments
+///
+/// * `piece_index` - Zero-based index of the piece
+/// * `block_index` - Zero-based index of the block within the piece
+/// * `piece_length` - Standard piece length from torrent metadata
+/// * `total_length` - Total length of the torrent content in bytes
+/// * `num_pieces` - Total number of pieces in the torrent
+///
+/// # Returns
+///
+/// The actual size of the specified block in bytes.
+///
+/// # Panics
+///
+/// Panics if `piece_index >= num_pieces` or if `block_index` is beyond
+/// the number of blocks in this piece.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::pieces::{block_size, BLOCK_SIZE};
+///
+/// // A piece of 40000 bytes has 3 blocks:
+/// // - Block 0: 16384 bytes
+/// // - Block 1: 16384 bytes
+/// // - Block 2: 7232 bytes (40000 - 2*16384)
+/// //
+/// // For a torrent with piece_length=40000, total_length=40000, num_pieces=1:
+/// assert_eq!(block_size(0, 0, 40000, 40000, 1), BLOCK_SIZE);
+/// assert_eq!(block_size(0, 1, 40000, 40000, 1), BLOCK_SIZE);
+/// assert_eq!(block_size(0, 2, 40000, 40000, 1), 7232);
+/// ```
+#[inline]
+pub fn block_size(
+    piece_index: u32,
+    block_index: u32,
+    piece_length: u32,
+    total_length: u64,
+    num_pieces: u32,
+) -> u32 {
+    let this_piece_size = piece_size(piece_index, piece_length, total_length, num_pieces);
+    let num_blocks = blocks_per_piece(this_piece_size);
+
+    assert!(
+        block_index < num_blocks,
+        "block_index {} >= num_blocks {} for piece {}",
+        block_index,
+        num_blocks,
+        piece_index
+    );
+
+    let is_last_block = block_index == num_blocks - 1;
+    if is_last_block {
+        // Last block size = piece_size - (bytes in all previous blocks)
+        let previous_bytes = block_index * BLOCK_SIZE;
+        this_piece_size - previous_bytes
+    } else {
+        BLOCK_SIZE
+    }
+}
+@
+
+\subsubsection{Block Offset Calculation}
+
+Given a block index, we often need the byte offset within the piece where that
+block starts. This is straightforward: [[block\_index * BLOCK\_SIZE]].
+
+<<piece geometry functions>>=
+
+/// Calculates the byte offset of a block within its piece.
+///
+/// Blocks are laid out sequentially within a piece, each at a multiple of
+/// `BLOCK_SIZE`. The first block is at offset 0, the second at offset
+/// 16384, and so on.
+///
+/// # Arguments
+///
+/// * `block_index` - Zero-based index of the block within the piece
+///
+/// # Returns
+///
+/// The byte offset where this block starts within the piece.
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::pieces::{block_offset, BLOCK_SIZE};
+///
+/// assert_eq!(block_offset(0), 0);
+/// assert_eq!(block_offset(1), BLOCK_SIZE);
+/// assert_eq!(block_offset(2), 2 * BLOCK_SIZE);
+/// ```
+#[inline]
+pub fn block_offset(block_index: u32) -> u32 {
+    block_index * BLOCK_SIZE
+}
+@
+
+\subsubsection{Geometry Tests}
+
+The geometry functions are pure and deterministic, making them ideal for exhaustive
+testing. We verify both normal cases and edge cases:
+
+\begin{itemize}
+\item Normal pieces in the middle of a torrent
+\item The last piece being smaller than standard
+\item Single-piece torrents
+\item The last block of a piece being smaller
+\item The last block of the last piece (smallest possible block)
+\end{itemize}
+
+<<piece geometry tests>>=
+#[test]
+fn block_size_constant_is_power_of_two() {
+    assert_eq!(BLOCK_SIZE, 16384);
+    assert_eq!(BLOCK_SIZE, 1 << 14);
+    // Verify it's exactly 16 KiB
+    assert_eq!(BLOCK_SIZE, 16 * 1024);
+}
+
+#[test]
+fn blocks_per_piece_standard_256k_piece() {
+    // Standard 256 KiB piece should have exactly 16 blocks
+    let piece_len = 262144; // 256 * 1024
+    assert_eq!(blocks_per_piece(piece_len), 16);
+}
+
+#[test]
+fn blocks_per_piece_ceiling_division() {
+    // 16385 bytes = 1 block + 1 byte, needs 2 blocks
+    assert_eq!(blocks_per_piece(BLOCK_SIZE + 1), 2);
+
+    // Exactly one block
+    assert_eq!(blocks_per_piece(BLOCK_SIZE), 1);
+
+    // Less than one block still needs 1 block
+    assert_eq!(blocks_per_piece(1), 1);
+    assert_eq!(blocks_per_piece(1000), 1);
+    assert_eq!(blocks_per_piece(BLOCK_SIZE - 1), 1);
+}
+
+#[test]
+fn blocks_per_piece_various_sizes() {
+    // 32768 = 2 * BLOCK_SIZE = 2 blocks
+    assert_eq!(blocks_per_piece(32768), 2);
+
+    // 49152 = 3 * BLOCK_SIZE = 3 blocks
+    assert_eq!(blocks_per_piece(49152), 3);
+
+    // 50000 = 3 * BLOCK_SIZE + extra = 4 blocks
+    assert_eq!(blocks_per_piece(50000), 4);
+}
+
+#[test]
+fn piece_size_all_full_pieces() {
+    // Torrent where all pieces are full (total_length = num_pieces * piece_length)
+    let piece_length = 100;
+    let num_pieces = 10;
+    let total_length = 1000;
+
+    for i in 0..num_pieces {
+        assert_eq!(
+            piece_size(i, piece_length, total_length, num_pieces),
+            piece_length,
+            "piece {} should be full",
+            i
+        );
+    }
+}
+
+#[test]
+fn piece_size_last_piece_partial() {
+    // Torrent: piece_length=100, total_length=250, num_pieces=3
+    // Pieces 0,1 are 100 bytes, piece 2 is 50 bytes
+    assert_eq!(piece_size(0, 100, 250, 3), 100);
+    assert_eq!(piece_size(1, 100, 250, 3), 100);
+    assert_eq!(piece_size(2, 100, 250, 3), 50);
+}
+
+#[test]
+fn piece_size_single_piece_torrent() {
+    // Single piece torrent: total_length = piece_length = 12345
+    assert_eq!(piece_size(0, 12345, 12345, 1), 12345);
+
+    // Single piece torrent with partial content (shouldn't happen in practice,
+    // but the math should still work: the piece is just smaller)
+    assert_eq!(piece_size(0, 100, 50, 1), 50);
+}
+
+#[test]
+fn piece_size_large_torrent() {
+    // Large torrent: 1000 pieces of 256 KiB each, last piece is 100000 bytes
+    let piece_length: u32 = 262144;
+    let num_pieces: u32 = 1000;
+    let full_bytes = (num_pieces - 1) as u64 * piece_length as u64;
+    let total_length = full_bytes + 100000;
+
+    // All but last should be full
+    assert_eq!(piece_size(0, piece_length, total_length, num_pieces), piece_length);
+    assert_eq!(piece_size(500, piece_length, total_length, num_pieces), piece_length);
+    assert_eq!(piece_size(998, piece_length, total_length, num_pieces), piece_length);
+
+    // Last piece should be partial
+    assert_eq!(piece_size(999, piece_length, total_length, num_pieces), 100000);
+}
+
+#[test]
+#[should_panic(expected = "piece_index")]
+fn piece_size_panics_on_invalid_index() {
+    piece_size(5, 100, 500, 5); // index 5 is out of range [0,5)
+}
+
+#[test]
+fn block_size_all_full_blocks() {
+    // A piece that's exactly 3 blocks (49152 bytes = 3 * 16384)
+    // All blocks should be full
+    let piece_len = 49152;
+    for block in 0..3 {
+        assert_eq!(
+            block_size(0, block, piece_len, piece_len as u64, 1),
+            BLOCK_SIZE,
+            "block {} should be full",
+            block
+        );
+    }
+}
+
+#[test]
+fn block_size_last_block_partial() {
+    // A piece of 40000 bytes: 2 full blocks + 1 partial
+    // 40000 = 16384 + 16384 + 7232
+    let piece_len = 40000;
+
+    assert_eq!(block_size(0, 0, piece_len, piece_len as u64, 1), BLOCK_SIZE);
+    assert_eq!(block_size(0, 1, piece_len, piece_len as u64, 1), BLOCK_SIZE);
+    assert_eq!(block_size(0, 2, piece_len, piece_len as u64, 1), 7232);
+}
+
+#[test]
+fn block_size_last_block_of_last_piece() {
+    // Torrent: piece_length=50000, total_length=130000, num_pieces=3
+    // Piece 0: 50000 bytes (4 blocks: 16384, 16384, 16384, 848)
+    // Piece 1: 50000 bytes (4 blocks: same as above)
+    // Piece 2: 30000 bytes (2 blocks: 16384, 13616)
+
+    // Last block of last piece
+    assert_eq!(block_size(2, 1, 50000, 130000, 3), 13616);
+}
+
+#[test]
+fn block_size_single_block_piece() {
+    // A piece smaller than BLOCK_SIZE
+    let piece_len = 5000;
+    assert_eq!(block_size(0, 0, piece_len, piece_len as u64, 1), 5000);
+}
+
+#[test]
+#[should_panic(expected = "block_index")]
+fn block_size_panics_on_invalid_block() {
+    // A piece of 40000 bytes has 3 blocks (0, 1, 2). Block 3 is invalid.
+    block_size(0, 3, 40000, 40000, 1);
+}
+
+#[test]
+fn block_offset_sequential() {
+    assert_eq!(block_offset(0), 0);
+    assert_eq!(block_offset(1), 16384);
+    assert_eq!(block_offset(2), 32768);
+    assert_eq!(block_offset(3), 49152);
+    assert_eq!(block_offset(15), 15 * BLOCK_SIZE);
+}
+
+#[test]
+fn block_offset_consistent_with_block_size() {
+    // For any piece, the sum of block sizes up to block N should equal
+    // the offset of block N+1 (for full blocks)
+    let piece_len = 262144; // 16 full blocks
+
+    let mut sum: u32 = 0;
+    for block in 0..16 {
+        assert_eq!(block_offset(block), sum);
+        sum += block_size(0, block, piece_len, piece_len as u64, 1);
+    }
+    assert_eq!(sum, piece_len);
+}
+
+#[test]
+fn geometry_edge_case_exactly_one_byte() {
+    // Degenerate case: 1 byte torrent
+    assert_eq!(blocks_per_piece(1), 1);
+    assert_eq!(piece_size(0, 1, 1, 1), 1);
+    assert_eq!(block_size(0, 0, 1, 1, 1), 1);
+}
+
+#[test]
+fn geometry_edge_case_piece_equals_block() {
+    // Piece length exactly equals block size
+    assert_eq!(blocks_per_piece(BLOCK_SIZE), 1);
+    assert_eq!(piece_size(0, BLOCK_SIZE, BLOCK_SIZE as u64, 1), BLOCK_SIZE);
+    assert_eq!(block_size(0, 0, BLOCK_SIZE, BLOCK_SIZE as u64, 1), BLOCK_SIZE);
 }
 @
