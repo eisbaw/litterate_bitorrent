@@ -144,6 +144,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<tracker request struct>>
 
+<<tracker response struct>>
+
 <<url encoding>>
 
 <<peer id generation>>
@@ -151,6 +153,8 @@ parsing. For now, we define just the error types needed by other modules.
 <<announce url construction>>
 
 <<http request>>
+
+<<tracker response parsing>>
 
 #[cfg(test)]
 mod tests {
@@ -169,6 +173,8 @@ mod tests {
     <<announce url tests>>
 
     <<http request tests>>
+
+    <<tracker response tests>>
 }
 @
 
@@ -1564,3 +1570,551 @@ fn tracker_timeout_is_30_seconds() {
 These tests verify the constants used by the HTTP request function. Full
 integration testing of [[announce_http]] requires network access and is
 performed in end-to-end tests rather than unit tests.
+
+\subsection{Tracker Response Parsing}
+
+After sending an announce request, the tracker returns a bencoded dictionary.
+This response contains either an error message or the information we need:
+the list of peers and when to announce again. BEP 3 defines the response
+format precisely, and we must handle both success and failure cases.
+
+\subsubsection{Response Format}
+
+A successful tracker response is a bencoded dictionary containing:
+
+\begin{description}
+\item[interval] (required) The number of seconds the client should wait
+  between regular announce requests. Trackers use this to control load---a
+  popular torrent might have a 30-minute interval, while a less-trafficked
+  one might allow 5-minute intervals.
+
+\item[min interval] (optional) The minimum interval between announces. If
+  present, the client must not announce more frequently than this, even
+  when events occur. Our client respects this by waiting at least this
+  long between any two announces.
+
+\item[peers] (required) The list of peers. This can be in two formats:
+  \begin{itemize}
+  \item \emph{Compact format} (BEP 23): A byte string where each peer is
+    6 bytes---4 bytes for the IPv4 address and 2 bytes for the port, both
+    in network byte order (big-endian). For $n$ peers, the string is
+    $6n$ bytes.
+  \item \emph{Dictionary format}: A list of dictionaries, each containing
+    ``peer id'', ``ip'', and ``port'' keys. This format is deprecated and
+    wastes bandwidth, but some older trackers still use it.
+  \end{itemize}
+
+\item[complete] (optional) The number of seeders (peers with the complete
+  file). Useful for display purposes and deciding whether to start a download.
+
+\item[incomplete] (optional) The number of leechers (peers still downloading).
+  Together with ``complete'', this indicates swarm health.
+
+\item[tracker id] (optional) An opaque string the client should echo back
+  in subsequent announces. We don't use this in our implementation, but
+  we document it for completeness.
+\end{description}
+
+A failure response contains a single key:
+
+\begin{description}
+\item[failure reason] A human-readable string explaining why the tracker
+  rejected the request. Common reasons include ``torrent not registered''
+  and ``invalid info\_hash''.
+\end{description}
+
+When ``failure reason'' is present, no other keys are required---the tracker
+is telling us the request failed and there's no useful information to extract.
+
+\subsubsection{The Response Structure}
+
+We define a struct to hold the parsed response. The [[peers]] field stores
+raw bytes because peer parsing is handled by a separate task (task-0070).
+This separation keeps the response parsing focused on the tracker protocol
+while deferring the peer address extraction.
+
+<<tracker response struct>>=
+/// A successful response from a BitTorrent tracker.
+///
+/// This struct contains the information returned by the tracker after a
+/// successful announce request. The peer list is stored as raw bytes to
+/// defer parsing to a separate component.
+///
+/// # Fields
+///
+/// See BEP 3 for the complete specification of tracker responses.
+///
+/// # Example
+///
+/// ```ignore
+/// let response = parse_tracker_response(&body)?;
+/// println!("Next announce in {} seconds", response.interval);
+/// println!("Received {} bytes of peer data", response.peers.len());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerResponse {
+    /// Seconds until the client should send another regular announce.
+    ///
+    /// The client must wait at least this long between periodic announces.
+    /// Events (started, stopped, completed) may trigger immediate announces,
+    /// but regular re-announces should respect this interval.
+    pub interval: u64,
+
+    /// Minimum seconds between any two announces (optional).
+    ///
+    /// If present, the client must not announce more frequently than this,
+    /// even when events occur. This takes precedence over `interval` as the
+    /// absolute minimum wait time.
+    pub min_interval: Option<u64>,
+
+    /// Raw peer data from the tracker.
+    ///
+    /// This is stored as raw bytes because the format depends on whether
+    /// the tracker returned compact (BEP 23) or dictionary format. The
+    /// peer parsing logic (task-0070) handles interpretation.
+    ///
+    /// For compact format: 6 bytes per peer (4-byte IPv4 + 2-byte port).
+    /// For dictionary format: this contains the bencoded list.
+    pub peers: Vec<u8>,
+
+    /// Number of seeders in the swarm (optional).
+    ///
+    /// Seeders are peers that have the complete file. This information
+    /// is useful for display and for deciding whether to start a download
+    /// (a torrent with zero seeders may never complete).
+    pub complete: Option<u64>,
+
+    /// Number of leechers in the swarm (optional).
+    ///
+    /// Leechers are peers still downloading. Together with `complete`,
+    /// this indicates swarm activity and health.
+    pub incomplete: Option<u64>,
+}
+@
+
+The struct uses [[Option]] for fields that the tracker may omit. The [[peers]]
+field is always present in a successful response, so it's not optional---if
+there are no peers, the tracker returns an empty byte string or list.
+
+\subsubsection{Parsing the Response}
+
+The [[parse_tracker_response]] function takes raw bytes (the HTTP response body)
+and returns either a [[TrackerResponse]] or an error. The parsing logic follows
+this order:
+
+\begin{enumerate}
+\item Decode the bytes as bencode. If this fails, return [[TrackerInvalidResponse]].
+\item Check for a ``failure reason'' key. If present, return [[TrackerErrorResponse]].
+\item Extract the required ``interval'' field. If missing or not an integer,
+  return [[TrackerInvalidResponse]].
+\item Extract the ``peers'' field. Handle both compact (byte string) and
+  dictionary (list) formats.
+\item Extract optional fields: ``min interval'', ``complete'', ``incomplete''.
+\item Construct and return the [[TrackerResponse]].
+\end{enumerate}
+
+<<tracker response parsing>>=
+use crate::bencode::{decode, BencodeValue};
+
+/// Parse a bencoded tracker response into a structured `TrackerResponse`.
+///
+/// This function handles the complete parsing of a tracker's HTTP response body,
+/// including error detection and field extraction. It supports both compact (BEP 23)
+/// and dictionary peer formats.
+///
+/// # Arguments
+///
+/// * `data` - The raw bytes of the tracker's HTTP response body
+///
+/// # Returns
+///
+/// On success, returns a `TrackerResponse` containing the interval, peers, and
+/// optional metadata.
+///
+/// # Errors
+///
+/// Returns [`TrackerError::TrackerInvalidResponse`] if:
+/// - The data is not valid bencode
+/// - The response is not a dictionary
+/// - The required `interval` field is missing or not an integer
+/// - The required `peers` field is missing
+/// - The `peers` field is neither a byte string nor a list
+///
+/// Returns [`TrackerError::TrackerErrorResponse`] if the response contains a
+/// `failure reason` key, with the failure message as the error payload.
+///
+/// # Example
+///
+/// ```ignore
+/// let body = announce_http(&url).await?;
+/// let response = parse_tracker_response(&body)?;
+/// println!("Announce again in {} seconds", response.interval);
+/// ```
+pub fn parse_tracker_response(data: &[u8]) -> Result<TrackerResponse, TrackerError> {
+    // Step 1: Decode as bencode
+    let value = decode(data).map_err(|e| {
+        TrackerError::TrackerInvalidResponse(format!("invalid bencode: {}", e))
+    })?;
+
+    // Step 2: Ensure it's a dictionary
+    let dict = match value {
+        BencodeValue::Dict(d) => d,
+        _ => {
+            return Err(TrackerError::TrackerInvalidResponse(
+                "response is not a dictionary".to_string(),
+            ))
+        }
+    };
+
+    // Step 3: Check for failure reason (BEP 3 error response)
+    if let Some(reason) = dict.get(b"failure reason".as_slice()) {
+        let message = match reason {
+            BencodeValue::Bytes(b) => {
+                String::from_utf8_lossy(b).into_owned()
+            }
+            _ => "unknown error".to_string(),
+        };
+        return Err(TrackerError::TrackerErrorResponse(message));
+    }
+
+    // Step 4: Extract required "interval" field
+    let interval = dict
+        .get(b"interval".as_slice())
+        .ok_or_else(|| {
+            TrackerError::TrackerInvalidResponse("missing 'interval' field".to_string())
+        })?;
+
+    let interval = match interval {
+        BencodeValue::Integer(n) if *n >= 0 => *n as u64,
+        BencodeValue::Integer(_) => {
+            return Err(TrackerError::TrackerInvalidResponse(
+                "'interval' is negative".to_string(),
+            ))
+        }
+        _ => {
+            return Err(TrackerError::TrackerInvalidResponse(
+                "'interval' is not an integer".to_string(),
+            ))
+        }
+    };
+
+    // Step 5: Extract required "peers" field
+    let peers_value = dict.get(b"peers".as_slice()).ok_or_else(|| {
+        TrackerError::TrackerInvalidResponse("missing 'peers' field".to_string())
+    })?;
+
+    // Peers can be either compact (byte string) or dictionary format (list)
+    let peers = match peers_value {
+        BencodeValue::Bytes(b) => b.clone(),
+        BencodeValue::List(_) => {
+            // For dictionary format, we store the re-encoded bencode
+            // The peer parser (task-0070) will handle this
+            crate::bencode::encode(peers_value)
+        }
+        _ => {
+            return Err(TrackerError::TrackerInvalidResponse(
+                "'peers' is neither a byte string nor a list".to_string(),
+            ))
+        }
+    };
+
+    // Step 6: Extract optional "min interval" field
+    let min_interval = dict.get(b"min interval".as_slice()).and_then(|v| {
+        match v {
+            BencodeValue::Integer(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    });
+
+    // Step 7: Extract optional "complete" (seeders) field
+    let complete = dict.get(b"complete".as_slice()).and_then(|v| {
+        match v {
+            BencodeValue::Integer(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    });
+
+    // Step 8: Extract optional "incomplete" (leechers) field
+    let incomplete = dict.get(b"incomplete".as_slice()).and_then(|v| {
+        match v {
+            BencodeValue::Integer(n) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        }
+    });
+
+    Ok(TrackerResponse {
+        interval,
+        min_interval,
+        peers,
+        complete,
+        incomplete,
+    })
+}
+@
+
+The parsing function is deliberately defensive. We check for failure reasons
+before extracting other fields because a failure response may not contain
+valid data for those fields. We also validate that integers are non-negative
+before casting to [[u64]], since negative intervals or peer counts don't make
+sense.
+
+For the peers field, we handle both formats:
+\begin{itemize}
+\item \textbf{Compact format}: The bytes are stored directly. This is the
+  common case with modern trackers.
+\item \textbf{Dictionary format}: We re-encode the list to bytes so the peer
+  parser can decode it uniformly. This adds a small overhead for deprecated
+  tracker responses, but keeps the peer parsing logic clean.
+\end{itemize}
+
+\subsubsection{Response Parsing Tests}
+
+We test the response parser with various scenarios to ensure correct behavior
+for both success and error cases.
+
+<<tracker response tests>>=
+#[test]
+fn parse_valid_compact_response() {
+    // Minimal valid response with compact peers
+    // d8:intervali1800e5:peers6:......e
+    // The peer data is 6 bytes representing one peer
+    let peer_data = vec![192, 168, 1, 1, 0x1A, 0xE1]; // 192.168.1.1:6881
+    let mut response = b"d8:intervali1800e5:peers6:".to_vec();
+    response.extend_from_slice(&peer_data);
+    response.push(b'e');
+
+    let result = parse_tracker_response(&response);
+    assert!(result.is_ok(), "Should parse valid response: {:?}", result);
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.interval, 1800);
+    assert_eq!(parsed.peers, peer_data);
+    assert_eq!(parsed.min_interval, None);
+    assert_eq!(parsed.complete, None);
+    assert_eq!(parsed.incomplete, None);
+}
+
+#[test]
+fn parse_response_with_all_fields() {
+    // Response with all optional fields
+    // d8:completei10e10:incompletei5e8:intervali900e12:min intervali300e5:peers0:e
+    let response = b"d8:completei10e10:incompletei5e8:intervali900e12:min intervali300e5:peers0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_ok(), "Should parse response with all fields: {:?}", result);
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.interval, 900);
+    assert_eq!(parsed.min_interval, Some(300));
+    assert_eq!(parsed.complete, Some(10));
+    assert_eq!(parsed.incomplete, Some(5));
+    assert_eq!(parsed.peers, Vec::<u8>::new()); // Empty peers
+}
+
+#[test]
+fn parse_failure_reason_returns_error() {
+    // Tracker error response
+    // d14:failure reason22:torrent not registerede
+    // "failure reason" is 14 chars, "torrent not registered" is 22 chars
+    let response = b"d14:failure reason22:torrent not registerede";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerErrorResponse(msg)) => {
+            assert_eq!(msg, "torrent not registered");
+        }
+        other => panic!("Expected TrackerErrorResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_missing_interval_returns_error() {
+    // Response missing required interval field
+    // d5:peers0:e
+    let response = b"d5:peers0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("interval"), "Error should mention interval: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_missing_peers_returns_error() {
+    // Response missing required peers field
+    // d8:intervali1800ee
+    let response = b"d8:intervali1800ee";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("peers"), "Error should mention peers: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_interval_not_integer_returns_error() {
+    // Response with interval as string instead of integer
+    // d8:interval4:text5:peers0:e
+    let response = b"d8:interval4:text5:peers0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("interval"), "Error should mention interval: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_invalid_bencode_returns_error() {
+    // Not valid bencode at all
+    let response = b"this is not bencode";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("bencode"), "Error should mention bencode: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_not_dictionary_returns_error() {
+    // Valid bencode but not a dictionary
+    let response = b"li42ee"; // A list, not a dict
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("dictionary"), "Error should mention dictionary: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_format_peers() {
+    // Response with dictionary format peers (deprecated but valid)
+    // d8:intervali600e5:peersld2:ip9:127.0.0.14:porti6881eeee
+    let response = b"d8:intervali600e5:peersld2:ip9:127.0.0.14:porti6881eeee";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_ok(), "Should handle dictionary format peers: {:?}", result);
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.interval, 600);
+    // Peers should be the re-encoded list
+    assert!(!parsed.peers.is_empty());
+    // Verify it starts with 'l' (list marker)
+    assert_eq!(parsed.peers[0], b'l');
+}
+
+#[test]
+fn parse_negative_interval_returns_error() {
+    // Negative interval is invalid
+    let response = b"d8:intervali-100e5:peers0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("negative"), "Error should mention negative: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse about negative, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_peers_invalid_type_returns_error() {
+    // Peers field is an integer (invalid)
+    let response = b"d8:intervali1800e5:peersi42ee";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(msg.contains("peers"), "Error should mention peers: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_ignores_negative_optional_fields() {
+    // Optional fields with negative values should be treated as absent
+    let response = b"d8:completei-1e8:intervali1800e5:peers0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_ok());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.complete, None); // Negative, so treated as absent
+}
+
+#[test]
+fn parse_empty_failure_reason() {
+    // Empty failure reason string
+    let response = b"d14:failure reason0:e";
+
+    let result = parse_tracker_response(response);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerErrorResponse(msg)) => {
+            assert_eq!(msg, "");
+        }
+        other => panic!("Expected TrackerErrorResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn tracker_response_implements_debug() {
+    let response = TrackerResponse {
+        interval: 1800,
+        min_interval: Some(300),
+        peers: vec![1, 2, 3, 4, 5, 6],
+        complete: Some(10),
+        incomplete: Some(5),
+    };
+
+    let debug = format!("{:?}", response);
+    assert!(debug.contains("TrackerResponse"));
+    assert!(debug.contains("1800"));
+}
+
+#[test]
+fn tracker_response_implements_clone() {
+    let original = TrackerResponse {
+        interval: 600,
+        min_interval: None,
+        peers: vec![192, 168, 1, 1, 0x1A, 0xE1],
+        complete: None,
+        incomplete: None,
+    };
+
+    let cloned = original.clone();
+    assert_eq!(cloned, original);
+}
+@
