@@ -628,6 +628,582 @@ The design deliberately keeps the function simple and focused. We do not:
 This separation of concerns keeps the function testable and reusable across
 different contexts (normal download, resume verification, seeding validation).
 
+\subsection{Piece Manager}
+
+The [[PieceManager]] is the central coordinator for piece download state. While
+[[PieceState]] tracks the state of a single piece, the manager holds the state
+for all pieces in the torrent and provides methods to query and transition
+between states.
+
+The manager stores four essential pieces of information:
+\begin{description}
+\item[piece\_states] A vector of [[PieceState]] for each piece in the torrent.
+  This is the core state tracking structure.
+\item[piece\_length] The standard piece length from the torrent metadata. Most
+  pieces have this size, except possibly the last piece.
+\item[total\_length] The total content length of the torrent. Combined with
+  [[piece\_length]], this determines the size of the last piece.
+\item[piece\_hashes] The 20-byte SHA1 hashes for each piece, extracted from the
+  torrent metadata. Used for verification after downloading.
+\end{description}
+
+The manager deliberately does not handle networking or disk I/O---those are
+separate concerns handled by other components. This makes the manager easy to
+test and reason about: it is a pure state machine with well-defined transitions.
+
+<<piece manager>>=
+/// Central coordinator for piece download state.
+///
+/// PieceManager tracks the download state of all pieces in a torrent. It holds:
+/// - The state of each piece (Missing, InProgress, Verified, Failed)
+/// - Torrent geometry (piece_length, total_length, piece count)
+/// - Expected piece hashes for verification
+///
+/// # Responsibilities
+///
+/// The manager's sole responsibility is state tracking. It does NOT:
+/// - Handle network I/O (sending/receiving blocks)
+/// - Write data to disk
+/// - Manage peer connections
+///
+/// These concerns are handled by other components that use the manager to
+/// query and update piece state.
+///
+/// # Thread Safety
+///
+/// This struct is not thread-safe. In a multi-threaded context, wrap it in
+/// a `Mutex` or use message-passing to serialize access.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::PieceManager;
+///
+/// // Create a manager for a torrent with 3 pieces of 100 bytes each
+/// // (total 300 bytes, so last piece is also 100 bytes)
+/// let hashes: Vec<[u8; 20]> = vec![[0u8; 20]; 3];
+/// let manager = PieceManager::new(100, 300, hashes).unwrap();
+///
+/// assert_eq!(manager.num_pieces(), 3);
+/// assert!(manager.get_state(0).unwrap().is_missing());
+/// ```
+#[derive(Debug)]
+pub struct PieceManager {
+    /// State of each piece, indexed by piece number.
+    piece_states: Vec<PieceState>,
+
+    /// Standard piece length from torrent metadata (bytes).
+    piece_length: u32,
+
+    /// Total content length of the torrent (bytes).
+    total_length: u64,
+
+    /// SHA1 hashes for each piece, for verification.
+    piece_hashes: Vec<[u8; 20]>,
+}
+
+impl PieceManager {
+    /// Creates a new PieceManager for a torrent.
+    ///
+    /// Validates that the number of hashes matches the computed piece count
+    /// based on `piece_length` and `total_length`.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_length` - Standard piece length from torrent metadata
+    /// * `total_length` - Total content length in bytes
+    /// * `piece_hashes` - SHA1 hash for each piece (20 bytes each)
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(PieceManager)` if the hash count matches the computed piece count
+    /// * `Err(PieceError::InvalidPieceIndex)` if the hash count is wrong
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// // 1000 bytes with 256-byte pieces = 4 pieces
+    /// let hashes = vec![[0u8; 20]; 4];
+    /// let manager = PieceManager::new(256, 1000, hashes);
+    /// assert!(manager.is_ok());
+    /// ```
+    pub fn new(
+        piece_length: u32,
+        total_length: u64,
+        piece_hashes: Vec<[u8; 20]>,
+    ) -> Result<Self, PieceError> {
+        // Compute expected piece count using ceiling division
+        let expected_pieces = if total_length == 0 {
+            0
+        } else {
+            ((total_length + piece_length as u64 - 1) / piece_length as u64) as usize
+        };
+
+        if piece_hashes.len() != expected_pieces {
+            return Err(PieceError::InvalidPieceIndex {
+                index: piece_hashes.len() as u32,
+                num_pieces: expected_pieces as u32,
+            });
+        }
+
+        // Initialize all pieces as Missing
+        let piece_states = vec![PieceState::Missing; expected_pieces];
+
+        Ok(PieceManager {
+            piece_states,
+            piece_length,
+            total_length,
+            piece_hashes,
+        })
+    }
+
+    /// Returns the number of pieces in this torrent.
+    #[inline]
+    pub fn num_pieces(&self) -> u32 {
+        self.piece_states.len() as u32
+    }
+
+    /// Returns the standard piece length.
+    #[inline]
+    pub fn piece_length(&self) -> u32 {
+        self.piece_length
+    }
+
+    /// Returns the total content length.
+    #[inline]
+    pub fn total_length(&self) -> u64 {
+        self.total_length
+    }
+
+    /// Returns a reference to the state of a specific piece.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(&PieceState)` if the index is valid
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// let hashes = vec![[0u8; 20]; 3];
+    /// let manager = PieceManager::new(100, 300, hashes).unwrap();
+    ///
+    /// assert!(manager.get_state(0).is_ok());
+    /// assert!(manager.get_state(999).is_err());
+    /// ```
+    pub fn get_state(&self, piece_index: u32) -> Result<&PieceState, PieceError> {
+        self.piece_states
+            .get(piece_index as usize)
+            .ok_or_else(|| PieceError::invalid_index(piece_index, self.num_pieces()))
+    }
+
+    /// Returns the expected SHA1 hash for a piece.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(&[u8; 20])` if the index is valid
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    pub fn get_hash(&self, piece_index: u32) -> Result<&[u8; 20], PieceError> {
+        self.piece_hashes
+            .get(piece_index as usize)
+            .ok_or_else(|| PieceError::invalid_index(piece_index, self.num_pieces()))
+    }
+
+    /// Calculates the size of a specific piece.
+    ///
+    /// Most pieces have the standard `piece_length`, but the last piece may
+    /// be smaller if `total_length` is not evenly divisible.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(u32)` with the piece size in bytes
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    pub fn get_piece_size(&self, piece_index: u32) -> Result<u32, PieceError> {
+        if piece_index >= self.num_pieces() {
+            return Err(PieceError::invalid_index(piece_index, self.num_pieces()));
+        }
+        Ok(piece_size(
+            piece_index,
+            self.piece_length,
+            self.total_length,
+            self.num_pieces(),
+        ))
+    }
+
+    /// Starts downloading a piece, transitioning it to InProgress state.
+    ///
+    /// This method transitions a piece from Missing or Failed to InProgress.
+    /// It initializes the block tracking BitVec based on the piece size.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece to start
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the piece was successfully transitioned to InProgress
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    ///
+    /// # State Transitions
+    ///
+    /// * `Missing` -> `InProgress`: Normal case when starting a new piece
+    /// * `Failed` -> `InProgress`: Retry case after verification failure
+    /// * `InProgress` -> `InProgress`: No-op (already downloading)
+    /// * `Verified` -> Error: Cannot restart a verified piece
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// let hashes = vec![[0u8; 20]; 3];
+    /// let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+    ///
+    /// assert!(manager.get_state(0).unwrap().is_missing());
+    /// manager.start_piece(0).unwrap();
+    /// assert!(manager.get_state(0).unwrap().is_in_progress());
+    /// ```
+    pub fn start_piece(&mut self, piece_index: u32) -> Result<(), PieceError> {
+        if piece_index >= self.num_pieces() {
+            return Err(PieceError::invalid_index(piece_index, self.num_pieces()));
+        }
+
+        let idx = piece_index as usize;
+        let current = &self.piece_states[idx];
+
+        // Only transition from Missing or Failed
+        if current.is_verified() {
+            // Already verified, nothing to do (or could be an error)
+            return Ok(());
+        }
+
+        if current.is_in_progress() {
+            // Already in progress, nothing to do
+            return Ok(());
+        }
+
+        // Calculate number of blocks for this piece
+        let ps = self.get_piece_size(piece_index)?;
+        let num_blocks = blocks_per_piece(ps) as usize;
+
+        self.piece_states[idx] = PieceState::new_in_progress(num_blocks);
+        Ok(())
+    }
+
+    /// Marks a block as received within a piece.
+    ///
+    /// This method should be called when block data is received from a peer.
+    /// It updates the piece's block tracking BitVec.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    /// * `block_index` - The zero-based index of the block within the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if this was a new block (not previously received)
+    /// * `Ok(false)` if the block was already received (duplicate)
+    /// * `Err(PieceError::InvalidPieceIndex)` if the piece index is out of range
+    ///
+    /// # Note
+    ///
+    /// If the piece is not in InProgress state, returns `Ok(false)`.
+    /// This handles late-arriving blocks after verification/failure gracefully.
+    pub fn mark_block_received(
+        &mut self,
+        piece_index: u32,
+        block_index: usize,
+    ) -> Result<bool, PieceError> {
+        if piece_index >= self.num_pieces() {
+            return Err(PieceError::invalid_index(piece_index, self.num_pieces()));
+        }
+
+        let idx = piece_index as usize;
+        let was_new = self.piece_states[idx].mark_block_received(block_index);
+        Ok(was_new)
+    }
+
+    /// Checks if all blocks of a piece have been received.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if all blocks have been received
+    /// * `Ok(false)` if blocks are still missing or piece is not InProgress
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    pub fn all_blocks_received(&self, piece_index: u32) -> Result<bool, PieceError> {
+        let state = self.get_state(piece_index)?;
+        Ok(state.all_blocks_received())
+    }
+
+    /// Marks a piece as verified (hash matched).
+    ///
+    /// Call this after successfully verifying the piece's SHA1 hash.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the piece was successfully marked as verified
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    pub fn mark_verified(&mut self, piece_index: u32) -> Result<(), PieceError> {
+        if piece_index >= self.num_pieces() {
+            return Err(PieceError::invalid_index(piece_index, self.num_pieces()));
+        }
+
+        self.piece_states[piece_index as usize] = PieceState::Verified;
+        Ok(())
+    }
+
+    /// Marks a piece as failed (hash mismatch).
+    ///
+    /// Call this when piece verification fails. The piece can later be
+    /// restarted with `start_piece()`.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` if the piece was successfully marked as failed
+    /// * `Err(PieceError::InvalidPieceIndex)` if the index is out of range
+    pub fn mark_failed(&mut self, piece_index: u32) -> Result<(), PieceError> {
+        if piece_index >= self.num_pieces() {
+            return Err(PieceError::invalid_index(piece_index, self.num_pieces()));
+        }
+
+        self.piece_states[piece_index as usize] = PieceState::Failed;
+        Ok(())
+    }
+
+    /// Returns the number of verified pieces.
+    pub fn verified_count(&self) -> usize {
+        self.piece_states.iter().filter(|s| s.is_verified()).count()
+    }
+
+    /// Returns the number of pieces that need downloading (Missing or Failed).
+    pub fn pending_count(&self) -> usize {
+        self.piece_states.iter().filter(|s| s.needs_download()).count()
+    }
+
+    /// Returns true if all pieces are verified.
+    pub fn is_complete(&self) -> bool {
+        self.piece_states.iter().all(|s| s.is_verified())
+    }
+}
+@
+
+\subsubsection{PieceManager Tests}
+
+<<piece manager tests>>=
+#[test]
+fn piece_manager_new_creates_all_missing() {
+    let hashes = vec![[0u8; 20]; 5];
+    let manager = PieceManager::new(100, 500, hashes).unwrap();
+
+    assert_eq!(manager.num_pieces(), 5);
+    for i in 0..5 {
+        assert!(manager.get_state(i).unwrap().is_missing());
+    }
+}
+
+#[test]
+fn piece_manager_new_validates_hash_count() {
+    // 300 bytes with 100-byte pieces = 3 pieces, but we provide 4 hashes
+    let hashes = vec![[0u8; 20]; 4];
+    let result = PieceManager::new(100, 300, hashes);
+    assert!(result.is_err());
+}
+
+#[test]
+fn piece_manager_new_handles_partial_last_piece() {
+    // 250 bytes with 100-byte pieces = 3 pieces (100 + 100 + 50)
+    let hashes = vec![[0u8; 20]; 3];
+    let manager = PieceManager::new(100, 250, hashes).unwrap();
+
+    assert_eq!(manager.num_pieces(), 3);
+    assert_eq!(manager.get_piece_size(0).unwrap(), 100);
+    assert_eq!(manager.get_piece_size(1).unwrap(), 100);
+    assert_eq!(manager.get_piece_size(2).unwrap(), 50);
+}
+
+#[test]
+fn piece_manager_get_state_validates_index() {
+    let hashes = vec![[0u8; 20]; 3];
+    let manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    assert!(manager.get_state(0).is_ok());
+    assert!(manager.get_state(2).is_ok());
+    assert!(manager.get_state(3).is_err());
+    assert!(manager.get_state(100).is_err());
+}
+
+#[test]
+fn piece_manager_start_piece_transitions_to_in_progress() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    assert!(manager.get_state(1).unwrap().is_missing());
+    manager.start_piece(1).unwrap();
+    assert!(manager.get_state(1).unwrap().is_in_progress());
+
+    // Verify correct number of blocks
+    // 100 bytes / 16384 = 1 block (ceiling division)
+    assert_eq!(manager.get_state(1).unwrap().total_blocks(), Some(1));
+}
+
+#[test]
+fn piece_manager_start_piece_from_failed() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    // Simulate failed piece
+    manager.start_piece(0).unwrap();
+    manager.mark_failed(0).unwrap();
+    assert!(manager.get_state(0).unwrap().is_failed());
+
+    // Should be able to restart
+    manager.start_piece(0).unwrap();
+    assert!(manager.get_state(0).unwrap().is_in_progress());
+}
+
+#[test]
+fn piece_manager_start_piece_noop_on_verified() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    manager.mark_verified(0).unwrap();
+    manager.start_piece(0).unwrap(); // Should be no-op
+    assert!(manager.get_state(0).unwrap().is_verified());
+}
+
+#[test]
+fn piece_manager_mark_block_received_tracks_blocks() {
+    // Use larger piece to have multiple blocks
+    // 40000 bytes = 3 blocks (16384 + 16384 + 7232)
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(40000, 40000, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // First block should be new
+    assert!(manager.mark_block_received(0, 0).unwrap());
+    // Same block should be duplicate
+    assert!(!manager.mark_block_received(0, 0).unwrap());
+
+    // Second block should be new
+    assert!(manager.mark_block_received(0, 1).unwrap());
+
+    // Not all blocks received yet
+    assert!(!manager.all_blocks_received(0).unwrap());
+
+    // Third block completes the piece
+    assert!(manager.mark_block_received(0, 2).unwrap());
+    assert!(manager.all_blocks_received(0).unwrap());
+}
+
+#[test]
+fn piece_manager_mark_verified_transitions_state() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    manager.start_piece(1).unwrap();
+    manager.mark_verified(1).unwrap();
+
+    assert!(manager.get_state(1).unwrap().is_verified());
+    assert_eq!(manager.verified_count(), 1);
+}
+
+#[test]
+fn piece_manager_mark_failed_transitions_state() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    manager.start_piece(2).unwrap();
+    manager.mark_failed(2).unwrap();
+
+    assert!(manager.get_state(2).unwrap().is_failed());
+    assert!(manager.get_state(2).unwrap().needs_download());
+}
+
+#[test]
+fn piece_manager_completion_tracking() {
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    assert!(!manager.is_complete());
+    assert_eq!(manager.pending_count(), 3);
+    assert_eq!(manager.verified_count(), 0);
+
+    manager.mark_verified(0).unwrap();
+    assert!(!manager.is_complete());
+    assert_eq!(manager.pending_count(), 2);
+    assert_eq!(manager.verified_count(), 1);
+
+    manager.mark_verified(1).unwrap();
+    manager.mark_verified(2).unwrap();
+    assert!(manager.is_complete());
+    assert_eq!(manager.pending_count(), 0);
+    assert_eq!(manager.verified_count(), 3);
+}
+
+#[test]
+fn piece_manager_get_hash_returns_correct_hash() {
+    let hash0 = [0u8; 20];
+    let hash1 = [1u8; 20];
+    let hash2 = [2u8; 20];
+    let hashes = vec![hash0, hash1, hash2];
+    let manager = PieceManager::new(100, 300, hashes).unwrap();
+
+    assert_eq!(*manager.get_hash(0).unwrap(), hash0);
+    assert_eq!(*manager.get_hash(1).unwrap(), hash1);
+    assert_eq!(*manager.get_hash(2).unwrap(), hash2);
+    assert!(manager.get_hash(3).is_err());
+}
+
+#[test]
+fn piece_manager_empty_torrent() {
+    let hashes: Vec<[u8; 20]> = vec![];
+    let manager = PieceManager::new(100, 0, hashes).unwrap();
+
+    assert_eq!(manager.num_pieces(), 0);
+    assert!(manager.is_complete()); // No pieces means complete
+    assert_eq!(manager.verified_count(), 0);
+    assert_eq!(manager.pending_count(), 0);
+}
+
+#[test]
+fn piece_manager_implements_debug() {
+    let hashes = vec![[0u8; 20]; 2];
+    let manager = PieceManager::new(100, 200, hashes).unwrap();
+    let debug_str = format!("{:?}", manager);
+    assert!(debug_str.contains("PieceManager"));
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -676,6 +1252,8 @@ The pieces module combines the error types and helpers.
 
 <<piece verification>>
 
+<<piece manager>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +1274,8 @@ mod tests {
     <<piece error helper tests>>
 
     <<piece verification tests>>
+
+    <<piece manager tests>>
 }
 @
 
