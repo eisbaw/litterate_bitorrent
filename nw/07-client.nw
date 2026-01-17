@@ -3159,20 +3159,110 @@ pub async fn perform_handshake(
 
 <<keep-alive scheduling>>
 
-/// A simple wrapper around a peer connection.
+/// Represents a live connection to a peer.
 ///
-/// Currently holds the socket address and per-peer protocol state.
-/// In future tasks (task-0112), this will be expanded to include the
-/// actual TCP stream for communication.
-#[derive(Debug)]
+/// Encapsulates the TCP stream, peer identity, protocol state, and timing
+/// information for keep-alive and timeout management.
+///
+/// Note: Debug is implemented manually because TcpStream's Debug output
+/// is not particularly useful for logging.
 pub struct PeerConnection {
+    /// The TCP stream for communication with this peer.
+    pub stream: TcpStream,
+
     /// The socket address (IP:port) of this peer.
     pub addr: SocketAddr,
 
+    /// The peer's 20-byte peer_id from their handshake.
+    pub peer_id: [u8; 20],
+
     /// Per-peer protocol state (choke/interest state machine, bitfield).
     pub state: PeerState,
-    // Note: stream field will be added in task-0112 when we implement
-    // actual TCP connections
+
+    /// When we last received a message from this peer.
+    /// Used for idle timeout detection.
+    pub last_recv_time: Instant,
+
+    /// When we last sent a message to this peer.
+    /// Used for keep-alive scheduling.
+    pub last_send_time: Instant,
+}
+
+impl PeerConnection {
+    /// Creates a new PeerConnection from a completed handshake.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - The TCP stream (already connected and handshaked)
+    /// * `addr` - The peer's socket address
+    /// * `peer_handshake` - The handshake received from the peer
+    /// * `num_pieces` - Number of pieces in the torrent (for bitfield sizing)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::net::SocketAddr;
+    /// use std::time::Instant;
+    /// use tokio::net::TcpStream;
+    /// use literate_bittorrent::messages::Handshake;
+    /// use literate_bittorrent::client::PeerConnection;
+    ///
+    /// async fn example() {
+    ///     let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
+    ///     let stream = TcpStream::connect(addr).await.unwrap();
+    ///     let peer_handshake = Handshake::new([0xAB; 20], [0xCD; 20]);
+    ///
+    ///     let conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+    ///
+    ///     assert_eq!(conn.addr, addr);
+    ///     assert_eq!(conn.peer_id, *peer_handshake.peer_id());
+    /// }
+    /// ```
+    pub fn new(
+        stream: TcpStream,
+        addr: SocketAddr,
+        peer_handshake: &Handshake,
+        num_pieces: usize,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            stream,
+            addr,
+            peer_id: *peer_handshake.peer_id(),
+            state: PeerState::new(num_pieces as u32),
+            last_recv_time: now,
+            last_send_time: now,
+        }
+    }
+
+    /// Updates the last receive time to now.
+    ///
+    /// Call this whenever a message is received from the peer.
+    /// Used for idle timeout detection.
+    pub fn mark_received(&mut self) {
+        self.last_recv_time = Instant::now();
+    }
+
+    /// Updates the last send time to now.
+    ///
+    /// Call this whenever a message is sent to the peer.
+    /// Used for keep-alive scheduling.
+    pub fn mark_sent(&mut self) {
+        self.last_send_time = Instant::now();
+    }
+}
+
+impl std::fmt::Debug for PeerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConnection")
+            .field("addr", &self.addr)
+            .field("peer_id", &format_args!("{:02x?}", &self.peer_id[..8]))
+            .field("state", &self.state)
+            .field("last_recv_time", &self.last_recv_time)
+            .field("last_send_time", &self.last_send_time)
+            // Omit stream - it's not useful to print
+            .finish_non_exhaustive()
+    }
 }
 
 /// Manages the pool of active peer connections.
@@ -3387,26 +3477,29 @@ impl PeerConnectionManager {
         self.active_count() < self.max_connections && self.available_count() > 0
     }
 
-    /// Connects to a specific peer address.
+    /// Registers an established peer connection.
     ///
-    /// This is a placeholder implementation for task-0015. It creates
-    /// a `PeerConnection` with an initialized `PeerState` but does not
-    /// establish an actual TCP connection. The real TCP connection logic
-    /// will be implemented in task-0101/task-0112.
+    /// Call this after successfully connecting to a peer and completing
+    /// the handshake. The connection is stored and managed for message
+    /// exchange.
     ///
     /// # Arguments
     ///
-    /// * `addr` - The socket address to connect to
+    /// * `stream` - The TCP stream (already connected and handshaked)
+    /// * `addr` - The peer's socket address
+    /// * `peer_handshake` - The handshake received from the peer
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Connection was created successfully
+    /// * `Ok(())` - Connection was registered successfully
     /// * `Err(PeerError::AlreadyConnected)` - Already connected to this address
     ///
     /// # Example
     ///
     /// ```no_run
     /// use std::net::SocketAddr;
+    /// use tokio::net::TcpStream;
+    /// use literate_bittorrent::messages::Handshake;
     /// use literate_bittorrent::client::{PeerConnectionManager, DEFAULT_MAX_CONNECTIONS};
     ///
     /// async fn example() {
@@ -3418,23 +3511,28 @@ impl PeerConnectionManager {
     ///     );
     ///
     ///     let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-    ///     manager.connect_to_peer(addr).await.unwrap();
+    ///     let stream = TcpStream::connect(addr).await.unwrap();
+    ///     let peer_handshake = Handshake::new([0xBB; 20], [0xCC; 20]);
+    ///
+    ///     manager.register_connection(stream, addr, &peer_handshake).unwrap();
     ///
     ///     assert_eq!(manager.active_count(), 1);
     ///     assert!(manager.get_connection(&addr).is_some());
     /// }
     /// ```
-    pub async fn connect_to_peer(&mut self, addr: SocketAddr) -> Result<(), PeerError> {
+    pub fn register_connection(
+        &mut self,
+        stream: TcpStream,
+        addr: SocketAddr,
+        peer_handshake: &Handshake,
+    ) -> Result<(), PeerError> {
         // Check for duplicate connection
         if self.connections.contains_key(&addr) {
             return Err(PeerError::AlreadyConnected);
         }
 
-        // Create peer state with proper bitfield sizing
-        let state = PeerState::new(self.num_pieces as u32);
-
-        // Create the connection (TCP stream will be added in task-0112)
-        let conn = PeerConnection { addr, state };
+        // Create the connection from the handshake result
+        let conn = PeerConnection::new(stream, addr, peer_handshake, self.num_pieces);
 
         // Add to active connections
         self.connections.insert(addr, conn);
@@ -3491,6 +3589,38 @@ the connection pool and peer queues.
     // PeerConnectionManager Tests
     // ========================================================================
 
+    use tokio::net::TcpListener;
+
+    /// Creates a TCP stream pair for testing.
+    ///
+    /// Returns (client_stream, server_stream, client_addr).
+    /// The server_stream can be dropped if not needed.
+    async fn create_test_stream() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (client, server) = tokio::join!(
+            TcpStream::connect(addr),
+            listener.accept()
+        );
+
+        let client_stream = client.unwrap();
+        let (server_stream, _) = server.unwrap();
+
+        (client_stream, server_stream, addr)
+    }
+
+    /// Helper to register a test connection with a manager.
+    async fn register_test_connection(
+        manager: &mut PeerConnectionManager,
+        peer_id: [u8; 20],
+    ) -> SocketAddr {
+        let (stream, _server, addr) = create_test_stream().await;
+        let handshake = Handshake::new([0xBB; 20], peer_id);
+        manager.register_connection(stream, addr, &handshake).unwrap();
+        addr
+    }
+
     #[test]
     fn manager_new_creates_empty_manager() {
         let manager = PeerConnectionManager::new(
@@ -3543,8 +3673,8 @@ the connection pool and peer queues.
         assert_eq!(manager.available_count(), 1);
     }
 
-    #[test]
-    fn manager_active_count_tracks_connections() {
+    #[tokio::test]
+    async fn manager_active_count_tracks_connections() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3552,22 +3682,11 @@ the connection pool and peer queues.
             30,
         );
 
-        // Use a runtime for async
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        register_test_connection(&mut manager, [0x01; 20]).await;
+        assert_eq!(manager.active_count(), 1);
 
-        rt.block_on(async {
-            let addr1: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            let addr2: SocketAddr = "192.168.1.2:6881".parse().unwrap();
-
-            manager.connect_to_peer(addr1).await.unwrap();
-            assert_eq!(manager.active_count(), 1);
-
-            manager.connect_to_peer(addr2).await.unwrap();
-            assert_eq!(manager.active_count(), 2);
-        });
+        register_test_connection(&mut manager, [0x02; 20]).await;
+        assert_eq!(manager.active_count(), 2);
     }
 
     #[test]
@@ -3611,8 +3730,8 @@ the connection pool and peer queues.
         assert!(manager.needs_more_connections());
     }
 
-    #[test]
-    fn manager_needs_more_connections_false_when_at_max() {
+    #[tokio::test]
+    async fn manager_needs_more_connections_false_when_at_max() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3620,115 +3739,25 @@ the connection pool and peer queues.
             1, // Max 1 connection
         );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        // Add peers
+        manager.add_peers(vec![
+            "192.168.1.1:6881".parse().unwrap(),
+            "192.168.1.2:6881".parse().unwrap(),
+        ]);
 
-        rt.block_on(async {
-            // Add peers and connect to one
-            manager.add_peers(vec![
-                "192.168.1.1:6881".parse().unwrap(),
-                "192.168.1.2:6881".parse().unwrap(),
-            ]);
-            manager.connect_to_peer("192.168.1.1:6881".parse().unwrap()).await.unwrap();
+        // Register one connection
+        register_test_connection(&mut manager, [0x01; 20]).await;
 
-            // At max connections now
-            assert!(!manager.needs_more_connections());
+        // At max connections now
+        assert!(!manager.needs_more_connections());
 
-            // Note: available_count is still 2 because connect_to_peer doesn't
-            // consume from available_peers. But we're at max connections.
-            assert_eq!(manager.available_count(), 2);
-        });
-    }
-
-    #[test]
-    fn manager_get_connection_returns_connection() {
-        let mut manager = PeerConnectionManager::new(
-            [0xAA; 20],
-            [0xBB; 20],
-            100,
-            30,
-        );
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            manager.connect_to_peer(addr).await.unwrap();
-
-            let conn = manager.get_connection(&addr);
-            assert!(conn.is_some());
-            assert_eq!(conn.unwrap().addr, addr);
-
-            // Non-existent address
-            let other: SocketAddr = "192.168.1.2:6881".parse().unwrap();
-            assert!(manager.get_connection(&other).is_none());
-        });
-    }
-
-    #[test]
-    fn manager_get_connection_mut_allows_modification() {
-        let mut manager = PeerConnectionManager::new(
-            [0xAA; 20],
-            [0xBB; 20],
-            100,
-            30,
-        );
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            manager.connect_to_peer(addr).await.unwrap();
-
-            // Modify the peer state
-            let conn = manager.get_connection_mut(&addr).unwrap();
-            conn.state.peer_choking = false;
-
-            // Verify the change persisted
-            let conn = manager.get_connection(&addr).unwrap();
-            assert!(!conn.state.peer_choking);
-        });
-    }
-
-    #[test]
-    fn manager_remove_connection_removes_and_returns() {
-        let mut manager = PeerConnectionManager::new(
-            [0xAA; 20],
-            [0xBB; 20],
-            100,
-            30,
-        );
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            manager.connect_to_peer(addr).await.unwrap();
-            assert_eq!(manager.active_count(), 1);
-
-            let removed = manager.remove_connection(&addr);
-            assert!(removed.is_some());
-            assert_eq!(removed.unwrap().addr, addr);
-            assert_eq!(manager.active_count(), 0);
-
-            // Double remove returns None
-            assert!(manager.remove_connection(&addr).is_none());
-        });
+        // Note: available_count is still 2 because register_connection doesn't
+        // consume from available_peers. But we're at max connections.
+        assert_eq!(manager.available_count(), 2);
     }
 
     #[tokio::test]
-    async fn connect_to_peer_adds_connection() {
+    async fn manager_get_connection_returns_connection() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3736,12 +3765,75 @@ the connection pool and peer queues.
             30,
         );
 
-        let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-        manager.connect_to_peer(addr).await.unwrap();
+        let addr = register_test_connection(&mut manager, [0x01; 20]).await;
+
+        let conn = manager.get_connection(&addr);
+        assert!(conn.is_some());
+        assert_eq!(conn.unwrap().addr, addr);
+
+        // Non-existent address
+        let other: SocketAddr = "192.168.1.2:6881".parse().unwrap();
+        assert!(manager.get_connection(&other).is_none());
+    }
+
+    #[tokio::test]
+    async fn manager_get_connection_mut_allows_modification() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            100,
+            30,
+        );
+
+        let addr = register_test_connection(&mut manager, [0x01; 20]).await;
+
+        // Modify the peer state
+        let conn = manager.get_connection_mut(&addr).unwrap();
+        conn.state.peer_choking = false;
+
+        // Verify the change persisted
+        let conn = manager.get_connection(&addr).unwrap();
+        assert!(!conn.state.peer_choking);
+    }
+
+    #[tokio::test]
+    async fn manager_remove_connection_removes_and_returns() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            100,
+            30,
+        );
+
+        let addr = register_test_connection(&mut manager, [0x01; 20]).await;
+        assert_eq!(manager.active_count(), 1);
+
+        let removed = manager.remove_connection(&addr);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().addr, addr);
+        assert_eq!(manager.active_count(), 0);
+
+        // Double remove returns None
+        assert!(manager.remove_connection(&addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn register_connection_adds_connection() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            100,
+            30,
+        );
+
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xBB; 20], [0xCC; 20]);
+        manager.register_connection(stream, addr, &peer_handshake).unwrap();
 
         assert_eq!(manager.active_count(), 1);
         let conn = manager.get_connection(&addr).unwrap();
         assert_eq!(conn.addr, addr);
+        assert_eq!(conn.peer_id, [0xCC; 20]);
 
         // PeerState should be initialized correctly
         assert!(conn.state.am_choking);
@@ -3751,7 +3843,7 @@ the connection pool and peer queues.
     }
 
     #[tokio::test]
-    async fn connect_to_peer_rejects_duplicate() {
+    async fn register_connection_rejects_duplicate() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3759,11 +3851,13 @@ the connection pool and peer queues.
             30,
         );
 
-        let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-        manager.connect_to_peer(addr).await.unwrap();
+        let (stream1, _server1, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xBB; 20], [0xCC; 20]);
+        manager.register_connection(stream1, addr, &peer_handshake).unwrap();
 
-        // Try to connect again
-        let result = manager.connect_to_peer(addr).await;
+        // Try to register again with same addr
+        let (stream2, _server2, _) = create_test_stream().await;
+        let result = manager.register_connection(stream2, addr, &peer_handshake);
         assert!(matches!(result, Err(PeerError::AlreadyConnected)));
 
         // Still only one connection
@@ -3771,7 +3865,7 @@ the connection pool and peer queues.
     }
 
     #[tokio::test]
-    async fn connect_to_peer_initializes_bitfield_correctly() {
+    async fn register_connection_initializes_bitfield_correctly() {
         let num_pieces = 100;
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
@@ -3780,8 +3874,7 @@ the connection pool and peer queues.
             30,
         );
 
-        let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-        manager.connect_to_peer(addr).await.unwrap();
+        let addr = register_test_connection(&mut manager, [0x01; 20]).await;
 
         let conn = manager.get_connection(&addr).unwrap();
         // Bitfield should be sized for 100 pieces: ceil(100/8) = 13 bytes
@@ -3809,8 +3902,8 @@ the connection pool and peer queues.
         assert_eq!(manager.pop_available(), None);
     }
 
-    #[test]
-    fn manager_add_peers_skips_already_connected() {
+    #[tokio::test]
+    async fn manager_add_peers_skips_already_connected() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3818,25 +3911,17 @@ the connection pool and peer queues.
             30,
         );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let addr = register_test_connection(&mut manager, [0x01; 20]).await;
 
-        rt.block_on(async {
-            let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            manager.connect_to_peer(addr).await.unwrap();
+        // Try to add the connected address to available
+        manager.add_peers(vec![addr]);
 
-            // Try to add the connected address to available
-            manager.add_peers(vec![addr]);
-
-            // Should not be in available queue
-            assert_eq!(manager.available_count(), 0);
-        });
+        // Should not be in available queue
+        assert_eq!(manager.available_count(), 0);
     }
 
-    #[test]
-    fn manager_connections_iterator() {
+    #[tokio::test]
+    async fn manager_connections_iterator() {
         let mut manager = PeerConnectionManager::new(
             [0xAA; 20],
             [0xBB; 20],
@@ -3844,29 +3929,101 @@ the connection pool and peer queues.
             30,
         );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let addr1 = register_test_connection(&mut manager, [0x01; 20]).await;
+        let addr2 = register_test_connection(&mut manager, [0x02; 20]).await;
 
-        rt.block_on(async {
-            let addr1: SocketAddr = "192.168.1.1:6881".parse().unwrap();
-            let addr2: SocketAddr = "192.168.1.2:6881".parse().unwrap();
-
-            manager.connect_to_peer(addr1).await.unwrap();
-            manager.connect_to_peer(addr2).await.unwrap();
-
-            let addrs: Vec<_> = manager.connections().map(|(a, _)| *a).collect();
-            assert_eq!(addrs.len(), 2);
-            assert!(addrs.contains(&addr1));
-            assert!(addrs.contains(&addr2));
-        });
+        let addrs: Vec<_> = manager.connections().map(|(a, _)| *a).collect();
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&addr1));
+        assert!(addrs.contains(&addr2));
     }
 
     #[test]
     fn manager_default_constants() {
         assert_eq!(DEFAULT_MAX_CONNECTIONS, 30);
         assert_eq!(CONNECT_TIMEOUT_SECS, 10);
+    }
+
+    // ========================================================================
+    // PeerConnection Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn peer_connection_new_stores_peer_id() {
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+
+        let conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        assert_eq!(conn.peer_id, [0xBB; 20]);
+    }
+
+    #[tokio::test]
+    async fn peer_connection_new_initializes_state() {
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+
+        let conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        // Check initial state values (per BitTorrent protocol)
+        assert!(conn.state.am_choking);
+        assert!(!conn.state.am_interested);
+        assert!(conn.state.peer_choking);
+        assert!(!conn.state.peer_interested);
+
+        // Bitfield should be sized for 100 pieces
+        assert_eq!(conn.state.bitfield.len(), 13); // ceil(100/8)
+    }
+
+    #[tokio::test]
+    async fn peer_connection_new_initializes_timing() {
+        use std::time::Instant;
+
+        let before = Instant::now();
+
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+        let conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        let after = Instant::now();
+
+        // Timing should be set to now (between before and after)
+        assert!(conn.last_recv_time >= before);
+        assert!(conn.last_recv_time <= after);
+        assert!(conn.last_send_time >= before);
+        assert!(conn.last_send_time <= after);
+    }
+
+    #[tokio::test]
+    async fn peer_connection_mark_received_updates_time() {
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+        let mut conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        let before_mark = conn.last_recv_time;
+
+        // Small delay to ensure time difference
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        conn.mark_received();
+
+        assert!(conn.last_recv_time > before_mark);
+    }
+
+    #[tokio::test]
+    async fn peer_connection_mark_sent_updates_time() {
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+        let mut conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        let before_mark = conn.last_send_time;
+
+        // Small delay to ensure time difference
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        conn.mark_sent();
+
+        assert!(conn.last_send_time > before_mark);
     }
 
     // ========================================================================
