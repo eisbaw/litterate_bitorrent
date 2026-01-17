@@ -2888,10 +2888,31 @@ The connection map uses [[SocketAddr]] as the key because a peer is uniquely
 identified by their IP:port combination. Using [[SocketAddr]] also makes it
 trivial to detect duplicate connection attempts.
 
-\subsubsection{Constants}
+\subsubsection{Constants and Connection Utilities}
+
+Connection timeouts are essential for robustness in peer-to-peer networks.
+Without explicit timeouts, the operating system's default TCP connection
+timeout (often 2+ minutes on Linux) would cause the client to block indefinitely
+when attempting to connect to offline or firewalled peers.
+
+The [[connect\_with\_timeout]] function wraps [[TcpStream::connect]] with a
+10-second timeout as specified in the PRD. This timeout balances two concerns:
+
+\begin{enumerate}
+\item \textbf{Responsiveness}: We don't want to wait too long for unresponsive
+  peers when there are many other peers available in the swarm.
+\item \textbf{Reliability}: We don't want to give up too quickly on peers that
+  may simply be on high-latency networks. Ten seconds is sufficient for even
+  intercontinental connections.
+\end{enumerate}
+
+The function returns [[PeerError::Timeout]] when the timeout elapses and
+[[PeerError::IoError]] for immediate failures like connection refused.
 
 <<peer connection manager>>=
 use crate::messages::PeerError;
+use tokio::net::TcpStream;
+use tokio::time::timeout;
 
 /// Default maximum number of concurrent peer connections.
 ///
@@ -2909,6 +2930,60 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 30;
 /// If a peer doesn't respond within this time, the connection attempt
 /// fails with `PeerError::Timeout`. The PRD specifies 10 seconds.
 pub const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Establishes a TCP connection to a peer with timeout.
+///
+/// Uses a 10-second timeout to prevent hanging on unresponsive peers.
+/// The timeout is configurable via the `CONNECT_TIMEOUT_SECS` constant.
+///
+/// # Why Timeouts Matter
+///
+/// BitTorrent peers are unreliable by nature. A peer address from the tracker
+/// might be:
+/// - Offline (machine powered down)
+/// - Behind a firewall that drops packets silently
+/// - On a slow or congested network
+/// - Running but not accepting connections
+///
+/// Without a timeout, `TcpStream::connect` could block indefinitely waiting
+/// for a response that never comes. The OS typically has a very long default
+/// timeout (often 2+ minutes). A 10-second timeout is long enough for legitimate
+/// connections over slow networks but short enough to move on to other peers
+/// when one is unresponsive.
+///
+/// # Arguments
+///
+/// * `addr` - The socket address of the peer to connect to
+///
+/// # Returns
+///
+/// * `Ok(TcpStream)` - A connected TCP stream ready for the handshake
+/// * `Err(PeerError::Timeout)` - Connection not established within 10 seconds
+/// * `Err(PeerError::IoError)` - Other connection failures (refused, unreachable)
+///
+/// # Example
+///
+/// ```no_run
+/// use std::net::SocketAddr;
+/// use literate_bittorrent::client::connect_with_timeout;
+///
+/// async fn example() {
+///     let addr: SocketAddr = "192.168.1.1:6881".parse().unwrap();
+///     match connect_with_timeout(addr).await {
+///         Ok(stream) => println!("Connected to {}", addr),
+///         Err(e) => println!("Failed to connect: {}", e),
+///     }
+/// }
+/// ```
+pub async fn connect_with_timeout(addr: SocketAddr) -> Result<TcpStream, PeerError> {
+    let connect_timeout = Duration::from_secs(CONNECT_TIMEOUT_SECS);
+
+    match timeout(connect_timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(io_err)) => Err(PeerError::IoError(io_err)),
+        Err(_elapsed) => Err(PeerError::Timeout),
+    }
+}
 
 /// A simple wrapper around a peer connection.
 ///
@@ -3617,6 +3692,27 @@ the connection pool and peer queues.
     #[test]
     fn manager_default_constants() {
         assert_eq!(DEFAULT_MAX_CONNECTIONS, 30);
+        assert_eq!(CONNECT_TIMEOUT_SECS, 10);
+    }
+
+    // ========================================================================
+    // connect_with_timeout Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn connect_with_timeout_returns_error_for_refused() {
+        // Try to connect to a port that's not listening.
+        // Port 1 is a privileged port (tcpmux) that is almost never open.
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let result = connect_with_timeout(addr).await;
+
+        // Should fail with an I/O error (connection refused or similar)
+        assert!(matches!(result, Err(PeerError::IoError(_))));
+    }
+
+    #[test]
+    fn connect_with_timeout_uses_correct_timeout() {
+        // Verify the constant is set correctly as specified in the PRD
         assert_eq!(CONNECT_TIMEOUT_SECS, 10);
     }
 @
