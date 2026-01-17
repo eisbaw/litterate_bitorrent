@@ -1978,6 +1978,8 @@ The client module exports the [[Client]] struct and associated types.
 <<event loop tests>>
 
 <<event loop integration tests>>
+
+<<peer disconnect tests>>
 @
 
 \subsection{Testing}
@@ -7862,8 +7864,26 @@ replace them from the available peer queue:
 <<event loop>>=
 /// Handles peer disconnection.
 ///
-/// Removes the peer from active connections and attempts to replace them
-/// from the available peer pool.
+/// When a peer disconnects, we must:
+/// 1. Remove the peer from active connections
+/// 2. Update piece availability (peer no longer has those pieces)
+/// 3. Drain pending requests and attempt to reassign them to other peers
+/// 4. Signal need for replacement peers if possible
+/// 5. Handle the all-peers-disconnected case
+///
+/// # Request Reassignment
+///
+/// Pending block requests from the disconnected peer are not lost---we drain
+/// them from the queue and attempt to reassign each to an alternative peer
+/// that has the piece and is not choking us. If no alternative is available,
+/// the request is effectively lost, but the piece will be re-requested during
+/// normal download scheduling.
+///
+/// # All Peers Disconnected
+///
+/// When all peers disconnect, we log a warning and continue. The re-announce
+/// timer will fire and fetch fresh peers from the tracker. Downloads cannot
+/// proceed until new peers connect, but the event loop remains responsive.
 async fn handle_peer_disconnected(
     addr: SocketAddr,
     reason: &str,
@@ -7871,22 +7891,98 @@ async fn handle_peer_disconnected(
 ) -> EventLoopAction {
     info!(peer = %addr, reason = %reason, "peer disconnected");
 
-    // Remove from connection manager
+    // Remove from connection manager and update availability
     if let Some(conn) = ctx.connection_manager.remove_connection(&addr) {
         // Update availability - remove peer's pieces from global tracking
         ctx.availability.remove_peer_bitfield(&conn.state.bitfield);
     }
 
-    // Remove the peer's request queue
-    ctx.request_queues.remove(&addr);
+    // Drain pending requests before removing the queue
+    // We attempt to reassign each request to an alternative peer
+    let pending_requests: Vec<BlockRequest> = ctx.request_queues
+        .remove(&addr)
+        .map(|mut queue| queue.drain().map(|tr| tr.request).collect())
+        .unwrap_or_default();
 
-    // Try to replace with a new peer
-    // (Connection establishment is handled elsewhere, we just note we need more)
-    if ctx.connection_manager.needs_more_connections() {
+    let pending_count = pending_requests.len();
+    let mut reassigned_count = 0;
+
+    for request in pending_requests {
+        // Find an alternative peer that has this piece and isn't choking us
+        let alt_addr = find_alternative_peer(
+            request.piece_index,
+            addr,
+            ctx.connection_manager.connections_map(),
+        );
+
+        if let Some(alt_addr) = alt_addr {
+            debug!(
+                piece = request.piece_index,
+                offset = request.offset,
+                old_peer = %addr,
+                new_peer = %alt_addr,
+                "reassigning pending request after disconnect"
+            );
+
+            // Queue the request to the alternative peer
+            let alt_queue = ctx.request_queues.entry(alt_addr).or_insert_with(|| {
+                PeerRequestQueue::new(DEFAULT_MAX_PIPELINE_LENGTH)
+            });
+
+            let new_request = BlockRequest::new(
+                request.piece_index,
+                request.offset,
+                request.length,
+                ctx.our_peer_id,
+            );
+
+            if alt_queue.push(new_request.clone()) {
+                // Send the request message
+                if let Some(alt_conn) = ctx.connection_manager.get_connection_mut(&alt_addr) {
+                    let msg = Message::Request {
+                        index: new_request.piece_index,
+                        begin: new_request.offset,
+                        length: new_request.length,
+                    };
+                    if let Err(e) = write_message(&mut alt_conn.stream, &msg).await {
+                        debug!(peer = %alt_addr, error = %e, "failed to send reassigned request");
+                        // Remove from queue since we couldn't send
+                        alt_queue.remove(new_request.piece_index, new_request.offset);
+                    } else {
+                        alt_conn.mark_sent();
+                        reassigned_count += 1;
+                    }
+                }
+            }
+        }
+        // If no alternative found, the request is dropped but will be re-requested
+        // during normal scheduling when we have available peers
+    }
+
+    if pending_count > 0 {
         debug!(
-            active = ctx.connection_manager.active_count(),
-            available = ctx.connection_manager.available_count(),
-            "peer disconnected, should connect to more peers"
+            pending = pending_count,
+            reassigned = reassigned_count,
+            dropped = pending_count - reassigned_count,
+            "completed request cleanup after disconnect"
+        );
+    }
+
+    // Check connection status and log appropriately
+    let active_count = ctx.connection_manager.active_count();
+    let available_count = ctx.connection_manager.available_count();
+
+    if active_count == 0 {
+        // All peers disconnected - download stalls until re-announce
+        warn!(
+            available = available_count,
+            "all peers disconnected, waiting for re-announce to get new peers"
+        );
+    } else if ctx.connection_manager.needs_more_connections() {
+        debug!(
+            active = active_count,
+            available = available_count,
+            "peer disconnected, replacement available in pool"
         );
     }
 
@@ -8134,6 +8230,15 @@ connections map for the event loop:
 
 <<event loop connection manager extension>>=
 impl PeerConnectionManager {
+    /// Returns a reference to the internal connections map.
+    ///
+    /// This is used by the event loop to find alternative peers for
+    /// reassigning block requests. The method provides read-only access
+    /// for querying peer state without modifying connections.
+    pub(crate) fn connections_map(&self) -> &HashMap<SocketAddr, PeerConnection> {
+        &self.connections
+    }
+
     /// Returns a mutable reference to the internal connections map.
     ///
     /// This is used by the event loop to read from multiple peer streams
@@ -8248,6 +8353,408 @@ mod event_loop_integration_tests {
 
         // The event loop should detect shutdown immediately
         assert!(shutdown.is_shutdown_requested());
+    }
+}
+@
+
+\subsection{Peer Disconnect Tests}
+
+Tests for peer disconnect handling verify complete cleanup:
+
+<<peer disconnect tests>>=
+#[cfg(test)]
+mod peer_disconnect_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+    use crate::messages::Handshake;
+    use crate::pieces::BlockRequest;
+
+    /// Helper to create a test TCP stream pair.
+    async fn create_test_stream() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (client, server) = tokio::join!(
+            TcpStream::connect(addr),
+            listener.accept()
+        );
+
+        let client_stream = client.unwrap();
+        let (server_stream, _) = server.unwrap();
+
+        (client_stream, server_stream, addr)
+    }
+
+    /// Helper to register a test peer connection.
+    async fn register_test_peer(
+        manager: &mut PeerConnectionManager,
+        peer_id: [u8; 20],
+        has_piece: Option<u32>,
+        peer_choking: bool,
+    ) -> SocketAddr {
+        let (stream, _server, addr) = create_test_stream().await;
+        let handshake = Handshake::new([0xBB; 20], peer_id);
+        manager.register_connection(stream, addr, &handshake).unwrap();
+
+        // Set up piece availability and choking state
+        if let Some(conn) = manager.get_connection_mut(&addr) {
+            if let Some(piece_idx) = has_piece {
+                conn.state.set_piece(piece_idx);
+            }
+            conn.state.peer_choking = peer_choking;
+        }
+
+        addr
+    }
+
+    #[test]
+    fn peer_request_queue_drain_returns_all_requests() {
+        let mut queue = PeerRequestQueue::new(10);
+        let peer_id = *b"-LB0001-test12345678";
+
+        // Add some requests
+        queue.push(BlockRequest::new(0, 0, 16384, peer_id));
+        queue.push(BlockRequest::new(0, 16384, 16384, peer_id));
+        queue.push(BlockRequest::new(1, 0, 16384, peer_id));
+
+        assert_eq!(queue.len(), 3);
+
+        // Drain all requests
+        let drained: Vec<_> = queue.drain().collect();
+
+        assert_eq!(drained.len(), 3);
+        assert!(queue.is_empty());
+
+        // Verify request contents
+        assert_eq!(drained[0].request.piece_index, 0);
+        assert_eq!(drained[0].request.offset, 0);
+        assert_eq!(drained[1].request.piece_index, 0);
+        assert_eq!(drained[1].request.offset, 16384);
+        assert_eq!(drained[2].request.piece_index, 1);
+        assert_eq!(drained[2].request.offset, 0);
+    }
+
+    #[test]
+    fn peer_request_queue_drain_on_empty_returns_nothing() {
+        let mut queue = PeerRequestQueue::new(10);
+
+        let drained: Vec<_> = queue.drain().collect();
+
+        assert!(drained.is_empty());
+        assert!(queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_manager_connections_map_provides_read_access() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        let addr = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+
+        // Use connections_map for read access
+        let map = manager.connections_map();
+        assert!(map.contains_key(&addr));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_alternative_peer_excludes_disconnected_peer() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        // Create two peers with piece 0
+        let addr1 = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+        let addr2 = register_test_peer(&mut manager, [0x02; 20], Some(0), false).await;
+
+        // Find alternative excluding addr1 should return addr2
+        let alt = find_alternative_peer(0, addr1, manager.connections_map());
+        assert!(alt.is_some());
+        assert_eq!(alt.unwrap(), addr2);
+
+        // Find alternative excluding addr2 should return addr1
+        let alt = find_alternative_peer(0, addr2, manager.connections_map());
+        assert!(alt.is_some());
+        assert_eq!(alt.unwrap(), addr1);
+    }
+
+    #[tokio::test]
+    async fn find_alternative_peer_returns_none_when_only_peer() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        // Create single peer with piece 0
+        let addr = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+
+        // Find alternative excluding the only peer should return None
+        let alt = find_alternative_peer(0, addr, manager.connections_map());
+        assert!(alt.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_alternative_peer_skips_choking_peers() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        // Create one unchoked and one choking peer with piece 0
+        let unchoked_addr = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+        let _choking_addr = register_test_peer(&mut manager, [0x02; 20], Some(0), true).await;
+
+        // Find alternative excluding neither - should return unchoked peer
+        let dummy_exclude: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let alt = find_alternative_peer(0, dummy_exclude, manager.connections_map());
+        assert!(alt.is_some());
+        assert_eq!(alt.unwrap(), unchoked_addr);
+
+        // Excluding unchoked peer should return None (choking peer not eligible)
+        let alt = find_alternative_peer(0, unchoked_addr, manager.connections_map());
+        assert!(alt.is_none(), "Choking peer should not be returned as alternative");
+    }
+
+    #[tokio::test]
+    async fn find_alternative_peer_skips_peers_without_piece() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        // Create peer with piece 0 and peer with piece 1
+        let has_piece0 = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+        let _has_piece1 = register_test_peer(&mut manager, [0x02; 20], Some(1), false).await;
+
+        // Find alternative for piece 0 excluding has_piece0 - should return None
+        let alt = find_alternative_peer(0, has_piece0, manager.connections_map());
+        assert!(alt.is_none(), "Peer without the piece should not be returned");
+    }
+
+    #[tokio::test]
+    async fn disconnect_cleanup_removes_connection_from_manager() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        let addr = register_test_peer(&mut manager, [0x01; 20], None, false).await;
+        assert_eq!(manager.active_count(), 1);
+
+        // Simulate disconnect by removing connection
+        let removed = manager.remove_connection(&addr);
+        assert!(removed.is_some());
+        assert_eq!(manager.active_count(), 0);
+
+        // Verify peer is gone
+        assert!(manager.get_connection(&addr).is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_cleanup_removes_request_queue() {
+        let addr: SocketAddr = "127.0.0.1:6881".parse().unwrap();
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Create a queue with some requests
+        let mut queue = PeerRequestQueue::new(10);
+        let peer_id = *b"-LB0001-test12345678";
+        queue.push(BlockRequest::new(0, 0, 16384, peer_id));
+        queue.push(BlockRequest::new(0, 16384, 16384, peer_id));
+        request_queues.insert(addr, queue);
+
+        assert!(request_queues.contains_key(&addr));
+        assert_eq!(request_queues.get(&addr).unwrap().len(), 2);
+
+        // Remove and drain queue
+        let removed = request_queues.remove(&addr);
+        assert!(removed.is_some());
+
+        let mut queue = removed.unwrap();
+        let drained: Vec<_> = queue.drain().collect();
+        assert_eq!(drained.len(), 2);
+
+        // Verify queue is gone
+        assert!(!request_queues.contains_key(&addr));
+    }
+
+    #[test]
+    fn needs_more_connections_true_when_pool_available() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            30, // Max 30 connections
+        );
+
+        // No available peers yet
+        assert!(!manager.needs_more_connections());
+
+        // Add some available peers
+        manager.add_peers(vec![
+            "192.168.1.1:6881".parse().unwrap(),
+            "192.168.1.2:6881".parse().unwrap(),
+        ]);
+
+        // Now we need and can connect more
+        assert!(manager.needs_more_connections());
+    }
+
+    #[tokio::test]
+    async fn all_peers_disconnected_leaves_manager_empty() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+
+        // Connect two peers
+        let addr1 = register_test_peer(&mut manager, [0x01; 20], None, false).await;
+        let addr2 = register_test_peer(&mut manager, [0x02; 20], None, false).await;
+        assert_eq!(manager.active_count(), 2);
+
+        // Disconnect both
+        manager.remove_connection(&addr1);
+        assert_eq!(manager.active_count(), 1);
+
+        manager.remove_connection(&addr2);
+        assert_eq!(manager.active_count(), 0);
+
+        // Verify no peers remain
+        assert!(manager.connections_map().is_empty());
+    }
+
+    /// Integration test: simulate disconnect with request reassignment.
+    ///
+    /// This test verifies that when a peer disconnects with pending requests,
+    /// those requests are drained and can be reassigned to an alternative peer.
+    #[tokio::test]
+    async fn disconnect_with_pending_requests_allows_reassignment() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            DEFAULT_MAX_CONNECTIONS,
+        );
+        let mut request_queues: HashMap<SocketAddr, PeerRequestQueue> = HashMap::new();
+
+        // Create two peers with piece 0
+        let peer1_addr = register_test_peer(&mut manager, [0x01; 20], Some(0), false).await;
+        let peer2_addr = register_test_peer(&mut manager, [0x02; 20], Some(0), false).await;
+
+        // Queue requests to peer1
+        let peer_id = *b"-LB0001-test12345678";
+        let mut queue1 = PeerRequestQueue::new(10);
+        queue1.push(BlockRequest::new(0, 0, 16384, peer_id));
+        queue1.push(BlockRequest::new(0, 16384, 16384, peer_id));
+        request_queues.insert(peer1_addr, queue1);
+
+        // Verify initial state
+        assert_eq!(manager.active_count(), 2);
+        assert!(request_queues.contains_key(&peer1_addr));
+        assert_eq!(request_queues.get(&peer1_addr).unwrap().len(), 2);
+
+        // Simulate disconnect: drain peer1's requests
+        let pending_requests: Vec<BlockRequest> = request_queues
+            .remove(&peer1_addr)
+            .map(|mut queue| queue.drain().map(|tr| tr.request).collect())
+            .unwrap_or_default();
+
+        // Verify requests were drained
+        assert_eq!(pending_requests.len(), 2);
+        assert!(!request_queues.contains_key(&peer1_addr));
+
+        // Remove peer1 from connection manager
+        manager.remove_connection(&peer1_addr);
+        assert_eq!(manager.active_count(), 1);
+
+        // Find alternative peer for reassignment
+        for request in pending_requests {
+            let alt_addr = find_alternative_peer(
+                request.piece_index,
+                peer1_addr,
+                manager.connections_map(),
+            );
+
+            // Peer2 should be available for reassignment
+            assert!(alt_addr.is_some(), "Should find alternative peer");
+            assert_eq!(alt_addr.unwrap(), peer2_addr);
+
+            // Queue to alternative peer
+            let alt_queue = request_queues.entry(alt_addr.unwrap()).or_insert_with(|| {
+                PeerRequestQueue::new(10)
+            });
+            let new_request = BlockRequest::new(
+                request.piece_index,
+                request.offset,
+                request.length,
+                peer_id,
+            );
+            assert!(alt_queue.push(new_request));
+        }
+
+        // Verify peer2 now has the reassigned requests
+        assert!(request_queues.contains_key(&peer2_addr));
+        assert_eq!(request_queues.get(&peer2_addr).unwrap().len(), 2);
+
+        // Verify peer2 connection is still active
+        assert!(manager.get_connection(&peer2_addr).is_some());
+    }
+
+    /// Integration test: all peers disconnect leaves pool available for reconnection.
+    ///
+    /// When all peers disconnect, the available peer pool should still be
+    /// accessible for the connection manager to use when re-announce provides
+    /// fresh peers.
+    #[tokio::test]
+    async fn all_peers_disconnect_maintains_available_pool() {
+        let mut manager = PeerConnectionManager::new(
+            [0xAA; 20],
+            [0xBB; 20],
+            10,
+            30, // Max connections
+        );
+
+        // Add some available peers to the pool
+        manager.add_peers(vec![
+            "192.168.1.1:6881".parse().unwrap(),
+            "192.168.1.2:6881".parse().unwrap(),
+        ]);
+        assert_eq!(manager.available_count(), 2);
+
+        // Connect one peer
+        let addr = register_test_peer(&mut manager, [0x01; 20], None, false).await;
+        assert_eq!(manager.active_count(), 1);
+
+        // Disconnect the peer
+        manager.remove_connection(&addr);
+        assert_eq!(manager.active_count(), 0);
+
+        // Available pool should still have peers
+        assert_eq!(manager.available_count(), 2);
+
+        // Manager should signal it needs more connections
+        assert!(manager.needs_more_connections());
+
+        // Pop an available peer for reconnection
+        let next_peer = manager.pop_available();
+        assert!(next_peer.is_some());
+        assert_eq!(manager.available_count(), 1);
     }
 }
 @
