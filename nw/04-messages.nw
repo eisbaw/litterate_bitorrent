@@ -619,6 +619,8 @@ impl Handshake {
     pub fn reserved(&self) -> [u8; 8] {
         [0u8; 8]
     }
+
+    <<handshake to_bytes>>
 }
 @
 
@@ -628,6 +630,83 @@ would indicate a likely bug (why create a handshake and ignore its fields?).
 Note that [[new]] takes ownership of the arrays rather than references. Since
 [[u8; 20]]] is [[Copy]], there's no performance difference, and taking ownership
 is clearer---the handshake owns its data.
+
+\subsubsection{Handshake Serialization}
+
+To transmit a handshake over the wire, we must serialize it to exactly 68 bytes.
+Unlike the length-prefixed messages that follow, the handshake has no length
+field---the receiver must read exactly 68 bytes and validate them.
+
+The serialization is straightforward: concatenate the five fields in order.
+We use a fixed-size array [[u8; 68]]] rather than a [[Vec<u8>]] because:
+
+\begin{itemize}
+\item The size is known at compile time, eliminating heap allocation
+\item The type system enforces correctness---we cannot accidentally produce
+  a buffer of the wrong size
+\item Fixed-size arrays are efficient to copy and can be passed by value
+\end{itemize}
+
+<<handshake to_bytes>>=
+/// Serializes this handshake to its 68-byte wire format.
+///
+/// The returned array contains:
+/// - Byte 0: protocol string length (19)
+/// - Bytes 1-19: protocol string ("BitTorrent protocol")
+/// - Bytes 20-27: reserved bytes (8 zeros)
+/// - Bytes 28-47: info_hash (20 bytes)
+/// - Bytes 48-67: peer_id (20 bytes)
+///
+/// This format matches BEP 3 exactly. The handshake can be written directly
+/// to a TCP socket.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::Handshake;
+///
+/// let info_hash = [0xAB; 20];
+/// let peer_id = *b"-LB0001-123456789012";
+/// let hs = Handshake::new(info_hash, peer_id);
+///
+/// let bytes = hs.to_bytes();
+/// assert_eq!(bytes.len(), 68);
+/// assert_eq!(bytes[0], 19); // pstrlen
+/// assert_eq!(&bytes[1..20], b"BitTorrent protocol");
+/// assert_eq!(&bytes[28..48], &info_hash);
+/// assert_eq!(&bytes[48..68], &peer_id);
+/// ```
+#[must_use]
+pub fn to_bytes(&self) -> [u8; HANDSHAKE_LENGTH] {
+    let mut buf = [0u8; HANDSHAKE_LENGTH];
+
+    // Byte 0: protocol string length
+    buf[0] = 19;
+
+    // Bytes 1-19: protocol string
+    buf[1..20].copy_from_slice(PROTOCOL_STRING);
+
+    // Bytes 20-27: reserved (already zeros from initialization)
+    // No action needed since we initialized with zeros
+
+    // Bytes 28-47: info_hash
+    buf[28..48].copy_from_slice(&self.info_hash);
+
+    // Bytes 48-67: peer_id
+    buf[48..68].copy_from_slice(&self.peer_id);
+
+    buf
+}
+@
+
+The implementation uses array slicing with [[copy_from_slice]], which is both
+safe and efficient. The compiler can verify that our slice ranges match the
+source array sizes, catching off-by-one errors at compile time.
+
+Note that we initialize the buffer with zeros, which automatically handles
+the reserved bytes (positions 20-27). This is a common pattern: zero-initialize
+and then fill in the non-zero parts. If we ever support protocol extensions
+that use the reserved bytes, we would add logic here to set specific bits.
 
 \subsubsection{Handshake Tests}
 
@@ -700,6 +779,8 @@ fn handshake_debug_output() {
     assert!(debug.contains("info_hash"));
     assert!(debug.contains("peer_id"));
 }
+
+<<handshake serialization tests>>
 @
 
 These tests verify:
@@ -713,11 +794,126 @@ These tests verify:
 \item Debug output is reasonable
 \end{itemize}
 
+\subsubsection{Handshake Serialization Tests}
+
+The serialization tests verify that [[to_bytes]] produces the exact wire format
+specified by BEP 3. We test both the overall structure and individual byte
+positions to ensure protocol compliance.
+
+<<handshake serialization tests>>=
+#[test]
+fn to_bytes_returns_68_bytes() {
+    let hs = Handshake::new([0; 20], [0; 20]);
+    let bytes = hs.to_bytes();
+    assert_eq!(bytes.len(), HANDSHAKE_LENGTH);
+    assert_eq!(bytes.len(), 68);
+}
+
+#[test]
+fn to_bytes_has_correct_layout() {
+    // Use distinctive values so we can verify positioning
+    let info_hash: [u8; 20] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+        0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
+    ];
+    let peer_id: [u8; 20] = [
+        0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA,
+        0xAB, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4,
+    ];
+    let hs = Handshake::new(info_hash, peer_id);
+    let bytes = hs.to_bytes();
+
+    // Byte 0: pstrlen = 19
+    assert_eq!(bytes[0], 19, "pstrlen should be 19");
+
+    // Bytes 1-19: "BitTorrent protocol"
+    assert_eq!(
+        &bytes[1..20],
+        b"BitTorrent protocol",
+        "pstr should be 'BitTorrent protocol'"
+    );
+
+    // Bytes 20-27: reserved (zeros)
+    assert_eq!(
+        &bytes[20..28],
+        &[0u8; 8],
+        "reserved bytes should be zeros"
+    );
+
+    // Bytes 28-47: info_hash
+    assert_eq!(
+        &bytes[28..48],
+        &info_hash,
+        "info_hash should match input"
+    );
+
+    // Bytes 48-67: peer_id
+    assert_eq!(
+        &bytes[48..68],
+        &peer_id,
+        "peer_id should match input"
+    );
+}
+
+#[test]
+fn to_bytes_round_trip() {
+    // Test that serialization is deterministic and contains the correct data.
+    // We parse the bytes back manually (since from_bytes is in a separate task)
+    // to verify round-trip correctness.
+    let info_hash = *b"AAAABBBBCCCCDDDDEEEE";
+    let peer_id = *b"-LB0001-TESTPEERIDNN";
+
+    let hs = Handshake::new(info_hash, peer_id);
+    let bytes = hs.to_bytes();
+
+    // Extract fields from serialized bytes
+    let extracted_pstrlen = bytes[0];
+    let extracted_pstr = &bytes[1..20];
+    let extracted_reserved = &bytes[20..28];
+    let extracted_info_hash: [u8; 20] = bytes[28..48].try_into().unwrap();
+    let extracted_peer_id: [u8; 20] = bytes[48..68].try_into().unwrap();
+
+    // Verify fixed fields
+    assert_eq!(extracted_pstrlen, 19);
+    assert_eq!(extracted_pstr, PROTOCOL_STRING);
+    assert_eq!(extracted_reserved, &[0u8; 8]);
+
+    // Verify variable fields match original
+    assert_eq!(extracted_info_hash, info_hash);
+    assert_eq!(extracted_peer_id, peer_id);
+
+    // Create a new handshake from extracted fields and verify equality
+    let reconstructed = Handshake::new(extracted_info_hash, extracted_peer_id);
+    assert_eq!(hs, reconstructed);
+}
+
+#[test]
+fn to_bytes_deterministic() {
+    // Calling to_bytes multiple times should produce identical output
+    let hs = Handshake::new([0xFF; 20], [0x00; 20]);
+    let bytes1 = hs.to_bytes();
+    let bytes2 = hs.to_bytes();
+    assert_eq!(bytes1, bytes2);
+}
+@
+
+The [[to_bytes_has_correct_layout]] test is the most important: it verifies
+each byte range in the output matches the BEP 3 specification. The test uses
+distinctive values (sequential bytes for info\_hash, different sequence for
+peer\_id) so that any byte-swapping or offset errors would be immediately
+visible.
+
+The [[to_bytes_round_trip]] test manually extracts fields from the serialized
+bytes and verifies they match the original. This is a partial round-trip test;
+the full round-trip (using [[from_bytes]]) will be tested once that method is
+implemented in a later task.
+
 \subsection{Next Steps}
 
-With the handshake struct defined, the messages module is ready for:
+With the handshake struct and serialization complete, the messages module is
+ready for:
 \begin{enumerate}
-\item Handshake serialization (to bytes) and deserialization (from bytes)
+\item Handshake deserialization (from bytes) with validation
 \item Message enum with the nine message types (keep-alive through cancel)
 \item Length-prefix framing helpers for reading/writing messages
 \end{enumerate}
