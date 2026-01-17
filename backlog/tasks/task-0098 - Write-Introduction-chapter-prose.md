@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:33'
-updated_date: '2026-01-17 23:41'
+updated_date: '2026-01-17 23:46'
 labels: []
 dependencies: []
 priority: high
@@ -38,22 +38,9 @@ The Introduction is the reader's first contact with the project. It must answer 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Expanded Introduction section in nw/00-main.nw with:
-
-- "What is BitTorrent?" subsection explaining:
-  - The problem with traditional client-server downloads
-  - The BitTorrent solution (peer-to-peer distribution)
-  - Four key concepts: Pieces, Swarms, Seeders/Leechers, Trackers
-  - Why BitTorrent succeeds (no single point of failure, scalability, incentives, verification)
-
-- "How BitTorrent Works" subsection with:
-  - TikZ diagram showing tracker, swarm of peers, torrent file, and data flow
-  - Step-by-step explanation of the download lifecycle (parse torrent, announce, receive peers, exchange pieces)
-
-- Rewritten "Document Roadmap" subsection with brief descriptions of all 8 chapters plus appendix
-
-Technical changes:
-- Added TikZ package to document preamble with positioning, arrows, shapes, fit, and backgrounds libraries
-- Verified with just tangle (Rust extraction works)
-- Verified with just weave (PDF generates successfully, 634 pages)
+Added comprehensive Introduction chapter:
+- "What is BitTorrent?" explaining pieces, swarms, seeders/leechers, trackers
+- TikZ protocol diagram showing data flow
+- Document roadmap covering all 8 chapters plus appendix
+- Fixed diagram per MPED review: parse arrow correctly shows client parsing locally
 <!-- SECTION:NOTES:END -->

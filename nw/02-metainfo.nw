@@ -3,43 +3,251 @@
 
 \section{Metainfo Files}
 
-A \texttt{.torrent} file, also called a \emph{metainfo} file, contains all the
-information needed to download a torrent: where to find peers (the tracker URL),
-how to verify downloaded data (piece hashes), and what files comprise the torrent.
-The entire file is bencoded, making our decoder from the previous chapter the
-foundation for this one.
+When you download a torrent, you don't start with the actual content---you start
+with a small \texttt{.torrent} file, typically just a few kilobytes. This file,
+formally called a \emph{metainfo} file, is the blueprint for the entire download.
+It tells your client where to find other peers, what files you're downloading,
+how large they are, and crucially, how to verify that every byte you receive
+is authentic.
 
-\subsection{The Metainfo Structure}
+The metainfo file is bencoded, making our decoder from the previous chapter the
+foundation for this one. Understanding the metainfo structure is essential because
+it defines the ``contract'' between all peers sharing a torrent. Every client
+that joins the swarm must interpret this file identically, or the swarm fragments.
 
-At the top level, a metainfo file is a bencoded dictionary with two required keys:
+\subsection{Why Metainfo Matters}
+
+Before examining the structure, consider what problems the metainfo file solves:
+
+\begin{enumerate}
+\item \textbf{Discovery}: How do peers find each other? The metainfo contains
+  the tracker URL---a coordination server that maintains a list of peers.
+
+\item \textbf{Identity}: How do we know two clients are sharing the same content?
+  The \emph{info hash}---a SHA1 hash of part of the metainfo---serves as a
+  globally unique identifier. Clients with the same info hash are sharing the
+  same torrent.
+
+\item \textbf{Integrity}: How do we verify downloaded data isn't corrupted or
+  malicious? The metainfo contains SHA1 hashes of every piece. Each downloaded
+  piece is hashed and compared; mismatches are rejected and re-downloaded.
+
+\item \textbf{Structure}: What exactly are we downloading? The metainfo describes
+  the files---their names, sizes, and how they map to pieces.
+\end{enumerate}
+
+These four concerns---discovery, identity, integrity, and structure---are all
+encoded in a single bencoded dictionary.
+
+\subsection{Top-Level Structure}
+
+At the top level, a metainfo file is a bencoded dictionary. The BitTorrent
+Enhancement Proposal 3 (BEP 3) defines two required keys:
 
 \begin{description}
-\item[announce] A string containing the tracker URL. Peers register with this
-  URL to discover each other.
-\item[info] A dictionary containing metadata about the torrent's content,
-  including file names, sizes, piece length, and piece hashes.
+\item[announce] A UTF-8 string containing the tracker's announce URL. This is
+  where peers register themselves and discover other peers. Common protocols
+  are HTTP (\texttt{http://...}) and UDP (\texttt{udp://...}).
+
+\item[info] A dictionary containing all metadata about the torrent's content.
+  This includes file names, sizes, piece length, and the concatenated SHA1
+  hashes of all pieces. The \texttt{info} dictionary is special---more on
+  this shortly.
 \end{description}
 
-The \texttt{info} dictionary is special: its bencoded form is hashed with SHA1
-to produce the \emph{info hash}, a 20-byte identifier that uniquely identifies
-this torrent across the entire BitTorrent network. Every peer sharing this
-content uses the same info hash.
+Optional keys include \texttt{announce-list} (for multiple trackers),
+\texttt{creation date}, \texttt{comment}, \texttt{created by}, and
+\texttt{encoding}. Our implementation focuses on the required fields;
+optional fields can be added later without changing the core parsing logic.
+
+\subsection{The Info Dictionary: Heart of the Torrent}
+
+The \texttt{info} dictionary is the most important part of the metainfo file.
+It contains everything needed to download and verify the content:
+
+\begin{description}
+\item[name] A UTF-8 string suggesting a filename (for single-file torrents) or
+  directory name (for multi-file torrents). Clients may use this as the default
+  save location, though users can override it.
+
+\item[piece length] An integer specifying the size of each piece in bytes.
+  Pieces are the fundamental unit of transfer and verification in BitTorrent.
+  Common values are powers of two: 256 KiB (262144), 512 KiB, 1 MiB, 2 MiB,
+  or 4 MiB. Larger pieces mean fewer hashes in the metainfo but slower
+  verification of individual chunks.
+
+\item[pieces] A byte string containing the concatenated SHA1 hashes of all
+  pieces. Since SHA1 produces 20-byte hashes, this string's length is always
+  a multiple of 20. The first 20 bytes are the hash of piece 0, the next 20
+  are the hash of piece 1, and so on.
+
+\item[length] (single-file only) The total size of the file in bytes.
+
+\item[files] (multi-file only) A list of dictionaries, each describing one
+  file in the torrent.
+\end{description}
+
+The presence of \texttt{length} indicates a single-file torrent; the presence
+of \texttt{files} indicates a multi-file torrent. These are mutually exclusive.
+
+\subsection{The Info Hash: Identity of a Torrent}
+
+The \texttt{info} dictionary has a unique property: its exact bencoded byte
+representation is hashed with SHA1 to produce the \emph{info hash}. This 20-byte
+value is the torrent's identity---its fingerprint in the BitTorrent network.
+
+\subsubsection{Why the Info Hash Matters}
+
+The info hash serves three critical purposes:
+
+\begin{enumerate}
+\item \textbf{Peer Discovery}: When contacting a tracker, clients send their
+  info hash. The tracker uses this to group peers---only clients with matching
+  info hashes are introduced to each other. Without this, you might connect to
+  peers sharing completely different content.
+
+\item \textbf{Handshake Verification}: The first message peers exchange includes
+  the info hash. If the hashes don't match, the connection is immediately closed.
+  This prevents protocol-level mix-ups before any data is transferred.
+
+\item \textbf{Content Addressing}: The info hash is essentially a content address.
+  Magnet links---those \texttt{magnet:?xt=urn:btih:...} URLs---are just info hashes
+  in disguise. Given only the info hash, a client can find peers, retrieve the
+  full metainfo from them, and begin downloading.
+\end{enumerate}
+
+\subsubsection{Immutability: The Defining Property}
+
+The info hash is \emph{immutable}---it cannot be changed without creating a
+different torrent. This follows directly from how it's computed:
+
+\begin{enumerate}
+\item Take the \texttt{info} dictionary from the metainfo file.
+\item Encode it to bencode bytes (using canonical encoding with sorted keys).
+\item Compute the SHA1 hash of those bytes.
+\end{enumerate}
+
+Any modification to the info dictionary---changing a filename, altering piece
+length, adding a file---produces a different SHA1 hash. The result is a different
+info hash, which means a different torrent. Peers sharing the original content
+will not recognize the modified torrent as the same.
+
+This immutability is a feature, not a limitation:
+
+\begin{itemize}
+\item \textbf{Tamper Evidence}: If someone modifies the metainfo (to inject
+  malware, change filenames maliciously, etc.), the info hash changes. Users
+  who obtained the original info hash can detect the tampering.
+
+\item \textbf{Caching}: Since the same info hash always refers to the same
+  content, clients can cache piece data indefinitely without revalidation.
+
+\item \textbf{Deduplication}: If two torrents have the same info hash, they
+  contain identical content. This enables swarm merging and cross-seeding.
+\end{itemize}
+
+Note that the \texttt{announce} URL is \emph{not} part of the info dictionary,
+so changing trackers doesn't change the info hash. This is intentional---the
+same content can be tracked by multiple trackers without fragmenting the swarm.
+
+\subsubsection{Computing the Info Hash}
+
+Computing the info hash requires care. We must re-encode the info dictionary
+to canonical bencode bytes, not simply extract the raw bytes from the original
+file. While extracting raw bytes would work for well-formed torrents, re-encoding
+guarantees correctness regardless of how the original file was structured.
+
+Our [[BTreeMap]]-based [[BencodeValue::Dict]] naturally produces sorted keys,
+ensuring canonical encoding. The computation is straightforward: encode the
+info dictionary, then hash the result with SHA1.
 
 \subsection{Single-File vs Multi-File Torrents}
 
-The info dictionary supports two formats:
+The info dictionary supports two mutually exclusive formats, distinguished by
+which keys are present:
+
+\subsubsection{Single-File Format}
+
+A single-file torrent represents exactly one file. The info dictionary contains:
 
 \begin{description}
-\item[Single-file] Contains a \texttt{name} (filename) and \texttt{length}
-  (file size in bytes). The torrent represents exactly one file.
-
-\item[Multi-file] Contains a \texttt{name} (directory name) and \texttt{files}
-  (a list of file entries). Each file entry has a \texttt{length} and a
-  \texttt{path} (list of path components from the root directory).
+\item[name] The suggested filename (e.g., \texttt{"ubuntu-24.04.iso"}).
+\item[length] The file size in bytes.
+\item[piece length] Bytes per piece.
+\item[pieces] Concatenated SHA1 hashes.
 \end{description}
 
-We unify these into a single representation: a torrent is always a list of
-files, with single-file torrents being the degenerate case of a one-element list.
+For example, a torrent for a 3.3 GB Ubuntu ISO with 256 KiB pieces would have:
+\begin{verbatim}
+d
+  6:length i3303444480e
+  4:name 38:ubuntu-24.04.3-live-server-amd64.iso
+  12:piece length i262144e
+  6:pieces 252040:<12602 SHA1 hashes>
+e
+\end{verbatim}
+
+The number of pieces is $\lceil \texttt{length} / \texttt{piece length} \rceil$.
+For a 3.3 GB file with 256 KiB pieces: $\lceil 3303444480 / 262144 \rceil = 12602$
+pieces, requiring $12602 \times 20 = 252040$ bytes for the piece hashes.
+
+\subsubsection{Multi-File Format}
+
+A multi-file torrent represents a directory containing multiple files. The
+info dictionary contains:
+
+\begin{description}
+\item[name] The suggested directory name (e.g., \texttt{"album"}).
+\item[files] A list of file entries, each with:
+  \begin{description}
+  \item[length] The file size in bytes.
+  \item[path] A list of path components (e.g., \texttt{["cover", "front.jpg"]}).
+  \end{description}
+\item[piece length] Bytes per piece.
+\item[pieces] Concatenated SHA1 hashes.
+\end{description}
+
+For example, a torrent containing an album might look like:
+\begin{verbatim}
+d
+  5:files l
+    d 6:length i5242880e 4:path l 9:track1.mp3 e e
+    d 6:length i4194304e 4:path l 9:track2.mp3 e e
+    d 6:length i1048576e 4:path l 5:cover 9:front.jpg e e
+  e
+  4:name 5:album
+  12:piece length i262144e
+  6:pieces ...<hashes>...
+e
+\end{verbatim}
+
+The path for \texttt{front.jpg} is \texttt{["cover", "front.jpg"]}, which
+resolves to \texttt{album/cover/front.jpg} when the torrent name is prepended.
+
+\subsubsection{How Pieces Span Files}
+
+In multi-file torrents, pieces are conceptually laid out across a single
+contiguous byte stream formed by concatenating all files in order. A piece
+may span file boundaries---the last bytes of one file and the first bytes
+of the next might be in the same piece.
+
+For example, if piece length is 1 MiB and file A is 1.5 MiB while file B is
+0.5 MiB:
+\begin{itemize}
+\item Piece 0: bytes 0--1048575 of file A
+\item Piece 1: bytes 1048576--1572863 of file A, then bytes 0--524287 of file B
+\end{itemize}
+
+This is why our [[Metainfo]] struct stores both individual [[FileInfo]] entries
+and a [[total\_length]]---the total length determines piece boundaries.
+
+\subsubsection{Unifying the Formats}
+
+We unify these formats into a single representation: a torrent is always a list
+of files, with single-file torrents being the degenerate case of a one-element
+list. This simplifies our data structures and the code that uses them. Rather
+than branching on ``is this single-file or multi-file?'' everywhere, consumers
+can simply iterate over the file list.
 
 \subsection{The FileInfo Structure}
 
@@ -198,10 +406,99 @@ These error variants cover the main parsing failure modes:
   invalid types, or contain empty paths.
 \end{itemize}
 
+\subsection{Implementation Overview: From Bytes to Metainfo}
+
+Before diving into the code, let's trace the parsing process from raw bytes to
+a usable [[Metainfo]] structure. This walkthrough will help you understand how
+the pieces fit together.
+
+\subsubsection{Step 1: Bencode Decoding}
+
+The input is raw bytes---the contents of a \texttt{.torrent} file. We first
+decode these bytes using our bencode decoder from Chapter 1:
+
+\begin{verbatim}
+let value = decode(data)?;
+\end{verbatim}
+
+This gives us a [[BencodeValue]], which should be a dictionary. If decoding
+fails (invalid bencode) or the result isn't a dictionary, we reject the file
+immediately.
+
+\subsubsection{Step 2: Extracting Top-Level Fields}
+
+With the root dictionary in hand, we extract the required top-level fields:
+
+\begin{enumerate}
+\item \textbf{announce}: A UTF-8 string containing the tracker URL.
+\item \textbf{info}: A dictionary containing all content metadata.
+\end{enumerate}
+
+We need the info dictionary in two forms: as a [[BencodeValue]] (for info hash
+computation) and as a [[BTreeMap]] (for field extraction). Helper functions
+like [[get\_string]], [[get\_value]], and [[get\_dict\_field]] handle the
+type checking.
+
+\subsubsection{Step 3: Parsing the Info Dictionary}
+
+From the info dictionary, we extract:
+
+\begin{enumerate}
+\item \textbf{name}: The torrent/file/directory name (required).
+\item \textbf{piece length}: Size of each piece in bytes (required, must be positive).
+\item \textbf{pieces}: The concatenated SHA1 hashes (required, length must be
+  a multiple of 20).
+\item \textbf{length} or \textbf{files}: One of these must be present to indicate
+  single-file or multi-file format.
+\end{enumerate}
+
+Each field is validated as it's extracted. Invalid piece lengths, malformed
+piece hashes, or missing required fields trigger immediate errors.
+
+\subsubsection{Step 4: File List Construction}
+
+Based on whether \texttt{length} or \texttt{files} is present, we call either
+[[parse\_single\_file]] or [[parse\_multi\_file]]. Both return a vector of
+[[FileInfo]] and the total content length.
+
+For single-file torrents, this is trivial---one [[FileInfo]] with the name and
+length. For multi-file torrents, we iterate through the files array, building
+paths by prepending the torrent name to each file's path components.
+
+\subsubsection{Step 5: Info Hash Computation}
+
+Finally, we compute the info hash by re-encoding the info dictionary to bencode
+bytes and hashing with SHA1. The [[compute\_info\_hash]] function handles this:
+
+\begin{verbatim}
+let info_hash = compute_info_hash(info_value);
+\end{verbatim}
+
+The result is a 20-byte array that uniquely identifies this torrent.
+
+\subsubsection{Step 6: Assembling the Result}
+
+With all fields extracted and validated, we construct the [[Metainfo]] struct:
+
+\begin{verbatim}
+Ok(Metainfo {
+    announce,
+    info_hash,
+    piece_length,
+    piece_hashes,
+    total_length,
+    files,
+    name,
+})
+\end{verbatim}
+
+The caller receives either this fully-validated structure or a descriptive
+error explaining what went wrong.
+
 \subsection{Module Structure}
 
-The metainfo module combines the data structures defined above. Future sections
-will add parsing functions that construct [[Metainfo]] from bencoded data.
+The metainfo module combines the data structures defined above with the parsing
+functions that construct [[Metainfo]] from bencoded data.
 
 <<metainfo.rs>>=
 // GENERATED CODE - DO NOT EDIT
