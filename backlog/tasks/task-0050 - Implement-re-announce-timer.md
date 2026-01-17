@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:29'
-updated_date: '2026-01-17 22:46'
+updated_date: '2026-01-17 22:56'
 labels:
   - phase-6
   - tracker
@@ -36,19 +36,5 @@ Implements periodic tracker re-announces. The tracker response includes an inter
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented re-announce timer with the following features:
-
-- Extended EventLoopContext with metainfo, info_hash, port, and re_announce_failures fields
-- Added handle_re_announce() function that:
-  - Builds TrackerRequest with current download stats (bytes_verified, left)
-  - Calls announce() and adds new peers to connection manager
-  - Logs success at INFO level with stats (peers received/added, interval, seeders/leechers)
-  - Logs failures at WARN level with backoff info
-- Implemented exponential backoff for tracker failures:
-  - Capped at MAX_RE_ANNOUNCE_BACKOFF_MULTIPLIER (8)
-  - Reset on success
-- Added unit tests for backoff logic and tracker unavailability handling
-
-Files modified:
-- nw/07-client.nw: EventLoopContext, handle_re_announce(), tests
+Full re-announce with exponential backoff. Uses sleep() for dynamic intervals. Stats from PieceManager (bytes_verified, left).
 <!-- SECTION:NOTES:END -->

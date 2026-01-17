@@ -4151,20 +4151,16 @@ impl Client {
             total_bytes // Instant completion
         };
 
-        // Format speed for logging
-        let speed_str = if bytes_per_second >= 1_000_000.0 {
-            format!("{:.2} MB/s", bytes_per_second / 1_000_000.0)
-        } else if bytes_per_second >= 1_000.0 {
-            format!("{:.2} KB/s", bytes_per_second / 1_000.0)
-        } else {
-            format!("{:.0} B/s", bytes_per_second)
-        };
+        // Format for completion message using the shared formatting functions
+        let time_str = format_duration(elapsed.as_secs_f64());
+        let speed_str = format_speed(bytes_per_second);
 
         info!(
-            "Download complete! {} in {:.1}s ({}) - {} pieces verified",
+            "Download complete! {} in {} (avg {}) - {}/{} pieces verified",
             format_bytes(self.metainfo.total_length),
-            elapsed.as_secs_f64(),
+            time_str,
             speed_str,
+            self.piece_manager.num_pieces(),
             self.piece_manager.num_pieces()
         );
 
@@ -7307,6 +7303,12 @@ use tracing::trace;
 /// and overhead (not checking too frequently).
 pub const REQUEST_TIMEOUT_CHECK_INTERVAL_SECS: u64 = 30;
 
+/// Progress display interval in seconds.
+///
+/// The event loop displays download progress every 2 seconds. This provides
+/// a good balance between keeping the user informed and not spamming output.
+pub const PROGRESS_DISPLAY_INTERVAL_SECS: u64 = 2;
+
 /// Events that can occur during the event loop.
 ///
 /// Each variant represents a distinct type of event that requires
@@ -7351,6 +7353,12 @@ pub enum EventLoopEvent {
 
     /// Download is complete (all pieces verified).
     DownloadComplete,
+
+    /// Time to display download progress.
+    ///
+    /// Triggered every PROGRESS_DISPLAY_INTERVAL_SECS seconds to show
+    /// the user how the download is progressing.
+    ProgressDisplay,
 }
 
 /// Result of processing one event loop iteration.
@@ -7437,6 +7445,21 @@ pub struct EventLoopContext<'a> {
 
     /// Consecutive re-announce failures (for backoff).
     pub re_announce_failures: &'a mut u32,
+
+    /// Bytes verified at the last progress display.
+    ///
+    /// Used to calculate download speed as (current_bytes - last_bytes) / elapsed_time.
+    pub last_progress_bytes: &'a mut u64,
+
+    /// Instant when the last progress was displayed.
+    ///
+    /// Used together with `last_progress_bytes` to calculate speed.
+    pub last_progress_time: &'a mut std::time::Instant,
+
+    /// Instant when the download started.
+    ///
+    /// Used to calculate total elapsed time and average speed for completion message.
+    pub download_start_time: std::time::Instant,
 }
 @
 
@@ -7527,6 +7550,9 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     let mut keep_alive_interval = interval(
         Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS)
     );
+    let mut progress_display_interval = interval(
+        Duration::from_secs(PROGRESS_DISPLAY_INTERVAL_SECS)
+    );
     // Use sleep() for re-announce to support dynamic intervals (backoff on failure)
     let mut re_announce_sleep: Pin<Box<Sleep>> = Box::pin(
         sleep(Duration::from_secs(ctx.tracker_interval))
@@ -7535,6 +7561,7 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     // Skip the first tick (intervals fire immediately on creation)
     request_timeout_interval.tick().await;
     keep_alive_interval.tick().await;
+    progress_display_interval.tick().await;
     // Note: re_announce_sleep doesn't need skipping - it's a one-shot sleep
 
     let mut iteration: u64 = 0;
@@ -7577,6 +7604,11 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
             // Re-announce timer (uses sleep for dynamic intervals)
             _ = &mut re_announce_sleep => {
                 EventLoopEvent::ReAnnounce
+            }
+
+            // Progress display timer
+            _ = progress_display_interval.tick() => {
+                EventLoopEvent::ProgressDisplay
             }
 
             // Read from peers (only if we have connections)
@@ -7676,6 +7708,11 @@ async fn handle_event(
 
         EventLoopEvent::KeepAliveCheck => {
             handle_keep_alives(ctx).await
+        }
+
+        EventLoopEvent::ProgressDisplay => {
+            handle_progress_display(ctx);
+            EventLoopAction::Continue
         }
 
         // ReAnnounce is handled specially in run_event_loop for dynamic intervals
@@ -8323,6 +8360,139 @@ async fn handle_re_announce(
 }
 @
 
+\subsubsection{Progress Display}
+
+Displaying download progress keeps the user informed about what is happening.
+We show pieces completed, percentage, download speed, and estimated time remaining.
+The progress is printed to stderr (via tracing at INFO level) every 2 seconds.
+
+<<event loop>>=
+/// Handles the progress display timer event.
+///
+/// Displays download progress including:
+/// - Pieces completed out of total (e.g., "42/100 pieces")
+/// - Percentage complete (e.g., "42.0%")
+/// - Download speed in human-readable format (e.g., "1.5 MB/s")
+/// - Estimated time remaining
+///
+/// Speed is calculated from bytes downloaded since the last progress display,
+/// which gives a more responsive speed indication than average speed.
+fn handle_progress_display(ctx: &mut EventLoopContext<'_>) {
+    let now = std::time::Instant::now();
+    let current_bytes = ctx.piece_manager.bytes_verified();
+    let total_bytes = ctx.piece_manager.total_length();
+    let (verified, total) = ctx.piece_manager.progress();
+
+    // Calculate instantaneous speed from delta since last update
+    let elapsed_since_last = now.duration_since(*ctx.last_progress_time);
+    let bytes_since_last = current_bytes.saturating_sub(*ctx.last_progress_bytes);
+
+    let speed_bytes_per_sec = if elapsed_since_last.as_secs_f64() > 0.0 {
+        bytes_since_last as f64 / elapsed_since_last.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    // Update tracking state for next calculation
+    *ctx.last_progress_bytes = current_bytes;
+    *ctx.last_progress_time = now;
+
+    // Calculate percentage
+    let percent = if total > 0 {
+        (verified as f64 / total as f64) * 100.0
+    } else {
+        100.0
+    };
+
+    // Estimate time remaining based on current speed
+    let remaining_bytes = total_bytes.saturating_sub(current_bytes);
+    let eta = if speed_bytes_per_sec > 0.0 {
+        let eta_secs = remaining_bytes as f64 / speed_bytes_per_sec;
+        format_duration(eta_secs)
+    } else if remaining_bytes == 0 {
+        "done".to_string()
+    } else {
+        "calculating...".to_string()
+    };
+
+    // Format speed
+    let speed_str = format_speed(speed_bytes_per_sec);
+
+    // Log the progress
+    info!(
+        "{}/{} pieces ({:.1}%) - {} - ETA: {}",
+        verified,
+        total,
+        percent,
+        speed_str,
+        eta
+    );
+}
+
+/// Formats a download speed in bytes per second as a human-readable string.
+///
+/// Uses appropriate units (B/s, KB/s, MB/s, GB/s) based on magnitude.
+///
+/// # Examples
+///
+/// ```
+/// # use literate_bittorrent::client::format_speed;
+/// assert_eq!(format_speed(500.0), "500 B/s");
+/// assert_eq!(format_speed(1536.0), "1.5 KB/s");
+/// assert_eq!(format_speed(1572864.0), "1.5 MB/s");
+/// ```
+pub fn format_speed(bytes_per_sec: f64) -> String {
+    if bytes_per_sec >= 1_073_741_824.0 {
+        format!("{:.2} GB/s", bytes_per_sec / 1_073_741_824.0)
+    } else if bytes_per_sec >= 1_048_576.0 {
+        format!("{:.1} MB/s", bytes_per_sec / 1_048_576.0)
+    } else if bytes_per_sec >= 1024.0 {
+        format!("{:.1} KB/s", bytes_per_sec / 1024.0)
+    } else {
+        format!("{:.0} B/s", bytes_per_sec)
+    }
+}
+
+/// Formats a duration in seconds as a human-readable string.
+///
+/// For durations under an hour, shows minutes and seconds (e.g., "5m 30s").
+/// For longer durations, shows hours, minutes, and seconds (e.g., "2h 15m 30s").
+/// Very large durations are capped at showing days.
+///
+/// # Examples
+///
+/// ```
+/// # use literate_bittorrent::client::format_duration;
+/// assert_eq!(format_duration(90.0), "1m 30s");
+/// assert_eq!(format_duration(3661.0), "1h 1m 1s");
+/// assert_eq!(format_duration(30.4), "30s");
+/// ```
+pub fn format_duration(seconds: f64) -> String {
+    if seconds < 0.0 || !seconds.is_finite() {
+        return "unknown".to_string();
+    }
+
+    let total_secs = seconds.round() as u64;
+
+    if total_secs < 60 {
+        return format!("{}s", total_secs);
+    }
+
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, secs)
+    } else {
+        format!("{}m {}s", minutes, secs)
+    }
+}
+@
+
 \subsubsection{Triggering Block Requests}
 
 After receiving an unchoke or completing a piece, we need to request more blocks:
@@ -8518,6 +8688,93 @@ mod event_loop_tests {
         let mut connections: HashMap<SocketAddr, PeerConnection> = HashMap::new();
         let result = read_from_first_peer(&mut connections).await;
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn progress_display_interval_is_reasonable() {
+        // Progress should update frequently enough to be informative
+        // but not so often as to spam the output
+        assert!(PROGRESS_DISPLAY_INTERVAL_SECS >= 1);
+        assert!(PROGRESS_DISPLAY_INTERVAL_SECS <= 5);
+    }
+
+    // ========================================================================
+    // format_speed tests
+    // ========================================================================
+
+    #[test]
+    fn format_speed_bytes() {
+        assert_eq!(format_speed(0.0), "0 B/s");
+        assert_eq!(format_speed(500.0), "500 B/s");
+        assert_eq!(format_speed(1023.0), "1023 B/s");
+    }
+
+    #[test]
+    fn format_speed_kilobytes() {
+        assert_eq!(format_speed(1024.0), "1.0 KB/s");
+        assert_eq!(format_speed(1536.0), "1.5 KB/s");
+        assert_eq!(format_speed(10240.0), "10.0 KB/s");
+        assert_eq!(format_speed(1048575.0), "1024.0 KB/s");
+    }
+
+    #[test]
+    fn format_speed_megabytes() {
+        assert_eq!(format_speed(1048576.0), "1.0 MB/s");
+        assert_eq!(format_speed(1572864.0), "1.5 MB/s");
+        assert_eq!(format_speed(10485760.0), "10.0 MB/s");
+    }
+
+    #[test]
+    fn format_speed_gigabytes() {
+        assert_eq!(format_speed(1073741824.0), "1.00 GB/s");
+        assert_eq!(format_speed(1610612736.0), "1.50 GB/s");
+    }
+
+    // ========================================================================
+    // format_duration tests
+    // ========================================================================
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(0.0), "0s");
+        assert_eq!(format_duration(30.0), "30s");
+        assert_eq!(format_duration(59.0), "59s");
+        assert_eq!(format_duration(30.5), "31s"); // Rounds to nearest
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(60.0), "1m 0s");
+        assert_eq!(format_duration(90.0), "1m 30s");
+        assert_eq!(format_duration(3599.0), "59m 59s");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(3600.0), "1h 0m 0s");
+        assert_eq!(format_duration(3661.0), "1h 1m 1s");
+        assert_eq!(format_duration(7200.0), "2h 0m 0s");
+    }
+
+    #[test]
+    fn format_duration_days() {
+        assert_eq!(format_duration(86400.0), "1d 0h 0m");
+        assert_eq!(format_duration(90061.0), "1d 1h 1m");
+    }
+
+    #[test]
+    fn format_duration_invalid() {
+        assert_eq!(format_duration(-1.0), "unknown");
+        assert_eq!(format_duration(f64::INFINITY), "unknown");
+        assert_eq!(format_duration(f64::NAN), "unknown");
+    }
+
+    #[test]
+    fn format_duration_large_values() {
+        // 10000 pieces at 1 piece per 2 seconds = 20000 seconds = 5h 33m 20s
+        let eta = format_duration(20000.0);
+        assert!(eta.contains("h"));
+        assert!(!eta.contains("d")); // Less than a day
     }
 }
 @
