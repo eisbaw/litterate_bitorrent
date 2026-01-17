@@ -892,6 +892,130 @@ pub fn handle_incoming_have(
     // Check if we need this piece
     !piece_manager.is_verified(piece_index as usize)
 }
+
+/// Formats a peer_id for logging (shows first 8 bytes as hex).
+///
+/// Peer IDs are 20 bytes, but showing all of them clutters logs.
+/// The first 8 bytes typically contain the client identifier (e.g., "-LB0001-")
+/// which is sufficient for distinguishing peers in most cases.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::format_peer_id;
+///
+/// let peer_id = *b"-LB0001-XXXXXXXXXXXX";
+/// let formatted = format_peer_id(&peer_id);
+/// assert_eq!(formatted, "2d4c42303030312d"); // "-LB0001-" in hex
+/// ```
+pub fn format_peer_id(peer_id: &[u8; 20]) -> String {
+    peer_id.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Handles an incoming unchoke message from a peer.
+///
+/// Updates peer state and logs the transition. Unchoke messages indicate
+/// that the remote peer is willing to respond to our block requests.
+/// After receiving an unchoke, the caller should start sending block
+/// requests to this peer if we are interested in their pieces.
+///
+/// # Flow Control
+///
+/// In BitTorrent, choke/unchoke messages control data transfer flow:
+/// - A choked peer will not receive piece data
+/// - An unchoked peer may request and receive blocks
+///
+/// This function logs the transition at INFO level to aid debugging
+/// of slow downloads. When a download stalls, the logs can reveal
+/// whether peers are choking us.
+///
+/// # Arguments
+///
+/// * `conn` - The peer connection to update
+///
+/// # Example
+///
+/// ```no_run
+/// use literate_bittorrent::client::{PeerConnection, handle_incoming_unchoke};
+///
+/// fn process_unchoke(conn: &mut PeerConnection) {
+///     handle_incoming_unchoke(conn);
+///     // Now we can request blocks from this peer
+///     // (if conn.state.am_interested is true)
+/// }
+/// ```
+pub fn handle_incoming_unchoke(conn: &mut PeerConnection) {
+    let was_choked = conn.state.peer_choking;
+    conn.state.handle_unchoke();
+
+    if was_choked {
+        info!(
+            peer_id = %format_peer_id(&conn.peer_id),
+            addr = %conn.addr,
+            "peer unchoked us - can request blocks"
+        );
+    }
+}
+
+/// Handles an incoming choke message from a peer.
+///
+/// Updates peer state, cancels pending requests, and logs the transition.
+/// Choke messages indicate that the remote peer will no longer respond
+/// to our block requests. Any pending requests must be considered lost.
+///
+/// # Request Reassignment
+///
+/// When a peer chokes us, all pending block requests to that peer are
+/// effectively cancelled. Rather than losing these requests, this function
+/// returns them so the caller can reassign them to other unchoked peers.
+/// This prevents download stalls when peers choke us mid-transfer.
+///
+/// The pending requests are drained from the connection state before
+/// calling `handle_choke()` to ensure they are captured before being
+/// cleared.
+///
+/// # Arguments
+///
+/// * `conn` - The peer connection to update
+///
+/// # Returns
+///
+/// A vector of the pending block requests that were cancelled.
+/// These should be returned to the scheduler for reassignment to
+/// other peers who have the same pieces.
+///
+/// # Example
+///
+/// ```no_run
+/// use literate_bittorrent::client::{PeerConnection, handle_incoming_choke};
+///
+/// fn process_choke(conn: &mut PeerConnection) {
+///     let cancelled = handle_incoming_choke(conn);
+///     // Return cancelled requests to the piece manager for reassignment
+///     for request in cancelled {
+///         // scheduler.return_request(request);
+///     }
+/// }
+/// ```
+pub fn handle_incoming_choke(conn: &mut PeerConnection) -> Vec<BlockRequest> {
+    let was_unchoked = !conn.state.peer_choking;
+
+    // Drain pending requests before handle_choke clears them
+    let cancelled: Vec<BlockRequest> = conn.state.pending_requests.drain(..).collect();
+
+    conn.state.handle_choke();
+
+    if was_unchoked {
+        info!(
+            peer_id = %format_peer_id(&conn.peer_id),
+            addr = %conn.addr,
+            cancelled_requests = cancelled.len(),
+            "peer choked us - requests cancelled"
+        );
+    }
+
+    cancelled
+}
 @
 
 \subsection{Client Construction}
@@ -2009,6 +2133,159 @@ mod tests {
 
         assert!(matches!(result, Err(PeerError::BitfieldWrongLength { expected: 2, actual: 1 })));
     }
+
+    // =========================================================================
+    // Tests for handle_incoming_unchoke and handle_incoming_choke
+    // =========================================================================
+
+    /// Helper to create a mock PeerConnection for testing.
+    ///
+    /// Since PeerConnection requires a TcpStream, we use a mock server
+    /// to create a real connection for testing.
+    async fn create_test_peer_connection(num_pieces: usize) -> PeerConnection {
+        use tokio::net::TcpListener;
+        use crate::messages::Handshake;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let connect_handle = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr).await.unwrap()
+        });
+
+        let (_, _) = listener.accept().await.unwrap();
+        let stream = connect_handle.await.unwrap();
+
+        let peer_handshake = Handshake::new([0xAB; 20], [0xCD; 20]);
+        PeerConnection::new(stream, addr, &peer_handshake, num_pieces)
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_unchoke_sets_peer_choking_false() {
+        let mut conn = create_test_peer_connection(100).await;
+
+        // Initially peer_choking is true
+        assert!(conn.state.peer_choking);
+
+        handle_incoming_unchoke(&mut conn);
+
+        assert!(!conn.state.peer_choking, "handle_incoming_unchoke should set peer_choking to false");
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_choke_sets_peer_choking_true() {
+        let mut conn = create_test_peer_connection(100).await;
+
+        // Unchoke first so we can test the choke transition
+        conn.state.peer_choking = false;
+        assert!(!conn.state.peer_choking);
+
+        handle_incoming_choke(&mut conn);
+
+        assert!(conn.state.peer_choking, "handle_incoming_choke should set peer_choking to true");
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_choke_returns_cancelled_requests() {
+        use crate::pieces::BlockRequest;
+        use std::time::Instant;
+
+        let mut conn = create_test_peer_connection(100).await;
+        conn.state.peer_choking = false;
+
+        let now = Instant::now();
+        let peer_id = conn.peer_id;
+
+        // Add some pending requests
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 0,
+            offset: 0,
+            length: 16384,
+            requested_at: now,
+            peer: peer_id,
+        });
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 1,
+            offset: 0,
+            length: 16384,
+            requested_at: now,
+            peer: peer_id,
+        });
+        conn.state.pending_requests.push_back(BlockRequest {
+            piece_index: 2,
+            offset: 16384,
+            length: 16384,
+            requested_at: now,
+            peer: peer_id,
+        });
+
+        assert_eq!(conn.state.pending_requests.len(), 3);
+
+        let cancelled = handle_incoming_choke(&mut conn);
+
+        // Should return all cancelled requests
+        assert_eq!(cancelled.len(), 3, "Should return all 3 cancelled requests");
+        assert_eq!(cancelled[0].piece_index, 0);
+        assert_eq!(cancelled[1].piece_index, 1);
+        assert_eq!(cancelled[2].piece_index, 2);
+
+        // pending_requests should now be empty
+        assert!(conn.state.pending_requests.is_empty(), "pending_requests should be empty after choke");
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_unchoke_enables_requesting() {
+        let mut conn = create_test_peer_connection(100).await;
+
+        // Set up state: interested and choked
+        conn.state.am_interested = true;
+        conn.state.peer_choking = true;
+
+        // Can't request while choked
+        assert!(!conn.state.can_request(), "Should not be able to request while choked");
+
+        handle_incoming_unchoke(&mut conn);
+
+        // Now we can request
+        assert!(conn.state.can_request(), "Should be able to request after unchoke (when interested)");
+    }
+
+    #[tokio::test]
+    async fn handle_incoming_choke_disables_requesting() {
+        let mut conn = create_test_peer_connection(100).await;
+
+        // Set up state: interested and unchoked
+        conn.state.am_interested = true;
+        conn.state.peer_choking = false;
+
+        // Can request while unchoked and interested
+        assert!(conn.state.can_request(), "Should be able to request while unchoked and interested");
+
+        handle_incoming_choke(&mut conn);
+
+        // Can't request after being choked
+        assert!(!conn.state.can_request(), "Should not be able to request after choke");
+    }
+
+    #[test]
+    fn format_peer_id_shows_first_8_bytes_as_hex() {
+        let peer_id = *b"-LB0001-XXXXXXXXXXXX";
+        let formatted = format_peer_id(&peer_id);
+
+        // "-LB0001-" in hex is: 2d 4c 42 30 30 30 31 2d
+        assert_eq!(formatted, "2d4c42303030312d");
+        assert_eq!(formatted.len(), 16); // 8 bytes * 2 hex chars = 16
+    }
+
+    #[test]
+    fn format_peer_id_handles_binary_data() {
+        let peer_id: [u8; 20] = [0xFF, 0x00, 0xAB, 0xCD, 0x12, 0x34, 0x56, 0x78,
+                                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                  0x00, 0x00, 0x00, 0x00];
+        let formatted = format_peer_id(&peer_id);
+
+        assert_eq!(formatted, "ff00abcd12345678");
+    }
 }
 @
 
@@ -2034,9 +2311,12 @@ The tests verify each aspect of client construction:
   \begin{itemize}
   \item [[handle\_incoming\_bitfield]] updates peer state, availability, and determines interest
   \item [[handle\_incoming\_have]] updates peer state, availability for single piece, determines interest
-  \item Both correctly return whether we should send an Interested message
+  \item [[handle\_incoming\_unchoke]] updates peer state and logs unchoke transitions
+  \item [[handle\_incoming\_choke]] updates peer state, returns cancelled requests for reassignment
+  \item Both bitfield/have handlers correctly return whether we should send an Interested message
   \item Availability counts are incremented for pieces the peer has
   \item Invalid bitfield lengths are rejected with appropriate errors
+  \item Cancelled requests on choke are returned to caller for reassignment
   \end{itemize}
 \end{itemize}
 
