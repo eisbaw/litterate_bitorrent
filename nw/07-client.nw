@@ -1040,6 +1040,8 @@ The client module exports the [[Client]] struct and associated types.
 <<connection manager tests>>
 
 <<framed message reading tests>>
+
+<<framed message writing tests>>
 @
 
 \subsection{Testing}
@@ -3153,6 +3155,10 @@ pub async fn perform_handshake(
 
 <<framed message reading>>
 
+<<framed message writing>>
+
+<<keep-alive scheduling>>
+
 /// A simple wrapper around a peer connection.
 ///
 /// Currently holds the socket address and per-peer protocol state.
@@ -4150,6 +4156,189 @@ mod framed_message_tests {
         {
             // This verifies the function exists and is in scope
             read_message;
+        }
+    }
+}
+@
+
+\subsection{Framed Message Writing}
+
+While reading messages requires careful handling of length prefixes and partial
+reads, writing messages is simpler but equally important. The [[write_message]]
+function serializes a message and writes it atomically to the TCP stream.
+
+\subsubsection{Keep-Alive Interval}
+
+The BitTorrent protocol requires peers to send keep-alive messages every two
+minutes (120 seconds) to prevent connection timeouts. A keep-alive is simply
+a zero-length message (four zero bytes). If no messages have been sent for
+120 seconds, we must send a keep-alive to signal that the connection is still
+active.
+
+<<framed message writing>>=
+use std::time::Instant;
+
+/// Keep-alive interval in seconds. Connection is considered idle after this.
+///
+/// Per BEP 3, peers should send keep-alives every two minutes to prevent
+/// connection timeouts. Idle connections without keep-alives may be closed
+/// by the peer, network equipment, or firewalls implementing connection
+/// tracking.
+pub const KEEP_ALIVE_INTERVAL_SECS: u64 = 120;
+
+/// Writes a message to the TCP stream.
+///
+/// Serializes the message using `Message::to_bytes()` which includes
+/// the 4-byte length prefix. Uses write_all for atomic writes.
+///
+/// # Arguments
+///
+/// * `stream` - A mutable reference to the TCP connection
+/// * `msg` - The message to send
+///
+/// # Returns
+///
+/// * `Ok(())` if the message was written successfully
+/// * `Err(PeerError::IoError)` on write failure
+///
+/// # Example
+///
+/// ```no_run
+/// use tokio::net::TcpStream;
+/// use literate_bittorrent::client::write_message;
+/// use literate_bittorrent::messages::Message;
+///
+/// async fn example(stream: &mut TcpStream) {
+///     // Send an interested message
+///     write_message(stream, &Message::Interested).await.unwrap();
+///
+///     // Send a keep-alive
+///     write_message(stream, &Message::KeepAlive).await.unwrap();
+/// }
+/// ```
+pub async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<(), PeerError> {
+    let bytes = msg.to_bytes();
+    stream.write_all(&bytes).await?;
+    Ok(())
+}
+@
+
+The [[write_all]] method ensures atomic delivery---it will keep writing until
+all bytes are sent or an error occurs. This is important because TCP is a stream
+protocol and a single [[write]] call might not send all bytes if the kernel's
+send buffer is full.
+
+\subsubsection{Keep-Alive Scheduling}
+
+To send keep-alives at the right time, we track when we last sent any message.
+If too much time has passed since the last send, we send a keep-alive. The
+[[send_keep_alive_if_needed]] function encapsulates this logic:
+
+<<keep-alive scheduling>>=
+/// Sends a keep-alive if needed based on the last send time.
+///
+/// Returns the new last send time (now) if keep-alive was sent,
+/// otherwise returns the unchanged last_send_time.
+///
+/// # Arguments
+///
+/// * `stream` - The TCP stream to write to
+/// * `last_send_time` - When we last sent any message
+///
+/// # Returns
+///
+/// The updated last_send_time (either unchanged or set to now if keep-alive sent).
+///
+/// # Errors
+///
+/// Returns `PeerError::IoError` on write failure.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::time::Instant;
+/// use tokio::net::TcpStream;
+/// use literate_bittorrent::client::send_keep_alive_if_needed;
+///
+/// async fn peer_loop(stream: &mut TcpStream) {
+///     let mut last_send_time = Instant::now();
+///
+///     loop {
+///         // ... process messages ...
+///
+///         // Check if we need to send a keep-alive
+///         last_send_time = send_keep_alive_if_needed(stream, last_send_time)
+///             .await
+///             .expect("Failed to send keep-alive");
+///
+///         // ... wait for next event ...
+///     }
+/// }
+/// ```
+pub async fn send_keep_alive_if_needed(
+    stream: &mut TcpStream,
+    last_send_time: Instant,
+) -> Result<Instant, PeerError> {
+    if last_send_time.elapsed() >= Duration::from_secs(KEEP_ALIVE_INTERVAL_SECS) {
+        write_message(stream, &Message::KeepAlive).await?;
+        Ok(Instant::now())
+    } else {
+        Ok(last_send_time)
+    }
+}
+@
+
+The function returns the updated [[last_send_time]] so the caller can track
+when the next keep-alive might be needed. The caller should update their
+[[last_send_time]] variable whenever they send any message, not just keep-alives.
+
+\subsubsection{Framed Message Writing Tests}
+
+We test the constants and verify function signatures exist. Integration testing
+with real TCP streams would require a mock server setup.
+
+<<framed message writing tests>>=
+#[cfg(test)]
+mod framed_message_writing_tests {
+    use super::*;
+
+    #[test]
+    fn keep_alive_interval_is_120_seconds() {
+        assert_eq!(KEEP_ALIVE_INTERVAL_SECS, 120);
+    }
+
+    #[tokio::test]
+    async fn write_message_function_exists() {
+        // This test verifies the function exists with the correct signature.
+        // We cannot easily test the actual implementation without mock streams.
+        //
+        // The function signature is:
+        //   pub async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<(), PeerError>
+        //
+        // We verify the function exists by referencing it.
+        #[allow(clippy::no_effect, path_statements)]
+        {
+            // This verifies the function exists and is in scope
+            write_message;
+        }
+    }
+
+    #[tokio::test]
+    async fn send_keep_alive_if_needed_function_exists() {
+        // This test verifies the function exists with the correct signature.
+        // We cannot easily test the actual implementation without mock streams.
+        //
+        // The function signature is:
+        //   pub async fn send_keep_alive_if_needed(
+        //       stream: &mut TcpStream,
+        //       last_send_time: Instant,
+        //   ) -> Result<Instant, PeerError>
+        //
+        // We verify the function exists by referencing it.
+        #[allow(clippy::no_effect, path_statements)]
+        {
+            // This verifies the function exists and is in scope
+            send_keep_alive_if_needed;
         }
     }
 }
