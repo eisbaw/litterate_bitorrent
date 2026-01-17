@@ -156,6 +156,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<tracker response parsing>>
 
+<<compact peer parsing>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +177,8 @@ mod tests {
     <<http request tests>>
 
     <<tracker response tests>>
+
+    <<compact peer parsing tests>>
 }
 @
 
@@ -1852,6 +1856,125 @@ pub fn parse_tracker_response(data: &[u8]) -> Result<TrackerResponse, TrackerErr
 }
 @
 
+\subsection{Compact Peer List Parsing (BEP-23)}
+
+Once we have the raw peer data from the tracker response, we need to parse it
+into usable socket addresses. BEP-23 defines the \emph{compact} peer format,
+which is far more efficient than the older dictionary format and is supported
+by virtually all modern trackers.
+
+In compact format, each peer is represented as exactly 6 bytes:
+
+\begin{description}
+\item[Bytes 0--3] The IPv4 address in network byte order (big-endian). The first
+  byte is the most significant octet of the address. For example, the address
+  192.168.1.1 would be encoded as the bytes \texttt{0xC0 0xA8 0x01 0x01}.
+
+\item[Bytes 4--5] The TCP port number in network byte order (big-endian). For
+  example, the standard BitTorrent port 6881 (0x1AE1) would be encoded as
+  \texttt{0x1A 0xE1}.
+\end{description}
+
+The total peer data length must be divisible by 6. If the tracker returns
+compact peer data with a length not divisible by 6, the response is malformed
+and we reject it. An empty peer list (0 bytes) is valid and simply means no
+peers are currently available---perhaps the torrent is new or all peers have
+disconnected.
+
+This format is called ``compact'' because it uses only 6 bytes per peer,
+compared to the dictionary format which requires dozens of bytes per peer
+for the bencoded dictionary structure, key names, and quoted string values.
+For a response with 50 peers, compact format uses 300 bytes while dictionary
+format might use 2000+ bytes.
+
+<<compact peer parsing>>=
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+/// The number of bytes used to represent each peer in compact format.
+///
+/// BEP-23 specifies: 4 bytes for IPv4 address + 2 bytes for port = 6 bytes.
+pub const COMPACT_PEER_SIZE: usize = 6;
+
+/// Parse a compact peer list into socket addresses.
+///
+/// BEP-23 defines the compact peer format where each peer is exactly 6 bytes:
+/// - Bytes 0-3: IPv4 address (big-endian / network byte order)
+/// - Bytes 4-5: Port number (big-endian / network byte order)
+///
+/// # Arguments
+///
+/// * `data` - Raw peer data from the tracker's `peers` field
+///
+/// # Returns
+///
+/// On success, returns a vector of socket addresses. The vector may be empty
+/// if no peers were provided (valid: the swarm may be empty).
+///
+/// # Errors
+///
+/// Returns [`TrackerError::TrackerInvalidResponse`] if the data length is not
+/// divisible by 6, indicating a malformed compact peer list.
+///
+/// # Example
+///
+/// ```ignore
+/// // Parse tracker response, then extract peers
+/// let response = parse_tracker_response(&body)?;
+/// let peers = parse_compact_peers(&response.peers)?;
+/// for peer in peers {
+///     println!("Peer: {}", peer);
+/// }
+/// ```
+pub fn parse_compact_peers(data: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
+    // Validate length is divisible by 6
+    if data.len() % COMPACT_PEER_SIZE != 0 {
+        return Err(TrackerError::TrackerInvalidResponse(format!(
+            "compact peer data length {} is not divisible by 6",
+            data.len()
+        )));
+    }
+
+    // Empty peer list is valid (no peers available)
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Parse each 6-byte chunk into a SocketAddr
+    let peer_count = data.len() / COMPACT_PEER_SIZE;
+    let mut peers = Vec::with_capacity(peer_count);
+
+    for chunk in data.chunks_exact(COMPACT_PEER_SIZE) {
+        // Extract IPv4 address (bytes 0-3, big-endian)
+        let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
+
+        // Extract port (bytes 4-5, big-endian)
+        let port = u16::from_be_bytes([chunk[4], chunk[5]]);
+
+        peers.push(SocketAddr::V4(SocketAddrV4::new(ip, port)));
+    }
+
+    Ok(peers)
+}
+@
+
+The implementation is straightforward thanks to Rust's standard library:
+
+\begin{itemize}
+\item [[Ipv4Addr::new]] takes four octets in the natural order (most significant
+  first), which matches the network byte order in the compact format.
+
+\item [[u16::from_be_bytes]] explicitly decodes the port from big-endian bytes,
+  making the byte ordering clear in the code. This is more readable than
+  manual bit shifting (\texttt{(chunk[4] as u16) @<@< 8 | chunk[5] as u16}).
+
+\item [[chunks_exact]] ensures we process exactly 6 bytes at a time and would
+  panic if the slice length wasn't divisible by 6---but we've already validated
+  that, so this is safe.
+
+\item We pre-allocate the vector capacity since we know exactly how many peers
+  we'll parse. This avoids reallocations during parsing.
+\end{itemize}
+
 The parsing function is deliberately defensive. We check for failure reasons
 before extracting other fields because a failure response may not contain
 valid data for those fields. We also validate that integers are non-negative
@@ -2116,5 +2239,191 @@ fn tracker_response_implements_clone() {
 
     let cloned = original.clone();
     assert_eq!(cloned, original);
+}
+@
+
+\subsubsection{Compact Peer Parsing Tests}
+
+We test the compact peer parser with a comprehensive set of test cases that
+verify correct handling of valid data, edge cases, and error conditions.
+
+<<compact peer parsing tests>>=
+#[test]
+fn parse_compact_peers_two_peers() {
+    // Two peers: 192.168.1.1:6881 and 10.0.0.1:8080
+    // 192.168.1.1 = 0xC0, 0xA8, 0x01, 0x01
+    // 6881 = 0x1AE1 -> 0x1A, 0xE1
+    // 10.0.0.1 = 0x0A, 0x00, 0x00, 0x01
+    // 8080 = 0x1F90 -> 0x1F, 0x90
+    let data: [u8; 12] = [
+        0xC0, 0xA8, 0x01, 0x01, 0x1A, 0xE1,  // 192.168.1.1:6881
+        0x0A, 0x00, 0x00, 0x01, 0x1F, 0x90,  // 10.0.0.1:8080
+    ];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok(), "Should parse valid peer data: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 2);
+    assert_eq!(peers[0].to_string(), "192.168.1.1:6881");
+    assert_eq!(peers[1].to_string(), "10.0.0.1:8080");
+}
+
+#[test]
+fn parse_compact_peers_empty_returns_empty_vec() {
+    // Empty input is valid: no peers available
+    let data: [u8; 0] = [];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok(), "Empty input should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert!(peers.is_empty(), "Should return empty vec for empty input");
+}
+
+#[test]
+fn parse_compact_peers_not_divisible_by_6_returns_error() {
+    // 7 bytes is not divisible by 6
+    let data: [u8; 7] = [0xC0, 0xA8, 0x01, 0x01, 0x1A, 0xE1, 0xFF];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_err(), "7 bytes should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("not divisible by 6"),
+                "Error should mention divisibility: {}",
+                msg
+            );
+            assert!(msg.contains("7"), "Error should mention actual length: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_compact_peers_endianness_verification() {
+    // Test with a known value where endianness matters
+    // IP: 1.2.3.4 (should be bytes 0x01, 0x02, 0x03, 0x04 in that order)
+    // Port: 258 (0x0102) should be bytes 0x01, 0x02 (big-endian)
+    let data: [u8; 6] = [0x01, 0x02, 0x03, 0x04, 0x01, 0x02];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok());
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+
+    // Verify the IP address octets are in correct order
+    assert_eq!(peers[0].to_string(), "1.2.3.4:258");
+
+    // Also verify by extracting the SocketAddrV4
+    if let SocketAddr::V4(addr) = peers[0] {
+        assert_eq!(addr.ip().octets(), [1, 2, 3, 4]);
+        assert_eq!(addr.port(), 258);
+    } else {
+        panic!("Expected IPv4 address");
+    }
+}
+
+#[test]
+fn parse_compact_peers_single_peer() {
+    // Single peer: 127.0.0.1:51413
+    // 51413 = 0xC8D5
+    let data: [u8; 6] = [127, 0, 0, 1, 0xC8, 0xD5];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok());
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "127.0.0.1:51413");
+}
+
+#[test]
+fn parse_compact_peers_max_values() {
+    // Maximum IP (255.255.255.255) and port (65535)
+    let data: [u8; 6] = [255, 255, 255, 255, 0xFF, 0xFF];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok());
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "255.255.255.255:65535");
+}
+
+#[test]
+fn parse_compact_peers_min_values() {
+    // Minimum IP (0.0.0.0) and port (0)
+    // While 0.0.0.0:0 is unusual, the parser should handle it
+    let data: [u8; 6] = [0, 0, 0, 0, 0, 0];
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok());
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "0.0.0.0:0");
+}
+
+#[test]
+fn parse_compact_peers_many_peers() {
+    // Test with 10 peers to verify batch processing
+    let mut data = Vec::with_capacity(60);
+    for i in 0..10 {
+        // Create peers: 192.168.1.i:6881+i
+        data.push(192);
+        data.push(168);
+        data.push(1);
+        data.push(i);
+        let port: u16 = 6881 + i as u16;
+        data.push((port >> 8) as u8);
+        data.push((port & 0xFF) as u8);
+    }
+
+    let result = parse_compact_peers(&data);
+    assert!(result.is_ok());
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 10);
+
+    // Verify first and last peer
+    assert_eq!(peers[0].to_string(), "192.168.1.0:6881");
+    assert_eq!(peers[9].to_string(), "192.168.1.9:6890");
+}
+
+#[test]
+fn parse_compact_peers_length_1_returns_error() {
+    // 1 byte is not divisible by 6
+    let data: [u8; 1] = [0xFF];
+    let result = parse_compact_peers(&data);
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_compact_peers_length_5_returns_error() {
+    // 5 bytes is not divisible by 6 (one byte short of one peer)
+    let data: [u8; 5] = [192, 168, 1, 1, 0x1A];
+    let result = parse_compact_peers(&data);
+    assert!(result.is_err());
+}
+
+#[test]
+fn parse_compact_peers_length_13_returns_error() {
+    // 13 bytes is not divisible by 6 (two complete peers + 1 extra byte)
+    let data: [u8; 13] = [
+        192, 168, 1, 1, 0x1A, 0xE1,  // peer 1
+        10, 0, 0, 1, 0x1F, 0x90,     // peer 2
+        0xFF,                        // extra byte
+    ];
+    let result = parse_compact_peers(&data);
+    assert!(result.is_err());
+}
+
+#[test]
+fn compact_peer_size_constant_is_6() {
+    assert_eq!(COMPACT_PEER_SIZE, 6);
 }
 @
