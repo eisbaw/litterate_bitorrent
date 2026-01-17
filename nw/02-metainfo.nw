@@ -209,7 +209,9 @@ will add parsing functions that construct [[Metainfo]] from bencoded data.
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::bencode::{decode, BencodeError, BencodeValue};
+use sha1::{Sha1, Digest};
+
+use crate::bencode::{decode, encode, BencodeError, BencodeValue};
 
 <<file info struct>>
 
@@ -218,6 +220,8 @@ use crate::bencode::{decode, BencodeError, BencodeValue};
 <<metainfo errors>>
 
 <<helper functions>>
+
+<<info hash computation>>
 
 <<parse pieces>>
 
@@ -294,11 +298,88 @@ fn get_dict_field<'a>(
         None => Err(MetainfoError::MissingField(key)),
     }
 }
+
+/// Extracts a BencodeValue from a dictionary by key.
+///
+/// Unlike `get_dict_field` which extracts only the inner BTreeMap,
+/// this returns the BencodeValue itself, which is needed when we
+/// need to re-encode the value (e.g., for info hash computation).
+fn get_value<'a>(
+    dict: &'a BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<&'a BencodeValue, MetainfoError> {
+    dict.get(key.as_bytes())
+        .ok_or(MetainfoError::MissingField(key))
+}
 @
 
 Each function returns a [[MetainfoError]] rather than a generic error because these
 are specifically designed for metainfo parsing. The error messages are intentionally
 simple---in production code, you might want more detailed type mismatch messages.
+
+\subsection{Computing the Info Hash}
+
+The \emph{info hash} is a 20-byte SHA1 hash of the bencoded info dictionary. This
+hash uniquely identifies a torrent across the entire BitTorrent network---every
+peer sharing the same content uses the same info hash to find each other.
+
+Computing the info hash requires:
+\begin{enumerate}
+\item Extracting the info dictionary as a [[BencodeValue]]
+\item Re-encoding it to bytes using our bencode encoder
+\item Computing the SHA1 hash of those bytes
+\end{enumerate}
+
+The re-encoding step is critical because we need the \emph{canonical} byte
+representation. Our [[BTreeMap]]-based [[BencodeValue::Dict]] ensures keys are
+sorted, which is required by the bencode specification. This guarantees that
+any encoder will produce the same bytes for the same dictionary content.
+
+<<info hash computation>>=
+/// Computes the SHA1 info hash from a BencodeValue representing the info dict.
+///
+/// The info hash is computed by:
+/// 1. Encoding the info dictionary to bencode bytes
+/// 2. Computing the SHA1 hash of those bytes
+///
+/// This is the canonical way to compute info hashes: by re-encoding the
+/// parsed info dictionary rather than extracting raw bytes from the original
+/// torrent file. Our BTreeMap-based encoding ensures proper key ordering.
+///
+/// # Arguments
+///
+/// * `info_dict` - The info dictionary as a BencodeValue (must be a Dict)
+///
+/// # Returns
+///
+/// A 20-byte array containing the SHA1 hash.
+///
+/// # Example
+///
+/// ```ignore
+/// let info_value = get_value(root, "info")?;
+/// let info_hash = compute_info_hash(info_value);
+/// ```
+pub fn compute_info_hash(info_dict: &BencodeValue) -> [u8; 20] {
+    // Encode the info dict to canonical bencode bytes
+    let encoded = encode(info_dict);
+
+    // Compute SHA1 hash
+    let mut hasher = Sha1::new();
+    hasher.update(&encoded);
+    let result = hasher.finalize();
+
+    // Convert GenericArray to fixed-size array
+    let mut hash = [0u8; 20];
+    hash.copy_from_slice(&result);
+    hash
+}
+@
+
+Note that we encode from the [[BencodeValue]] rather than using the original
+bytes from the torrent file. While using original bytes might seem more direct,
+it would require tracking byte positions during parsing. Re-encoding is simpler
+and equally correct because our encoder produces canonical output.
 
 \subsection{Parsing Piece Hashes}
 
@@ -419,7 +500,10 @@ pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
     // Extract announce URL
     let announce = get_string(root, "announce")?;
 
-    // Extract the info dictionary
+    // Extract the info dictionary as BencodeValue (for info hash computation)
+    let info_value = get_value(root, "info")?;
+
+    // Also extract as BTreeMap for field access
     let info_dict = get_dict_field(root, "info")?;
 
     // Extract name from info dict
@@ -454,9 +538,8 @@ pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
         return Err(MetainfoError::MissingField("length (multi-file not supported)"));
     };
 
-    // Note: info_hash computation is a separate task (0110)
-    // For now, use a placeholder
-    let info_hash = [0u8; 20];
+    // Compute the info hash from the info dictionary
+    let info_hash = compute_info_hash(info_value);
 
     Ok(Metainfo {
         announce,
@@ -475,9 +558,9 @@ and we propagate errors with descriptive messages. The bencode decoding error is
 mapped to a [[MissingField]] error since the specific bencode error details are
 less relevant at this level.
 
-The info\_hash computation is deliberately left as a placeholder. Computing it
-requires re-encoding the info dictionary or tracking byte offsets during parsing,
-which adds complexity. Task 0110 will handle this separately.
+The info hash is computed by extracting the info dictionary as a [[BencodeValue]],
+re-encoding it to bytes, and computing the SHA1 hash. This canonical approach
+ensures consistent hashes regardless of how the original torrent file was structured.
 
 \subsection{Tests}
 
@@ -554,8 +637,9 @@ mod tests {
         assert_eq!(metainfo.files.len(), 1);
         assert_eq!(metainfo.files[0].length, 1024);
         assert_eq!(metainfo.files[0].path, PathBuf::from("test.txt"));
-        // info_hash is placeholder for now
-        assert_eq!(metainfo.info_hash, [0u8; 20]);
+        // Verify info hash is computed (not a placeholder)
+        // The hash depends on the exact bencode of the info dict
+        assert_ne!(metainfo.info_hash, [0u8; 20], "info hash should be computed");
     }
 
     #[test]
@@ -768,6 +852,123 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0][0], 1);
         assert_eq!(result[1][0], 2);
+    }
+
+    // ========================================
+    // Info Hash Computation Tests
+    // ========================================
+
+    #[test]
+    fn compute_info_hash_simple_dict() {
+        // Test compute_info_hash with a simple dictionary
+        // The hash should be SHA1 of the bencoded dictionary
+        use crate::bencode::encode;
+
+        let mut dict = BTreeMap::new();
+        dict.insert(b"name".to_vec(), BencodeValue::Bytes(b"test".to_vec()));
+        dict.insert(b"length".to_vec(), BencodeValue::Integer(100));
+        let value = BencodeValue::Dict(dict);
+
+        let hash = compute_info_hash(&value);
+
+        // Hash should be 20 bytes and non-zero
+        assert_eq!(hash.len(), 20);
+        assert_ne!(hash, [0u8; 20]);
+
+        // Verify by computing manually
+        use sha1::{Sha1, Digest};
+        let encoded = encode(&value);
+        let mut hasher = Sha1::new();
+        hasher.update(&encoded);
+        let expected: [u8; 20] = hasher.finalize().into();
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn compute_info_hash_deterministic() {
+        // Same input should always produce the same hash
+        let mut dict = BTreeMap::new();
+        dict.insert(b"test".to_vec(), BencodeValue::Integer(42));
+        let value = BencodeValue::Dict(dict);
+
+        let hash1 = compute_info_hash(&value);
+        let hash2 = compute_info_hash(&value);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn info_hash_for_synthetic_torrent() {
+        // Create a known torrent and verify its info hash
+        let pieces = [0u8; 20];
+        let torrent = make_single_file_torrent(
+            "http://tracker.example.com/announce",
+            "test.txt",
+            1024,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+
+        // Verify hash is computed correctly by re-computing from info dict
+        use sha1::{Sha1, Digest};
+        use crate::bencode::encode;
+
+        // Recreate the info dict
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+        let info_value = BencodeValue::Dict(info);
+
+        let mut hasher = Sha1::new();
+        hasher.update(&encode(&info_value));
+        let expected: [u8; 20] = hasher.finalize().into();
+
+        assert_eq!(metainfo.info_hash, expected);
+    }
+
+    #[test]
+    fn info_hash_ubuntu_torrent() {
+        // Test against real ubuntu.torrent fixture with known info hash
+        // Expected hash from tests/fixtures/ubuntu.torrent.expected:
+        // INFO_HASH=a1dfefec1a9dd7fa8a041ebeeea271db55126d2f
+
+        let torrent_bytes = std::fs::read("tests/fixtures/ubuntu.torrent")
+            .expect("ubuntu.torrent fixture should exist");
+
+        let metainfo = parse(&torrent_bytes).expect("ubuntu.torrent should parse");
+
+        // Convert expected hex string to bytes
+        let expected_hex = "a1dfefec1a9dd7fa8a041ebeeea271db55126d2f";
+        let expected: [u8; 20] = {
+            let mut arr = [0u8; 20];
+            for i in 0..20 {
+                arr[i] = u8::from_str_radix(&expected_hex[i*2..i*2+2], 16).unwrap();
+            }
+            arr
+        };
+
+        // Verify the info hash matches the expected value
+        assert_eq!(
+            metainfo.info_hash, expected,
+            "info hash mismatch:\n  computed: {}\n  expected: {}",
+            hex_string(&metainfo.info_hash),
+            expected_hex
+        );
+
+        // Also verify other known values from the fixture
+        assert_eq!(metainfo.name, "ubuntu-24.04.3-live-server-amd64.iso");
+        assert_eq!(metainfo.total_length, 3303444480);
+        assert_eq!(metainfo.piece_length, 262144);
+        assert_eq!(metainfo.piece_hashes.len(), 12602);
+    }
+
+    /// Helper to format a hash as a hex string for error messages
+    fn hex_string(hash: &[u8; 20]) -> String {
+        hash.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 @
