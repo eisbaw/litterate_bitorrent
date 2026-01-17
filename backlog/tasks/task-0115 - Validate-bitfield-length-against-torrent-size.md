@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:38'
-updated_date: '2026-01-17 21:55'
+updated_date: '2026-01-17 21:57'
 labels:
   - phase-3
   - protocol
@@ -46,18 +46,5 @@ When a peer sends a bitfield, its length must match the expected number of piece
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented bitfield validation for the peer wire protocol:
-
-- Added `bitfield_length(num_pieces: u32) -> usize` function that computes ceil(num_pieces/8)
-- Added `validate_bitfield(bits: &[u8], num_pieces: u32) -> Result<(), PeerError>` that:
-  - Returns BitfieldWrongLength if length mismatch
-  - Returns InvalidMessage if spare bits are set
-- Comprehensive unit tests covering edge cases:
-  - 0, 1, 8, 9, 1000 pieces
-  - Spare bits validation (zero vs nonzero)
-  - Exact multiples of 8 (no spare bits)
-- Literate documentation explaining the bit layout and validation logic
-
-Files modified:
-- nw/04-messages.nw: Added <<bitfield validation>> and <<bitfield validation tests>> chunks
+Implemented bitfield validation with comprehensive tests. 848 tests passing.
 <!-- SECTION:NOTES:END -->
