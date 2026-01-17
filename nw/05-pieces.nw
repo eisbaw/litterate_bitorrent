@@ -530,6 +530,104 @@ impl PieceError {
 }
 @
 
+\subsection{Piece Hash Verification}
+
+The fundamental integrity guarantee of BitTorrent is that every piece has a known
+SHA1 hash stored in the torrent metadata. After downloading all blocks of a piece,
+we must compute the SHA1 hash of the assembled data and compare it against the
+expected hash. Only pieces that pass this verification should be written to disk.
+
+The verification function is straightforward:
+\begin{enumerate}
+\item Accept the piece index (for error reporting), the raw piece data, and the
+  expected 20-byte hash.
+\item Compute the SHA1 hash of the data.
+\item Compare the computed hash against the expected hash.
+\item Return [[Ok(())]] on match, or [[Err(PieceHashMismatch)]] on mismatch.
+\end{enumerate}
+
+We include the piece index in the error because a typical download involves
+thousands of pieces, and knowing which one failed is essential for debugging.
+The error includes both the expected and computed hashes as hex strings, making
+it easy to log and diagnose issues without additional formatting.
+
+<<piece verification>>=
+use sha1::{Sha1, Digest};
+
+/// Verifies that a piece's data matches its expected SHA1 hash.
+///
+/// After downloading all blocks of a piece and assembling them into a contiguous
+/// buffer, call this function to verify the data's integrity. BitTorrent stores
+/// a 20-byte SHA1 hash for each piece in the torrent metadata; this function
+/// computes the hash of the downloaded data and compares it.
+///
+/// # Arguments
+///
+/// * `piece_index` - The index of the piece being verified (for error reporting)
+/// * `data` - The complete piece data (all blocks assembled)
+/// * `expected_hash` - The 20-byte SHA1 hash from the torrent metadata
+///
+/// # Returns
+///
+/// * `Ok(())` if the computed hash matches the expected hash
+/// * `Err(PieceError::PieceHashMismatch)` if the hashes differ
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::{verify_piece, PieceError};
+///
+/// // "test" hashes to a94a8fe5ccb19ba61c4c0873d391e987982fbbd3
+/// let expected: [u8; 20] = [
+///     0xa9, 0x4a, 0x8f, 0xe5, 0xcc, 0xb1, 0x9b, 0xa6, 0x1c, 0x4c,
+///     0x08, 0x73, 0xd3, 0x91, 0xe9, 0x87, 0x98, 0x2f, 0xbb, 0xd3,
+/// ];
+///
+/// // Correct data should verify successfully
+/// assert!(verify_piece(0, b"test", &expected).is_ok());
+///
+/// // Corrupted data should fail verification
+/// assert!(verify_piece(0, b"Test", &expected).is_err());
+/// ```
+///
+/// # Performance Notes
+///
+/// SHA1 hashing is CPU-bound. For typical piece sizes (256 KiB to 4 MiB),
+/// verification takes microseconds to milliseconds. Consider running verification
+/// in a background task if you need to avoid blocking the main download loop.
+pub fn verify_piece(
+    piece_index: u32,
+    data: &[u8],
+    expected_hash: &[u8; 20],
+) -> Result<(), PieceError> {
+    // Compute the SHA1 hash of the piece data
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+
+    // Convert GenericArray to fixed-size array for comparison
+    let mut computed_hash = [0u8; 20];
+    computed_hash.copy_from_slice(&result);
+
+    // Compare the hashes
+    if computed_hash == *expected_hash {
+        Ok(())
+    } else {
+        Err(PieceError::hash_mismatch(piece_index, expected_hash, &computed_hash))
+    }
+}
+@
+
+The design deliberately keeps the function simple and focused. We do not:
+\begin{itemize}
+\item Validate the piece index (the caller should do bounds checking separately)
+\item Check the data length (different pieces can have different sizes)
+\item Log anything (the error contains all needed debugging info)
+\end{itemize}
+
+This separation of concerns keeps the function testable and reusable across
+different contexts (normal download, resume verification, seeding validation).
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -576,6 +674,8 @@ The pieces module combines the error types and helpers.
 
 <<piece error helpers>>
 
+<<piece verification>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,6 +694,8 @@ mod tests {
     <<piece error trait tests>>
 
     <<piece error helper tests>>
+
+    <<piece verification tests>>
 }
 @
 
@@ -1787,5 +1889,120 @@ fn geometry_edge_case_piece_equals_block() {
     assert_eq!(blocks_per_piece(BLOCK_SIZE), 1);
     assert_eq!(piece_size(0, BLOCK_SIZE, BLOCK_SIZE as u64, 1), BLOCK_SIZE);
     assert_eq!(block_size(0, 0, BLOCK_SIZE, BLOCK_SIZE as u64, 1), BLOCK_SIZE);
+}
+@
+
+\subsection{Piece Verification Tests}
+
+We test the [[verify_piece]] function with known data and precomputed hashes.
+The SHA1 hash of the string ``test'' is well-known and provides a reliable
+test vector. We also verify that corrupted data produces a hash mismatch error
+with the expected context.
+
+<<piece verification tests>>=
+/// The SHA1 hash of "test" is a94a8fe5ccb19ba61c4c0873d391e987982fbbd3.
+/// This is a well-known test vector used across many projects.
+const TEST_HASH: [u8; 20] = [
+    0xa9, 0x4a, 0x8f, 0xe5, 0xcc, 0xb1, 0x9b, 0xa6, 0x1c, 0x4c,
+    0x08, 0x73, 0xd3, 0x91, 0xe9, 0x87, 0x98, 0x2f, 0xbb, 0xd3,
+];
+
+#[test]
+fn verify_piece_succeeds_with_correct_data() {
+    // "test" should verify against its known SHA1 hash
+    let result = verify_piece(0, b"test", &TEST_HASH);
+    assert!(result.is_ok(), "verification should succeed: {:?}", result);
+}
+
+#[test]
+fn verify_piece_fails_with_corrupted_data() {
+    // "Test" (capital T) has a different hash than "test"
+    let result = verify_piece(42, b"Test", &TEST_HASH);
+    assert!(result.is_err(), "verification should fail for corrupted data");
+
+    if let Err(PieceError::PieceHashMismatch {
+        piece_index,
+        expected_hash,
+        computed_hash,
+    }) = result
+    {
+        assert_eq!(piece_index, 42, "piece index should match");
+        assert_eq!(
+            expected_hash, "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
+            "expected hash should be the TEST_HASH"
+        );
+        // "Test" hashes to different value
+        assert_ne!(
+            computed_hash, expected_hash,
+            "computed hash should differ from expected"
+        );
+    } else {
+        panic!("expected PieceHashMismatch error");
+    }
+}
+
+#[test]
+fn verify_piece_fails_with_empty_data() {
+    // Empty data should not match the "test" hash
+    let result = verify_piece(7, b"", &TEST_HASH);
+    assert!(result.is_err(), "empty data should fail verification");
+
+    match result {
+        Err(PieceError::PieceHashMismatch { piece_index, .. }) => {
+            assert_eq!(piece_index, 7);
+        }
+        _ => panic!("expected PieceHashMismatch error"),
+    }
+}
+
+#[test]
+fn verify_piece_succeeds_with_empty_data_and_correct_hash() {
+    // SHA1 of empty string is da39a3ee5e6b4b0d3255bfef95601890afd80709
+    let empty_hash: [u8; 20] = [
+        0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55,
+        0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09,
+    ];
+
+    let result = verify_piece(0, b"", &empty_hash);
+    assert!(result.is_ok(), "empty data should verify against empty hash");
+}
+
+#[test]
+fn verify_piece_piece_index_preserved_in_error() {
+    // Verify that various piece indices are correctly preserved
+    for piece_index in [0, 1, 100, 1000, u32::MAX] {
+        let result = verify_piece(piece_index, b"wrong data", &TEST_HASH);
+        if let Err(PieceError::PieceHashMismatch {
+            piece_index: idx, ..
+        }) = result
+        {
+            assert_eq!(idx, piece_index, "piece index should be preserved");
+        } else {
+            panic!("expected hash mismatch error");
+        }
+    }
+}
+
+#[test]
+fn verify_piece_with_larger_data() {
+    // Test with a larger piece to ensure the hasher handles arbitrary sizes
+    // Create 256 KiB of data (a typical piece size)
+    let large_data: Vec<u8> = (0..262144).map(|i| (i % 256) as u8).collect();
+
+    // Compute what the hash should be
+    use sha1::{Sha1, Digest};
+    let mut hasher = Sha1::new();
+    hasher.update(&large_data);
+    let expected: [u8; 20] = hasher.finalize().into();
+
+    // Verification should succeed
+    let result = verify_piece(0, &large_data, &expected);
+    assert!(result.is_ok(), "large piece should verify correctly");
+
+    // Corrupting one byte should cause failure
+    let mut corrupted = large_data.clone();
+    corrupted[0] ^= 0xFF;
+    let result = verify_piece(0, &corrupted, &expected);
+    assert!(result.is_err(), "corrupted piece should fail verification");
 }
 @
