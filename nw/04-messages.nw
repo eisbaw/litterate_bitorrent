@@ -152,6 +152,18 @@ pub enum PeerError {
     #[error("connection closed by peer")]
     ConnectionClosed,
 
+    /// Attempted to connect to a peer we are already connected to.
+    ///
+    /// The `PeerConnectionManager` tracks active connections by socket address.
+    /// If we try to connect to the same address twice, this error is returned
+    /// rather than creating a duplicate connection. This can happen if:
+    /// - The same peer appears multiple times in tracker response
+    /// - A reconnection attempt happens before the old connection is removed
+    ///
+    /// This is not a protocol violation---simply skip this peer and continue.
+    #[error("already connected to this peer")]
+    AlreadyConnected,
+
     /// An underlying I/O error occurred.
     ///
     /// This wraps `std::io::Error` for errors that don't fit the more
@@ -370,6 +382,13 @@ fn connection_closed_has_clear_message() {
     let err = PeerError::ConnectionClosed;
     let msg = err.to_string();
     assert!(msg.contains("connection") || msg.contains("closed"), "msg: {}", msg);
+}
+
+#[test]
+fn already_connected_has_clear_message() {
+    let err = PeerError::AlreadyConnected;
+    let msg = err.to_string();
+    assert!(msg.contains("already connected"), "msg: {}", msg);
 }
 
 #[test]
