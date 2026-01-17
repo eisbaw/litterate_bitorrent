@@ -305,6 +305,8 @@ a foundation.
 
 <<message impl>>
 
+<<bitfield validation>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +319,8 @@ mod tests {
     <<handshake tests>>
 
     <<message tests>>
+
+    <<bitfield validation tests>>
 }
 @
 
@@ -3125,6 +3129,404 @@ These parsing tests verify:
 \item Messages without payloads reject extra data
 \item Edge cases like maximum values work correctly
 \end{itemize}
+
+\subsection{Bitfield Validation}
+
+When a peer sends a bitfield message, we must validate two properties:
+
+\begin{enumerate}
+\item \textbf{Correct length}: The bitfield must have exactly $\lceil\mathit{num\_pieces}/8\rceil$
+  bytes. A bitfield that is too short cannot represent all pieces; a bitfield
+  that is too long wastes bandwidth and may indicate a protocol violation.
+
+\item \textbf{Zero spare bits}: If the number of pieces is not a multiple of 8,
+  the last byte contains ``spare'' bits that do not correspond to any piece.
+  According to BEP 3, these spare bits must be zero. A non-zero spare bit
+  indicates a buggy client that may be setting invalid piece flags.
+\end{enumerate}
+
+For example, a torrent with 10 pieces needs a 2-byte bitfield (bits 0--9 are
+meaningful, bits 10--15 are spare). The layout is:
+
+\begin{verbatim}
+Byte 0: | bit 0 | bit 1 | bit 2 | bit 3 | bit 4 | bit 5 | bit 6 | bit 7 |
+Byte 1: | bit 8 | bit 9 | spare | spare | spare | spare | spare | spare |
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  These 6 bits must be zero
+\end{verbatim}
+
+The spare bits are the low-order bits of the last byte. For $n$ pieces where
+$n \mod 8 \neq 0$, the number of spare bits is $8 - (n \mod 8)$.
+
+<<bitfield validation>>=
+/// Computes the expected bitfield length in bytes for a given number of pieces.
+///
+/// The bitfield has one bit per piece, packed into bytes. Since pieces are
+/// numbered from 0 and the number of pieces may not be a multiple of 8, we
+/// need `ceil(num_pieces / 8)` bytes to represent all pieces.
+///
+/// # Arguments
+///
+/// * `num_pieces` - The total number of pieces in the torrent
+///
+/// # Returns
+///
+/// The number of bytes needed to represent `num_pieces` bits.
+///
+/// # Edge Cases
+///
+/// - `num_pieces = 0` returns 0 (no bytes needed for zero pieces)
+/// - `num_pieces = 1` through 8 returns 1 (all fit in one byte)
+/// - `num_pieces = 9` returns 2 (needs a second byte for the 9th piece)
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::bitfield_length;
+///
+/// assert_eq!(bitfield_length(0), 0);
+/// assert_eq!(bitfield_length(1), 1);
+/// assert_eq!(bitfield_length(8), 1);
+/// assert_eq!(bitfield_length(9), 2);
+/// assert_eq!(bitfield_length(1000), 125);
+/// ```
+#[must_use]
+pub fn bitfield_length(num_pieces: u32) -> usize {
+    // Integer ceiling division: (n + 7) / 8 computes ceil(n / 8)
+    // This works because adding 7 before division rounds up any remainder.
+    // For n=0: (0+7)/8 = 0
+    // For n=1-8: (n+7)/8 = 1
+    // For n=9-16: (n+7)/8 = 2
+    // etc.
+    ((num_pieces + 7) / 8) as usize
+}
+
+/// Validates a bitfield against the expected number of pieces.
+///
+/// This function checks two invariants required by BEP 3:
+///
+/// 1. **Length**: The bitfield must have exactly `ceil(num_pieces / 8)` bytes.
+///    A mismatch indicates either a different torrent or a protocol bug.
+///
+/// 2. **Spare bits**: If `num_pieces` is not a multiple of 8, the last byte
+///    contains spare bits that must be zero. Non-zero spare bits indicate
+///    a buggy client setting invalid piece flags.
+///
+/// # Arguments
+///
+/// * `bits` - The bitfield bytes to validate
+/// * `num_pieces` - The expected number of pieces in the torrent
+///
+/// # Returns
+///
+/// * `Ok(())` if the bitfield is valid
+/// * `Err(PeerError::BitfieldWrongLength)` if the length doesn't match
+/// * `Err(PeerError::InvalidMessage)` if spare bits are set
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::{validate_bitfield, PeerError};
+///
+/// // Valid bitfield for 10 pieces: 2 bytes, spare bits zero
+/// assert!(validate_bitfield(&[0xFF, 0xC0], 10).is_ok());
+///
+/// // Wrong length: 1 byte for 10 pieces
+/// let err = validate_bitfield(&[0xFF], 10).unwrap_err();
+/// assert!(matches!(err, PeerError::BitfieldWrongLength { .. }));
+///
+/// // Spare bits set: last 6 bits should be zero but aren't
+/// let err = validate_bitfield(&[0xFF, 0xC1], 10).unwrap_err();
+/// assert!(matches!(err, PeerError::InvalidMessage(_)));
+/// ```
+pub fn validate_bitfield(bits: &[u8], num_pieces: u32) -> Result<(), PeerError> {
+    let expected_len = bitfield_length(num_pieces);
+
+    // Check length first
+    if bits.len() != expected_len {
+        return Err(PeerError::BitfieldWrongLength {
+            expected: expected_len,
+            actual: bits.len(),
+        });
+    }
+
+    // For zero pieces, we're done (no bytes, no spare bits)
+    if num_pieces == 0 {
+        return Ok(());
+    }
+
+    // Check spare bits in the last byte
+    // The number of meaningful bits in the last byte is: num_pieces % 8
+    // If this is 0, all 8 bits are meaningful (no spare bits)
+    // Otherwise, the spare bits are the low-order (8 - meaningful) bits
+    let meaningful_bits_in_last_byte = (num_pieces % 8) as u8;
+
+    if meaningful_bits_in_last_byte != 0 {
+        // There are spare bits to check
+        let spare_count = 8 - meaningful_bits_in_last_byte;
+        // Mask for spare bits: e.g., for 2 spare bits, mask = 0b00000011
+        let spare_mask = (1u8 << spare_count) - 1;
+
+        let last_byte = bits[bits.len() - 1];
+        if (last_byte & spare_mask) != 0 {
+            return Err(PeerError::InvalidMessage(format!(
+                "bitfield has non-zero spare bits: last byte is 0x{:02X}, \
+                 but last {} bits must be zero",
+                last_byte, spare_count
+            )));
+        }
+    }
+
+    Ok(())
+}
+@
+
+The implementation uses integer ceiling division for [[bitfield_length]]: adding
+7 before dividing by 8 ensures we round up rather than down. This is a common
+idiom for computing $\lceil n/d \rceil$ as $(n + d - 1) / d$.
+
+The spare bit check computes a mask for the low-order bits that should be zero.
+For example, with 10 pieces (2 meaningful bits in the last byte, 6 spare bits),
+the mask is [[0b00111111 = 0x3F]]. We AND this mask with the last byte; a non-zero
+result means at least one spare bit is set.
+
+\subsubsection{Bitfield Validation Tests}
+
+We test both the length computation and the validation function across various
+edge cases specified in the acceptance criteria.
+
+<<bitfield validation tests>>=
+// Tests for bitfield_length function
+
+#[test]
+fn bitfield_length_zero_pieces() {
+    // Zero pieces requires zero bytes
+    assert_eq!(bitfield_length(0), 0);
+}
+
+#[test]
+fn bitfield_length_one_piece() {
+    // One piece fits in one byte (only bit 7 of byte 0 is used)
+    assert_eq!(bitfield_length(1), 1);
+}
+
+#[test]
+fn bitfield_length_eight_pieces() {
+    // Eight pieces exactly fills one byte
+    assert_eq!(bitfield_length(8), 1);
+}
+
+#[test]
+fn bitfield_length_nine_pieces() {
+    // Nine pieces needs two bytes (8 bits in byte 0, 1 bit in byte 1)
+    assert_eq!(bitfield_length(9), 2);
+}
+
+#[test]
+fn bitfield_length_1000_pieces() {
+    // 1000 pieces needs ceil(1000/8) = 125 bytes
+    assert_eq!(bitfield_length(1000), 125);
+}
+
+#[test]
+fn bitfield_length_exact_multiples() {
+    // Test exact multiples of 8
+    assert_eq!(bitfield_length(16), 2);
+    assert_eq!(bitfield_length(24), 3);
+    assert_eq!(bitfield_length(64), 8);
+    assert_eq!(bitfield_length(256), 32);
+}
+
+#[test]
+fn bitfield_length_various() {
+    // Test various non-multiple cases
+    assert_eq!(bitfield_length(2), 1);
+    assert_eq!(bitfield_length(7), 1);
+    assert_eq!(bitfield_length(10), 2);
+    assert_eq!(bitfield_length(15), 2);
+    assert_eq!(bitfield_length(17), 3);
+}
+
+// Tests for validate_bitfield function - length validation
+
+#[test]
+fn validate_bitfield_zero_pieces() {
+    // Zero pieces: empty bitfield is valid
+    assert!(validate_bitfield(&[], 0).is_ok());
+
+    // Non-empty bitfield for zero pieces is wrong length
+    let err = validate_bitfield(&[0x00], 0).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 0, actual: 1 }));
+}
+
+#[test]
+fn validate_bitfield_one_piece() {
+    // One piece needs 1 byte
+    // All bits except the high bit are spare and must be zero
+    assert!(validate_bitfield(&[0x80], 1).is_ok()); // piece 0 present
+    assert!(validate_bitfield(&[0x00], 1).is_ok()); // piece 0 absent
+
+    // Wrong length
+    let err = validate_bitfield(&[], 1).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 1, actual: 0 }));
+
+    let err = validate_bitfield(&[0x00, 0x00], 1).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 1, actual: 2 }));
+}
+
+#[test]
+fn validate_bitfield_eight_pieces() {
+    // Eight pieces: all 8 bits are meaningful, no spare bits
+    assert!(validate_bitfield(&[0xFF], 8).is_ok()); // all present
+    assert!(validate_bitfield(&[0x00], 8).is_ok()); // none present
+    assert!(validate_bitfield(&[0xAA], 8).is_ok()); // alternating
+
+    // Wrong length
+    let err = validate_bitfield(&[], 8).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 1, actual: 0 }));
+}
+
+#[test]
+fn validate_bitfield_nine_pieces() {
+    // Nine pieces: 2 bytes needed
+    // Byte 0: bits 0-7 (all meaningful)
+    // Byte 1: bit 8 meaningful (high bit), bits 1-7 spare (must be zero)
+
+    // Valid: spare bits (low 7 bits of byte 1) are zero
+    assert!(validate_bitfield(&[0xFF, 0x80], 9).is_ok());
+    assert!(validate_bitfield(&[0x00, 0x00], 9).is_ok());
+    assert!(validate_bitfield(&[0xFF, 0x00], 9).is_ok());
+
+    // Wrong length
+    let err = validate_bitfield(&[0xFF], 9).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 2, actual: 1 }));
+}
+
+#[test]
+fn validate_bitfield_1000_pieces() {
+    // 1000 pieces: 125 bytes needed
+    // 1000 = 125 * 8, so no spare bits
+    let bitfield = vec![0xFF; 125];
+    assert!(validate_bitfield(&bitfield, 1000).is_ok());
+
+    let bitfield = vec![0x00; 125];
+    assert!(validate_bitfield(&bitfield, 1000).is_ok());
+
+    // Wrong length
+    let err = validate_bitfield(&vec![0x00; 124], 1000).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 125, actual: 124 }));
+
+    let err = validate_bitfield(&vec![0x00; 126], 1000).unwrap_err();
+    assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 125, actual: 126 }));
+}
+
+// Tests for validate_bitfield function - spare bits validation
+
+#[test]
+fn validate_bitfield_spare_bits_zero_ok() {
+    // 10 pieces: 2 bytes, 6 spare bits in last byte
+    // Bits 0-7 in byte 0, bits 8-9 in byte 1 (high 2 bits)
+    // Spare bits are low 6 bits of byte 1
+
+    // Valid: all spare bits zero
+    assert!(validate_bitfield(&[0xFF, 0xC0], 10).is_ok()); // 0xC0 = 0b11000000
+    assert!(validate_bitfield(&[0xFF, 0x80], 10).is_ok()); // 0x80 = 0b10000000
+    assert!(validate_bitfield(&[0xFF, 0x40], 10).is_ok()); // 0x40 = 0b01000000
+    assert!(validate_bitfield(&[0xFF, 0x00], 10).is_ok()); // 0x00 = 0b00000000
+}
+
+#[test]
+fn validate_bitfield_spare_bits_nonzero_rejected() {
+    // 10 pieces: 6 spare bits in last byte must be zero
+
+    // Invalid: one spare bit set
+    let err = validate_bitfield(&[0xFF, 0xC1], 10).unwrap_err(); // 0xC1 = 0b11000001
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    let err = validate_bitfield(&[0xFF, 0x01], 10).unwrap_err(); // 0x01 = 0b00000001
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    // Invalid: multiple spare bits set
+    let err = validate_bitfield(&[0xFF, 0x3F], 10).unwrap_err(); // 0x3F = 0b00111111
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    let err = validate_bitfield(&[0xFF, 0xFF], 10).unwrap_err(); // All bits including spare
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+}
+
+#[test]
+fn validate_bitfield_spare_bits_one_piece() {
+    // 1 piece: 7 spare bits (low 7 bits must be zero)
+
+    // Valid
+    assert!(validate_bitfield(&[0x80], 1).is_ok());
+    assert!(validate_bitfield(&[0x00], 1).is_ok());
+
+    // Invalid: any of the low 7 bits set
+    let err = validate_bitfield(&[0x81], 1).unwrap_err(); // 0x81 = 0b10000001
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    let err = validate_bitfield(&[0x40], 1).unwrap_err(); // 0x40 = 0b01000000, but wait...
+    // Actually 0x40 sets bit 6 (from high), which is spare bit 1
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    let err = validate_bitfield(&[0x7F], 1).unwrap_err(); // 0x7F = 0b01111111
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+}
+
+#[test]
+fn validate_bitfield_spare_bits_seven_pieces() {
+    // 7 pieces: 1 spare bit (low 1 bit must be zero)
+
+    // Valid: low bit is zero
+    assert!(validate_bitfield(&[0xFE], 7).is_ok()); // 0xFE = 0b11111110
+    assert!(validate_bitfield(&[0x00], 7).is_ok());
+    assert!(validate_bitfield(&[0x80], 7).is_ok());
+
+    // Invalid: low bit is set
+    let err = validate_bitfield(&[0xFF], 7).unwrap_err(); // 0xFF = 0b11111111
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+
+    let err = validate_bitfield(&[0x01], 7).unwrap_err(); // 0x01 = 0b00000001
+    assert!(matches!(err, PeerError::InvalidMessage(_)));
+}
+
+#[test]
+fn validate_bitfield_no_spare_bits() {
+    // 8 pieces: exactly fills 1 byte, no spare bits
+    // Any value should be valid (length permitting)
+    assert!(validate_bitfield(&[0x00], 8).is_ok());
+    assert!(validate_bitfield(&[0xFF], 8).is_ok());
+    assert!(validate_bitfield(&[0x01], 8).is_ok());
+    assert!(validate_bitfield(&[0x80], 8).is_ok());
+    assert!(validate_bitfield(&[0xAB], 8).is_ok());
+
+    // 16 pieces: exactly fills 2 bytes, no spare bits
+    assert!(validate_bitfield(&[0xFF, 0xFF], 16).is_ok());
+    assert!(validate_bitfield(&[0x00, 0x01], 16).is_ok());
+}
+
+#[test]
+fn validate_bitfield_error_messages_are_descriptive() {
+    // Verify error messages contain useful information
+
+    let err = validate_bitfield(&[0xFF], 10).unwrap_err();
+    if let PeerError::BitfieldWrongLength { expected, actual } = err {
+        assert_eq!(expected, 2);
+        assert_eq!(actual, 1);
+    } else {
+        panic!("expected BitfieldWrongLength, got {:?}", err);
+    }
+
+    let err = validate_bitfield(&[0xFF, 0xFF], 10).unwrap_err();
+    if let PeerError::InvalidMessage(msg) = err {
+        assert!(msg.contains("spare"), "message should mention 'spare': {}", msg);
+        assert!(msg.contains("0xFF"), "message should show byte value: {}", msg);
+    } else {
+        panic!("expected InvalidMessage, got {:?}", err);
+    }
+}
+@
 
 \subsection{Next Steps}
 

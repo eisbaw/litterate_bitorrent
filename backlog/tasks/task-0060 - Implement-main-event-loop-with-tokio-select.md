@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:29'
-updated_date: '2026-01-17 21:42'
+updated_date: '2026-01-17 21:49'
 labels:
   - phase-6
   - event-loop
@@ -61,53 +61,5 @@ The central event loop that multiplexes all async operations using tokio::select
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Summary
-
-Implemented the main event loop using tokio::select\! to multiplex all async operations in the BitTorrent client.
-
-## Changes Made
-
-### Event Loop Core (nw/07-client.nw)
-
-1. **Event Types**: Added `EventLoopEvent` enum with variants for:
-   - `PeerMessage` - incoming messages from peers
-   - `PeerDisconnected` - connection lost
-   - `RequestTimeoutCheck` - 30s periodic check
-   - `ReAnnounce` - tracker re-announce timer
-   - `KeepAliveCheck` - 120s keep-alive timer
-   - `Shutdown` - graceful shutdown
-   - `DownloadComplete` - all pieces verified
-
-2. **Event Loop Context**: Created `EventLoopContext` struct to pass all required state (connection_manager, piece_manager, availability, shutdown, request_queues, in_progress_pieces, etc.)
-
-3. **Main Loop**: `run_event_loop()` function using tokio::select\! with biased ordering:
-   - Shutdown has highest priority
-   - Timer checks for timeouts, keep-alives, re-announce
-   - Peer message reading from first available connection
-
-4. **Message Handlers**: Integrated with existing handlers:
-   - Choke/Unchoke handling with request triggering
-   - Have/Bitfield with interested message sending
-   - Piece data with verification and completion checking
-
-5. **Timeout Handling**: Two-pass approach to avoid borrow checker issues:
-   - First pass: collect all timed-out requests
-   - Second pass: process cancels and re-assignments
-
-6. **Keep-Alive Handling**: Sends keep-alives to idle peers after 120s
-
-### Connection Manager Extension
-
-- Added `connections_map_mut()` method to access internal HashMap
-
-### Tests
-
-- Unit tests for `EventLoopAction` equality and `EventLoopEvent` debug
-- Test for `read_from_first_peer` with empty connections
-- Integration tests for shutdown controller triggering
-
-## Testing
-
-- All 740+ tests pass
-- Clippy lint check passes with no warnings
+Implemented main event loop with tokio::select!. Sequential peer reading (not FuturesUnordered) used to avoid external dependency - may optimize later.
 <!-- SECTION:NOTES:END -->
