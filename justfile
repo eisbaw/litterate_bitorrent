@@ -22,6 +22,7 @@ tangle:
     notangle -Rpieces.rs nw/05-pieces.nw > src/pieces.rs
     notangle -Rcli.rs nw/06-cli.nw > src/cli.rs
     notangle -Rclient.rs nw/07-client.nw > src/client.rs
+    notangle -Rdisk.rs nw/08-disk.nw > src/disk.rs
 
 # Weave: generate PDF documentation from noweb source
 # Creates doc/ directory and produces doc/literate-bittorrent.pdf

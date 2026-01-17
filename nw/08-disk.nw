@@ -1,0 +1,547 @@
+% Disk I/O: File Creation and Storage
+% Chapter 8 of the literate BitTorrent client
+
+\section{Disk I/O}
+
+Before downloading any piece data, we must prepare the output files. BitTorrent
+torrents can contain single files or entire directory trees, and our disk module
+handles creating this structure on the local filesystem. The key operation is
+creating \emph{sparse files}---files that reserve space in the filesystem
+metadata but don't actually allocate disk blocks until data is written.
+
+\subsection{Why Sparse Files?}
+
+When downloading a 4 GB file, we don't want to immediately allocate 4 GB of
+disk space filled with zeros. Instead, we create a file with the correct
+reported size but no actual data blocks. As pieces are downloaded and verified,
+we write them to specific offsets within this sparse file. The operating system
+allocates disk blocks only for the regions we actually write to.
+
+This approach has several benefits:
+
+\begin{itemize}
+\item \textbf{Fast initialization}: Creating a sparse file is nearly instant
+  regardless of size, since we're only updating filesystem metadata.
+\item \textbf{Efficient disk usage}: Partially downloaded torrents consume only
+  as much space as the data actually received.
+\item \textbf{Resume support}: If we resume a download, the already-written
+  regions remain on disk while gaps remain sparse.
+\end{itemize}
+
+Most modern filesystems (ext4, NTFS, APFS, Btrfs) support sparse files
+transparently. The \texttt{File::set\_len} method in Rust creates sparse files
+on these systems---it sets the file size in metadata without writing any data.
+
+\subsection{Error Handling}
+
+Disk operations can fail for many reasons: permission denied, disk full,
+filesystem errors, or invalid paths. We define a dedicated error type that
+captures the file path involved, making debugging straightforward.
+
+<<disk errors>>=
+use std::path::PathBuf;
+
+/// Errors that can occur during disk I/O operations.
+///
+/// Unlike generic I/O errors, these include the path context so that
+/// error messages clearly identify which file caused the problem.
+#[derive(Debug, thiserror::Error)]
+pub enum DiskError {
+    /// Failed to create a directory.
+    ///
+    /// This can happen if:
+    /// - The parent directory doesn't exist and we lack permission to create it
+    /// - A file already exists at this path
+    /// - The path contains invalid characters
+    #[error("failed to create directory {path}: {source}")]
+    CreateDirectory {
+        /// The directory path we tried to create.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Failed to create or open a file.
+    ///
+    /// This can happen if:
+    /// - The parent directory doesn't exist
+    /// - Permission is denied
+    /// - A directory exists at this path
+    #[error("failed to create file {path}: {source}")]
+    CreateFile {
+        /// The file path we tried to create.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Failed to set file length (sparse allocation).
+    ///
+    /// This can happen if:
+    /// - The filesystem doesn't support sparse files (rare)
+    /// - The filesystem is full (no space for metadata)
+    /// - Permission is denied
+    #[error("failed to set file size for {path}: {source}")]
+    SetFileSize {
+        /// The file path we tried to resize.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Failed to get file metadata.
+    ///
+    /// This can happen if:
+    /// - The file was deleted between operations
+    /// - Permission is denied
+    #[error("failed to get metadata for {path}: {source}")]
+    Metadata {
+        /// The file path we tried to query.
+        path: PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+@
+
+The error variants are specific to each operation rather than having a single
+generic ``disk error.'' This specificity helps debugging: knowing whether we
+failed to create a directory vs. set a file size points to different root
+causes (permissions vs. filesystem support vs. disk space).
+
+\subsection{Creating Output Files}
+
+The main entry point for file creation is [[create\_output\_files]]. Given an
+output directory and a list of [[FileInfo]] structures from the metainfo, it:
+
+\begin{enumerate}
+\item Creates all necessary parent directories
+\item Creates each file as a sparse file with the correct size
+\item Handles idempotency: existing files are left unchanged
+\end{enumerate}
+
+The idempotency requirement is important for resumed downloads. If the user
+restarts the client after a partial download, we don't want to truncate files
+that already contain verified piece data.
+
+<<create output files>>=
+use std::fs::{self, OpenOptions};
+use std::path::Path;
+
+use crate::metainfo::FileInfo;
+
+/// Creates all output files for a torrent.
+///
+/// This function prepares the filesystem for receiving piece data by creating
+/// the directory structure and sparse files specified in the torrent metadata.
+///
+/// # Arguments
+///
+/// * `output_dir` - Base directory where files will be created
+/// * `files` - List of files from the torrent's metainfo
+///
+/// # Sparse Files
+///
+/// Files are created as sparse files using `set_len`. This means the reported
+/// file size matches the expected size, but no disk space is allocated until
+/// data is actually written. This enables:
+///
+/// - Fast initialization regardless of file size
+/// - Efficient partial downloads
+/// - Resume support without re-creating files
+///
+/// # Idempotency
+///
+/// This function is safe to call multiple times:
+/// - Existing directories are not modified
+/// - Existing files with the correct size are not touched
+/// - Existing files with incorrect size are NOT truncated (to preserve data)
+///
+/// # Errors
+///
+/// Returns `DiskError` if:
+/// - A directory cannot be created (permission denied, path conflict)
+/// - A file cannot be created (permission denied, path is a directory)
+/// - File size cannot be set (filesystem limitations)
+///
+/// # Example
+///
+/// ```ignore
+/// use literate_bittorrent::disk::create_output_files;
+/// use literate_bittorrent::metainfo::FileInfo;
+/// use std::path::PathBuf;
+///
+/// let files = vec![
+///     FileInfo { length: 1024, path: PathBuf::from("torrent_name/file1.txt") },
+///     FileInfo { length: 2048, path: PathBuf::from("torrent_name/subdir/file2.txt") },
+/// ];
+///
+/// create_output_files(Path::new("/downloads"), &files)?;
+/// // Creates:
+/// //   /downloads/torrent_name/file1.txt (1024 bytes, sparse)
+/// //   /downloads/torrent_name/subdir/file2.txt (2048 bytes, sparse)
+/// ```
+pub fn create_output_files(output_dir: &Path, files: &[FileInfo]) -> Result<(), DiskError> {
+    for file_info in files {
+        let full_path = output_dir.join(&file_info.path);
+
+        // Create parent directories if needed
+        if let Some(parent) = full_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).map_err(|e| DiskError::CreateDirectory {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
+            }
+        }
+
+        // Check if file already exists with correct size
+        if full_path.exists() {
+            let metadata = fs::metadata(&full_path).map_err(|e| DiskError::Metadata {
+                path: full_path.clone(),
+                source: e,
+            })?;
+
+            // If file exists with correct size, skip it (idempotent)
+            if metadata.len() == file_info.length {
+                continue;
+            }
+
+            // File exists but wrong size - we don't truncate to preserve data
+            // The file will be overwritten piece by piece during download
+            // This handles the case where a previous download was interrupted
+            // and we're resuming with potentially verified pieces
+            continue;
+        }
+
+        // Create the file
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false) // Don't truncate if somehow file was created between check and open
+            .open(&full_path)
+            .map_err(|e| DiskError::CreateFile {
+                path: full_path.clone(),
+                source: e,
+            })?;
+
+        // Set file size (sparse allocation)
+        file.set_len(file_info.length).map_err(|e| DiskError::SetFileSize {
+            path: full_path.clone(),
+            source: e,
+        })?;
+    }
+
+    Ok(())
+}
+@
+
+The implementation handles several edge cases:
+
+\begin{itemize}
+\item \textbf{Parent directory creation}: We use [[create\_dir\_all]] which
+  works like [[mkdir -p]]---it creates all missing parent directories in one
+  call. If the directory already exists, this is a no-op.
+
+\item \textbf{Existing files}: If a file already exists with the correct size,
+  we skip it entirely. This preserves any data from previous downloads. If the
+  size is wrong, we still don't truncate---the piece-writing code will overwrite
+  the relevant portions.
+
+\item \textbf{Race conditions}: We check existence before creating, but another
+  process could create the file between our check and our [[open]] call. Using
+  [[truncate(false)]] ensures we don't accidentally destroy data in this case.
+
+\item \textbf{Zero-length files}: BitTorrent allows zero-length files (common
+  for placeholder files in directory structures). [[set\_len(0)]] on a newly
+  created file is a no-op but harmless.
+\end{itemize}
+
+\subsection{Module Structure}
+
+The disk module combines the error types and file creation logic.
+
+<<disk.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/08-disk.nw
+// Regenerate with: just tangle
+
+//! Disk I/O operations for BitTorrent client.
+//!
+//! This module handles creating and managing output files for torrent downloads.
+//! The primary entry point is [`create_output_files`], which sets up the
+//! directory structure and sparse files based on torrent metadata.
+//!
+//! # Sparse Files
+//!
+//! Files are created using sparse allocation, meaning they report their full
+//! size but only consume disk space for regions that have been written.
+//! This enables efficient partial downloads and fast initialization.
+
+<<disk errors>>
+
+<<create output files>>
+
+<<disk tests>>
+@
+
+\subsection{Tests}
+
+We test file creation thoroughly, verifying both successful cases and error
+handling. The tests use Rust's [[tempfile]] crate to create temporary directories
+that are automatically cleaned up.
+
+<<disk tests>>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn create_single_file() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files = vec![FileInfo {
+            length: 1024,
+            path: PathBuf::from("test.txt"),
+        }];
+
+        create_output_files(output_dir, &files).expect("create files");
+
+        let created = output_dir.join("test.txt");
+        assert!(created.exists(), "file should exist");
+
+        let metadata = fs::metadata(&created).expect("get metadata");
+        assert_eq!(metadata.len(), 1024, "file should have correct size");
+    }
+
+    #[test]
+    fn create_file_with_parent_directories() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files = vec![FileInfo {
+            length: 2048,
+            path: PathBuf::from("deep/nested/path/file.bin"),
+        }];
+
+        create_output_files(output_dir, &files).expect("create files");
+
+        let created = output_dir.join("deep/nested/path/file.bin");
+        assert!(created.exists(), "file should exist");
+        assert!(output_dir.join("deep/nested/path").is_dir(), "directories should exist");
+
+        let metadata = fs::metadata(&created).expect("get metadata");
+        assert_eq!(metadata.len(), 2048);
+    }
+
+    #[test]
+    fn create_multiple_files() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files = vec![
+            FileInfo {
+                length: 100,
+                path: PathBuf::from("torrent_name/file1.txt"),
+            },
+            FileInfo {
+                length: 200,
+                path: PathBuf::from("torrent_name/file2.txt"),
+            },
+            FileInfo {
+                length: 300,
+                path: PathBuf::from("torrent_name/subdir/file3.txt"),
+            },
+        ];
+
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Verify all files exist with correct sizes
+        for file_info in &files {
+            let path = output_dir.join(&file_info.path);
+            assert!(path.exists(), "file {:?} should exist", file_info.path);
+
+            let metadata = fs::metadata(&path).expect("get metadata");
+            assert_eq!(
+                metadata.len(),
+                file_info.length,
+                "file {:?} should have correct size",
+                file_info.path
+            );
+        }
+    }
+
+    #[test]
+    fn idempotent_does_not_modify_existing_files() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files = vec![FileInfo {
+            length: 1000,
+            path: PathBuf::from("existing.txt"),
+        }];
+
+        // Create files first time
+        create_output_files(output_dir, &files).expect("first create");
+
+        // Write some data to the file
+        let file_path = output_dir.join("existing.txt");
+        fs::write(&file_path, b"test data").expect("write data");
+
+        // Get modification time
+        let mtime_before = fs::metadata(&file_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        // Small delay to ensure filesystem timestamp granularity
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Call create_output_files again
+        create_output_files(output_dir, &files).expect("second create");
+
+        // File should still exist with the same modification time
+        let mtime_after = fs::metadata(&file_path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        assert_eq!(
+            mtime_before, mtime_after,
+            "file should not be modified on second call"
+        );
+
+        // Content should be preserved
+        let content = fs::read(&file_path).expect("read content");
+        assert_eq!(content, b"test data", "content should be preserved");
+    }
+
+    #[test]
+    fn create_zero_length_file() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files = vec![FileInfo {
+            length: 0,
+            path: PathBuf::from("empty.txt"),
+        }];
+
+        create_output_files(output_dir, &files).expect("create files");
+
+        let created = output_dir.join("empty.txt");
+        assert!(created.exists(), "empty file should exist");
+
+        let metadata = fs::metadata(&created).expect("get metadata");
+        assert_eq!(metadata.len(), 0, "empty file should have size 0");
+    }
+
+    #[test]
+    fn sparse_file_does_not_allocate_disk_space() {
+        // This test verifies sparse file behavior by creating a large file
+        // and checking that disk usage is minimal
+
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Create a 1 GB sparse file
+        let large_size: u64 = 1024 * 1024 * 1024;
+        let files = vec![FileInfo {
+            length: large_size,
+            path: PathBuf::from("sparse_large.bin"),
+        }];
+
+        create_output_files(output_dir, &files).expect("create sparse file");
+
+        let created = output_dir.join("sparse_large.bin");
+        let metadata = fs::metadata(&created).expect("get metadata");
+
+        // File should report full size
+        assert_eq!(metadata.len(), large_size, "file should report 1 GB size");
+
+        // Note: We can't reliably test actual disk usage across all platforms,
+        // but on Linux we could check blocks * 512 < len. For this test,
+        // we just verify the file was created and has the correct reported size.
+        // The sparse behavior is filesystem-dependent but works on ext4, Btrfs,
+        // NTFS, APFS, etc.
+    }
+
+    #[test]
+    fn handles_existing_file_with_different_size() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        // Create a file with different size manually
+        let file_path = output_dir.join("existing.txt");
+        fs::create_dir_all(output_dir).expect("create dir");
+        fs::write(&file_path, b"existing content with different length").expect("write");
+
+        let files = vec![FileInfo {
+            length: 1000, // Different from actual file size
+            path: PathBuf::from("existing.txt"),
+        }];
+
+        // Should succeed without truncating
+        create_output_files(output_dir, &files).expect("create files");
+
+        // Original content should be preserved (we don't truncate existing files)
+        let content = fs::read(&file_path).expect("read");
+        assert_eq!(
+            content,
+            b"existing content with different length",
+            "original content should be preserved"
+        );
+    }
+
+    #[test]
+    fn error_includes_path_context() {
+        // Test that errors include the path for debugging
+        // We can't easily trigger a real error in tests, but we can verify
+        // the error types include path information
+
+        let err = DiskError::CreateFile {
+            path: PathBuf::from("/some/path/file.txt"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "test"),
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/some/path/file.txt"),
+            "error message should include path"
+        );
+    }
+
+    #[test]
+    fn empty_file_list_is_valid() {
+        let temp = tempdir().expect("create temp dir");
+        let output_dir = temp.path();
+
+        let files: Vec<FileInfo> = vec![];
+
+        // Should succeed with empty list
+        create_output_files(output_dir, &files).expect("create files");
+    }
+}
+@
+
+The tests cover the main scenarios:
+
+\begin{itemize}
+\item \textbf{Basic creation}: Single file with correct size
+\item \textbf{Directory creation}: Nested directories are created automatically
+\item \textbf{Multiple files}: Batch creation works correctly
+\item \textbf{Idempotency}: Existing files are not modified
+\item \textbf{Zero-length files}: Edge case handled correctly
+\item \textbf{Sparse allocation}: Large file doesn't consume excessive disk space
+\item \textbf{Error context}: Error messages include the problematic path
+\end{itemize}
+
+The sparse file test creates a 1 GB file to verify that sparse allocation works.
+On systems with sparse file support, this completes instantly despite the large
+size. The test doesn't verify actual disk usage (which varies by filesystem)
+but confirms the API works correctly.

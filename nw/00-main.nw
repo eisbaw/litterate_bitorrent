@@ -125,6 +125,7 @@ reused. The library root re-exports all public modules.
 pub mod bencode;
 pub mod cli;
 pub mod client;
+pub mod disk;
 pub mod metainfo;
 pub mod tracker;
 pub mod messages;
@@ -140,11 +141,10 @@ The following chapters will be included as they are developed:
 \item \texttt{02-metainfo.nw} --- Torrent file parsing
 \item \texttt{03-tracker.nw} --- HTTP tracker protocol
 \item \texttt{04-messages.nw} --- Peer wire protocol messages
-\item \texttt{05-peer.nw} --- Peer connection handling
-\item \texttt{06-pieces.nw} --- Piece and block management
-\item \texttt{07-strategy.nw} --- Download strategy
-\item \texttt{08-client.nw} --- Main event loop
-\item \texttt{09-cli.nw} --- Command-line interface
+\item \texttt{05-pieces.nw} --- Piece and block management
+\item \texttt{06-cli.nw} --- Command-line interface
+\item \texttt{07-client.nw} --- Main event loop
+\item \texttt{08-disk.nw} --- Disk I/O and file creation
 \end{itemize}
 
 \appendix
