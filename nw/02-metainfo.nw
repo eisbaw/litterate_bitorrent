@@ -1,0 +1,219 @@
+% Metainfo: Parsing .torrent Files
+% Chapter 2 of the literate BitTorrent client
+
+\section{Metainfo Files}
+
+A \texttt{.torrent} file, also called a \emph{metainfo} file, contains all the
+information needed to download a torrent: where to find peers (the tracker URL),
+how to verify downloaded data (piece hashes), and what files comprise the torrent.
+The entire file is bencoded, making our decoder from the previous chapter the
+foundation for this one.
+
+\subsection{The Metainfo Structure}
+
+At the top level, a metainfo file is a bencoded dictionary with two required keys:
+
+\begin{description}
+\item[announce] A string containing the tracker URL. Peers register with this
+  URL to discover each other.
+\item[info] A dictionary containing metadata about the torrent's content,
+  including file names, sizes, piece length, and piece hashes.
+\end{description}
+
+The \texttt{info} dictionary is special: its bencoded form is hashed with SHA1
+to produce the \emph{info hash}, a 20-byte identifier that uniquely identifies
+this torrent across the entire BitTorrent network. Every peer sharing this
+content uses the same info hash.
+
+\subsection{Single-File vs Multi-File Torrents}
+
+The info dictionary supports two formats:
+
+\begin{description}
+\item[Single-file] Contains a \texttt{name} (filename) and \texttt{length}
+  (file size in bytes). The torrent represents exactly one file.
+
+\item[Multi-file] Contains a \texttt{name} (directory name) and \texttt{files}
+  (a list of file entries). Each file entry has a \texttt{length} and a
+  \texttt{path} (list of path components from the root directory).
+\end{description}
+
+We unify these into a single representation: a torrent is always a list of
+files, with single-file torrents being the degenerate case of a one-element list.
+
+\subsection{The FileInfo Structure}
+
+Each file in a torrent is represented by its length and path. For single-file
+torrents, the path is simply the filename. For multi-file torrents, the path
+includes directory components.
+
+<<file info struct>>=
+/// Information about a single file within a torrent.
+///
+/// For single-file torrents, this represents the entire torrent content.
+/// For multi-file torrents, each file in the torrent has its own `FileInfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileInfo {
+    /// Size of the file in bytes.
+    pub length: u64,
+
+    /// Path to the file, relative to the torrent's root directory.
+    ///
+    /// For single-file torrents, this is just the filename.
+    /// For multi-file torrents, this includes directory components.
+    pub path: PathBuf,
+}
+@
+
+The path is stored as a [[PathBuf]] rather than a [[String]] because file paths
+can contain arbitrary bytes in BitTorrent (the protocol uses byte strings, not
+UTF-8 strings). [[PathBuf]] handles this correctly on most platforms.
+
+\subsection{The Metainfo Structure}
+
+The main [[Metainfo]] struct captures everything we need from a torrent file:
+
+<<metainfo struct>>=
+/// Parsed contents of a .torrent file.
+///
+/// This structure contains all the information needed to download a torrent:
+/// - Where to find peers (tracker URL)
+/// - How to identify the torrent (info hash)
+/// - How to verify downloaded data (piece hashes)
+/// - What files comprise the torrent (file list)
+///
+/// The structure unifies single-file and multi-file torrents into a consistent
+/// representation where every torrent has a list of files (single-file torrents
+/// simply have a one-element list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metainfo {
+    /// The tracker's announce URL.
+    ///
+    /// Peers register with this URL to discover other peers sharing the torrent.
+    /// The URL typically uses HTTP or UDP protocol.
+    pub announce: String,
+
+    /// The 20-byte SHA1 hash of the bencoded info dictionary.
+    ///
+    /// This uniquely identifies the torrent across the BitTorrent network.
+    /// All peers sharing the same content have the same info hash.
+    pub info_hash: [u8; 20],
+
+    /// Size of each piece in bytes.
+    ///
+    /// Pieces are the unit of data transfer and verification in BitTorrent.
+    /// Typical values are powers of two between 256KB (262144) and 4MB (4194304).
+    /// The last piece may be smaller than this value.
+    pub piece_length: u32,
+
+    /// SHA1 hashes of each piece, in order.
+    ///
+    /// After downloading a piece, its SHA1 hash is computed and compared to
+    /// the corresponding entry here. A mismatch indicates corruption.
+    pub piece_hashes: Vec<[u8; 20]>,
+
+    /// Total size of the torrent content in bytes.
+    ///
+    /// This is the sum of all file lengths. For single-file torrents, this
+    /// equals the file's length. For multi-file torrents, it's the total
+    /// across all files.
+    pub total_length: u64,
+
+    /// List of files in the torrent.
+    ///
+    /// Single-file torrents have exactly one entry. Multi-file torrents have
+    /// one entry per file. Files are stored in the order they appear in the
+    /// metainfo, which determines how piece boundaries align with file content.
+    pub files: Vec<FileInfo>,
+
+    /// Name of the torrent.
+    ///
+    /// For single-file torrents, this is the filename.
+    /// For multi-file torrents, this is the root directory name.
+    pub name: String,
+}
+@
+
+Several design decisions deserve explanation:
+
+\begin{itemize}
+\item \textbf{info\_hash as fixed array}: We use \texttt{[u8; 20]} rather than
+  \texttt{Vec<u8>} because SHA1 hashes are always exactly 20 bytes. The fixed
+  size prevents accidental misuse and enables efficient comparison.
+
+\item \textbf{piece\_length as u32}: Piece lengths are typically between 256KB
+  and 4MB, well within u32 range. Using u32 saves memory and matches the
+  protocol's 32-bit piece index.
+
+\item \textbf{piece\_hashes as Vec}: The number of pieces varies widely---a small
+  torrent might have 10 pieces, while a large one could have 100,000. A vector
+  provides the flexibility needed.
+
+\item \textbf{total\_length as u64}: Modern torrents can exceed 4GB, requiring
+  64-bit file sizes.
+\end{itemize}
+
+\subsection{Error Handling}
+
+Parsing metainfo can fail in several ways. We define a dedicated error type
+to provide clear feedback about what went wrong.
+
+<<metainfo errors>>=
+/// Errors that can occur when parsing a metainfo file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MetainfoError {
+    /// A required field is missing from the metainfo dictionary.
+    #[error("missing required field: {0}")]
+    MissingField(&'static str),
+
+    /// The piece length is invalid (zero, negative, or too large).
+    #[error("invalid piece length: {0}")]
+    InvalidPieceLength(String),
+
+    /// The pieces field is malformed (not a multiple of 20 bytes).
+    #[error("invalid piece hashes: {0}")]
+    InvalidPieceHashes(String),
+}
+@
+
+These error variants cover the main parsing failure modes:
+
+\begin{itemize}
+\item \textbf{MissingField}: A required key (like ``announce'' or ``info'')
+  is absent from the dictionary. The parameter identifies which field.
+
+\item \textbf{InvalidPieceLength}: The piece length is zero (would cause
+  division by zero), negative, or unreasonably large.
+
+\item \textbf{InvalidPieceHashes}: The ``pieces'' field isn't a valid
+  concatenation of 20-byte SHA1 hashes. This happens when its length
+  isn't a multiple of 20.
+\end{itemize}
+
+\subsection{Module Structure}
+
+The metainfo module combines the data structures defined above. Future sections
+will add parsing functions that construct [[Metainfo]] from bencoded data.
+
+<<metainfo.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/02-metainfo.nw
+// Regenerate with: just tangle
+
+//! Metainfo file (.torrent) parsing.
+//!
+//! This module provides types for representing the contents of a .torrent file.
+//! A metainfo file contains the tracker URL, file information, and piece hashes
+//! needed to download and verify a torrent.
+
+use std::path::PathBuf;
+
+<<file info struct>>
+
+<<metainfo struct>>
+
+<<metainfo errors>>
+@
+
+The module is structured to be imported as [[use literate\_bittorrent::metainfo]],
+exposing [[Metainfo]], [[FileInfo]], and [[MetainfoError]] as the public interface.
