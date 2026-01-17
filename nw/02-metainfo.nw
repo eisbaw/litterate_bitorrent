@@ -1093,45 +1093,112 @@ mod tests {
         assert_eq!(metainfo.info_hash, expected);
     }
 
-    #[test]
-    fn info_hash_ubuntu_torrent() {
-        // Test against real ubuntu.torrent fixture with known info hash
-        // Expected hash from tests/fixtures/ubuntu.torrent.expected:
-        // INFO_HASH=a1dfefec1a9dd7fa8a041ebeeea271db55126d2f
-
-        let torrent_bytes = std::fs::read("tests/fixtures/ubuntu.torrent")
-            .expect("ubuntu.torrent fixture should exist");
-
-        let metainfo = parse(&torrent_bytes).expect("ubuntu.torrent should parse");
-
-        // Convert expected hex string to bytes
-        let expected_hex = "a1dfefec1a9dd7fa8a041ebeeea271db55126d2f";
-        let expected: [u8; 20] = {
-            let mut arr = [0u8; 20];
-            for i in 0..20 {
-                arr[i] = u8::from_str_radix(&expected_hex[i*2..i*2+2], 16).unwrap();
-            }
-            arr
-        };
-
-        // Verify the info hash matches the expected value
-        assert_eq!(
-            metainfo.info_hash, expected,
-            "info hash mismatch:\n  computed: {}\n  expected: {}",
-            hex_string(&metainfo.info_hash),
-            expected_hex
-        );
-
-        // Also verify other known values from the fixture
-        assert_eq!(metainfo.name, "ubuntu-24.04.3-live-server-amd64.iso");
-        assert_eq!(metainfo.total_length, 3303444480);
-        assert_eq!(metainfo.piece_length, 262144);
-        assert_eq!(metainfo.piece_hashes.len(), 12602);
-    }
-
-    /// Helper to format a hash as a hex string for error messages
+    /// Helper to format a hash as a hex string
     fn hex_string(hash: &[u8; 20]) -> String {
         hash.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Helper to format bytes as human-readable size
+    fn human_readable_size(bytes: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = KIB * 1024;
+        const GIB: u64 = MIB * 1024;
+
+        if bytes >= GIB {
+            format!("{:.2} GiB", bytes as f64 / GIB as f64)
+        } else if bytes >= MIB {
+            format!("{:.2} MiB", bytes as f64 / MIB as f64)
+        } else if bytes >= KIB {
+            format!("{:.2} KiB", bytes as f64 / KIB as f64)
+        } else {
+            format!("{} bytes", bytes)
+        }
+    }
+
+    // ========================================
+    // Integration Test: ubuntu.torrent
+    // Phase 1 Exit Criteria Validation
+    // ========================================
+
+    /// Integration test with real ubuntu.torrent file.
+    ///
+    /// This test serves as the Phase 1 exit criteria validation:
+    /// - Loads a real torrent file from the fixtures directory
+    /// - Decodes the bencode successfully
+    /// - Parses Metainfo from the bencoded dictionary
+    /// - Prints info hash, piece count, and total size for verification
+    /// - Asserts all values match known correct values
+    ///
+    /// Expected values from tests/fixtures/ubuntu.torrent.expected:
+    /// - INFO_HASH=a1dfefec1a9dd7fa8a041ebeeea271db55126d2f
+    /// - PIECE_COUNT=12602
+    /// - TOTAL_LENGTH=3303444480
+    #[test]
+    fn integration_test_ubuntu_torrent() {
+        // Step 1: Verify the fixture file exists
+        let torrent_path = "tests/fixtures/ubuntu.torrent";
+        assert!(
+            std::path::Path::new(torrent_path).exists(),
+            "ubuntu.torrent fixture should exist at {}",
+            torrent_path
+        );
+
+        // Step 2: Read and decode the torrent file
+        let torrent_bytes = std::fs::read(torrent_path)
+            .expect("should read ubuntu.torrent file");
+
+        // Step 3: Parse Metainfo from bencoded dict
+        let metainfo = parse(&torrent_bytes)
+            .expect("should parse ubuntu.torrent successfully");
+
+        // Step 4: Print info hash in hex format
+        let info_hash_hex = hex_string(&metainfo.info_hash);
+        println!();
+        println!("=== Phase 1 Exit Criteria: ubuntu.torrent ===");
+        println!("Torrent name:     {}", metainfo.name);
+        println!("Info hash:        {}", info_hash_hex);
+
+        // Step 5: Print piece count
+        let piece_count = metainfo.piece_hashes.len();
+        println!("Piece count:      {}", piece_count);
+        println!("Piece length:     {} bytes", metainfo.piece_length);
+
+        // Step 6: Print total size in bytes and human-readable format
+        println!(
+            "Total size:       {} bytes ({})",
+            metainfo.total_length,
+            human_readable_size(metainfo.total_length)
+        );
+        println!("==============================================");
+        println!();
+
+        // Step 7: Assert all values match known correct values
+        let expected_info_hash = "a1dfefec1a9dd7fa8a041ebeeea271db55126d2f";
+        let expected_piece_count = 12602;
+        let expected_total_length: u64 = 3303444480;
+
+        assert_eq!(
+            info_hash_hex, expected_info_hash,
+            "info hash mismatch:\n  computed: {}\n  expected: {}",
+            info_hash_hex, expected_info_hash
+        );
+
+        assert_eq!(
+            piece_count, expected_piece_count,
+            "piece count mismatch:\n  computed: {}\n  expected: {}",
+            piece_count, expected_piece_count
+        );
+
+        assert_eq!(
+            metainfo.total_length, expected_total_length,
+            "total length mismatch:\n  computed: {}\n  expected: {}",
+            metainfo.total_length, expected_total_length
+        );
+
+        // Additional sanity checks
+        assert_eq!(metainfo.name, "ubuntu-24.04.3-live-server-amd64.iso");
+        assert_eq!(metainfo.piece_length, 262144);
+        assert_eq!(metainfo.files.len(), 1, "should be single-file torrent");
     }
 
     // ========================================
