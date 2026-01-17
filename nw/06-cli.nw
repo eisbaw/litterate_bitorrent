@@ -169,6 +169,322 @@ We provide two parsing methods:
   making it suitable for testing error cases.
 \end{itemize}
 
+\subsection{Input Validation}
+
+While [[clap]] handles syntactic validation---ensuring arguments parse
+correctly---semantic validation requires additional logic. The \emph{fail-fast}
+principle demands we validate inputs thoroughly before beginning any expensive
+operations. A user who misspells a torrent file path should learn of their
+error immediately, not after attempting to parse corrupt data or failing
+to connect to peers.
+
+Our validation strategy addresses three categories:
+
+\begin{enumerate}
+\item \textbf{File existence}: The torrent file must exist and be readable.
+  This catches typos early and provides a clear error message including the
+  exact path that failed.
+
+\item \textbf{Directory preparation}: The output directory may not exist yet.
+  We attempt to create it (including parent directories) rather than failing.
+  However, permission denied errors require clear reporting.
+
+\item \textbf{Port validity}: While [[clap]] ensures the port fits in a [[u16]],
+  we check for port zero (invalid for binding) and warn about privileged
+  ports below 1024 that typically require root access.
+\end{enumerate}
+
+\subsubsection{Validation Errors}
+
+We define a dedicated error type for validation failures. Each variant carries
+the specific value that failed validation, enabling precise error messages.
+The [[thiserror]] crate generates [[Display]] implementations from our
+[[#[error]]] attributes.
+
+<<cli validation>>=
+use std::io;
+use thiserror::Error;
+
+/// Errors that can occur during argument validation.
+///
+/// These errors represent semantic problems with the arguments that
+/// syntactic parsing (by clap) cannot catch. Each variant includes
+/// the problematic value for clear error reporting.
+#[derive(Debug, Error)]
+pub enum ValidationError {
+    /// The specified torrent file does not exist.
+    #[error("Torrent file not found: {path}")]
+    TorrentNotFound {
+        /// The path that was checked
+        path: PathBuf,
+    },
+
+    /// The torrent file exists but cannot be read.
+    #[error("Cannot read torrent file '{path}': {reason}")]
+    TorrentNotReadable {
+        /// The path that failed
+        path: PathBuf,
+        /// Description of why reading failed
+        reason: String,
+    },
+
+    /// The output directory cannot be created or accessed.
+    #[error("Cannot create output directory '{path}': {reason}")]
+    OutputDirectoryError {
+        /// The directory path that failed
+        path: PathBuf,
+        /// Description of the failure
+        reason: String,
+    },
+
+    /// The port number is invalid (zero is not bindable).
+    #[error("Invalid port number: {port} (must be 1-65535)")]
+    InvalidPort {
+        /// The invalid port value
+        port: u16,
+    },
+}
+
+/// A warning that does not prevent operation but should be shown to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationWarning {
+    /// Port below 1024 typically requires root/administrator privileges.
+    PrivilegedPort {
+        /// The privileged port number
+        port: u16,
+    },
+}
+
+impl std::fmt::Display for ValidationWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationWarning::PrivilegedPort { port } => {
+                write!(
+                    f,
+                    "Warning: port {} is a privileged port (below 1024) and may require root privileges",
+                    port
+                )
+            }
+        }
+    }
+}
+@
+
+The separation between [[ValidationError]] (fatal) and [[ValidationWarning]]
+(informational) allows the caller to decide how to handle non-fatal issues.
+A warning about privileged ports might be ignored by a root user but is
+valuable feedback for a regular user wondering why binding failed.
+
+\subsubsection{The Validation Function}
+
+The [[validate\_args]] function performs all semantic checks in sequence.
+It returns early on the first error (fail-fast), but collects all warnings
+so the user sees the complete picture.
+
+<<cli validation>>=
+/// Result of argument validation.
+#[derive(Debug)]
+pub struct ValidationResult {
+    /// Warnings that were generated (empty if none).
+    pub warnings: Vec<ValidationWarning>,
+}
+
+/// Validate command-line arguments semantically.
+///
+/// This function checks that:
+/// 1. The torrent file exists and is readable
+/// 2. The output directory exists or can be created
+/// 3. The port number is valid for binding
+///
+/// # Arguments
+///
+/// * `args` - The parsed command-line arguments
+///
+/// # Returns
+///
+/// * `Ok(ValidationResult)` - Validation passed, possibly with warnings
+/// * `Err(ValidationError)` - A fatal validation error occurred
+///
+/// # Example
+///
+/// ```no_run
+/// use literate_bittorrent::cli::{Args, validate_args};
+///
+/// let args = Args::try_parse_from([
+///     "literate-bittorrent",
+///     "ubuntu.torrent",
+/// ]).unwrap();
+///
+/// match validate_args(&args) {
+///     Ok(result) => {
+///         for warning in &result.warnings {
+///             eprintln!("{}", warning);
+///         }
+///     }
+///     Err(e) => {
+///         eprintln!("Error: {}", e);
+///         std::process::exit(1);
+///     }
+/// }
+/// ```
+pub fn validate_args(args: &Args) -> Result<ValidationResult, ValidationError> {
+    let mut warnings = Vec::new();
+
+    // Check torrent file exists
+    validate_torrent_file(&args.torrent)?;
+
+    // Ensure output directory exists or can be created
+    validate_output_directory(&args.output)?;
+
+    // Check port validity
+    validate_port(args.port, &mut warnings)?;
+
+    Ok(ValidationResult { warnings })
+}
+@
+
+We decompose validation into focused helper functions. This makes the code
+easier to test and understand---each function has a single responsibility.
+
+\subsubsection{Torrent File Validation}
+
+The torrent file validation uses [[std::fs::metadata]] to check existence
+without reading the entire file. We also verify readability by checking
+file permissions.
+
+<<cli validation>>=
+/// Validate that the torrent file exists and is readable.
+fn validate_torrent_file(path: &PathBuf) -> Result<(), ValidationError> {
+    // Check if file exists
+    if !path.exists() {
+        return Err(ValidationError::TorrentNotFound { path: path.clone() });
+    }
+
+    // Check if we can read the file metadata (tests accessibility)
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            // Check it's actually a file, not a directory
+            if !metadata.is_file() {
+                return Err(ValidationError::TorrentNotReadable {
+                    path: path.clone(),
+                    reason: "path is a directory, not a file".to_string(),
+                });
+            }
+            // Try to open the file to verify read permission
+            if let Err(e) = std::fs::File::open(path) {
+                return Err(ValidationError::TorrentNotReadable {
+                    path: path.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+        Err(e) => {
+            return Err(ValidationError::TorrentNotReadable {
+                path: path.clone(),
+                reason: e.to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+@
+
+Note that we attempt to actually open the file rather than just checking
+[[metadata.permissions()]]. On Unix, the permission bits indicate intended
+access, but the actual ability to read depends on user ID, group membership,
+and potential access control lists. Opening the file is the definitive test.
+
+\subsubsection{Output Directory Validation}
+
+For the output directory, we take a proactive approach: if it doesn't exist,
+we create it. This is more user-friendly than requiring manual directory
+creation. We use [[create\_dir\_all]] to handle nested paths like
+[[/tmp/downloads/movies/2024]].
+
+<<cli validation>>=
+/// Validate the output directory exists or can be created.
+fn validate_output_directory(path: &PathBuf) -> Result<(), ValidationError> {
+    // If directory already exists, verify we can write to it
+    if path.exists() {
+        // Check it's actually a directory
+        if !path.is_dir() {
+            return Err(ValidationError::OutputDirectoryError {
+                path: path.clone(),
+                reason: "path exists but is not a directory".to_string(),
+            });
+        }
+
+        // Try to verify write permission by checking if we can create a temp file
+        // We use a deterministic but unique-ish name to avoid conflicts
+        let test_file = path.join(".literate_bittorrent_write_test");
+        match std::fs::File::create(&test_file) {
+            Ok(_) => {
+                // Clean up the test file
+                let _ = std::fs::remove_file(&test_file);
+            }
+            Err(e) => {
+                return Err(ValidationError::OutputDirectoryError {
+                    path: path.clone(),
+                    reason: format!("permission denied: {}", e),
+                });
+            }
+        }
+
+        return Ok(());
+    }
+
+    // Directory doesn't exist, try to create it
+    match std::fs::create_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(ValidationError::OutputDirectoryError {
+            path: path.clone(),
+            reason: match e.kind() {
+                io::ErrorKind::PermissionDenied => {
+                    format!("permission denied: {}", e)
+                }
+                _ => e.to_string(),
+            },
+        }),
+    }
+}
+@
+
+The write test creates a temporary file to verify we have actual write
+permission, not just apparent permission from the metadata. This catches
+scenarios like read-only filesystems mounted with permissive mode bits.
+
+\subsubsection{Port Validation}
+
+Port validation catches the edge case of port zero, which is syntactically
+valid for a [[u16]] but cannot be bound. We also generate a warning for
+privileged ports (below 1024), which typically require root access on
+Unix-like systems.
+
+<<cli validation>>=
+/// Validate the port number is usable for binding.
+fn validate_port(port: u16, warnings: &mut Vec<ValidationWarning>) -> Result<(), ValidationError> {
+    // Port 0 is special (OS assigns a random port) but not useful for BitTorrent
+    // where peers need to know your port to connect back
+    if port == 0 {
+        return Err(ValidationError::InvalidPort { port });
+    }
+
+    // Warn about privileged ports
+    if port < 1024 {
+        warnings.push(ValidationWarning::PrivilegedPort { port });
+    }
+
+    Ok(())
+}
+@
+
+We treat port zero as an error rather than a warning because BitTorrent
+clients need a stable, known port for incoming peer connections. While
+operating systems allow binding to port zero (which assigns an ephemeral
+port), this is useless for a BitTorrent client that needs to announce
+its port to the tracker.
+
 \subsection{Logging Initialization}
 
 Observability is essential for debugging protocol issues and understanding
@@ -286,10 +602,16 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 //! # Usage
 //!
 //! ```no_run
-//! use literate_bittorrent::cli::{Args, init_logging};
+//! use literate_bittorrent::cli::{Args, init_logging, validate_args};
 //!
 //! let args = Args::parse_args();
 //! init_logging(args.verbose);
+//!
+//! // Validate inputs before proceeding
+//! if let Err(e) = validate_args(&args) {
+//!     eprintln!("Error: {}", e);
+//!     std::process::exit(1);
+//! }
 //!
 //! println!("Torrent: {:?}", args.torrent);
 //! println!("Output: {:?}", args.output);
@@ -300,9 +622,13 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 
 <<cli parse>>
 
+<<cli validation>>
+
 <<cli logging>>
 
 <<cli tests>>
+
+<<cli validation tests>>
 @
 
 \subsection{Testing the CLI}
@@ -770,6 +1096,370 @@ mod logging_tests {
         } else {
             env::remove_var("RUST_LOG");
         }
+    }
+}
+@
+
+\subsection{Testing Validation}
+
+Validation tests require creating temporary files and directories. We use
+[[tempfile]] for this purpose, which ensures cleanup even if tests panic.
+These tests verify each validation check produces the correct error type
+and includes the problematic value in the message.
+
+<<cli validation tests>>=
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use std::fs::File;
+    use tempfile::tempdir;
+
+    // Helper to create Args with specific values
+    fn make_args(torrent: &str, output: &str, port: u16) -> Args {
+        Args {
+            torrent: PathBuf::from(torrent),
+            output: PathBuf::from(output),
+            port,
+            verbose: false,
+        }
+    }
+
+    // ========================================================================
+    // Torrent file validation tests
+    // ========================================================================
+
+    #[test]
+    fn torrent_file_not_found_produces_error() {
+        // AC #1: Torrent file path is checked for existence before parsing
+        // AC #2: Torrent file path produces error with path in message
+        let args = make_args("/nonexistent/path/to/missing.torrent", "/tmp", 6881);
+        let result = validate_args(&args);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+
+        // Error should include the exact path
+        assert!(
+            msg.contains("/nonexistent/path/to/missing.torrent"),
+            "Error should include the torrent path: {}",
+            msg
+        );
+        assert!(
+            msg.contains("not found") || msg.contains("Not found"),
+            "Error should indicate file not found: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn torrent_path_is_directory_produces_error() {
+        // If user passes a directory instead of a file, give clear error
+        let dir = tempdir().unwrap();
+        let args = make_args(dir.path().to_str().unwrap(), "/tmp", 6881);
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("directory") || msg.contains("not a file"),
+            "Error should indicate path is a directory: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn valid_torrent_file_passes_validation() {
+        // Create a temporary torrent file
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            6881
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok(), "Valid torrent file should pass: {:?}", result);
+    }
+
+    // ========================================================================
+    // Output directory validation tests
+    // ========================================================================
+
+    #[test]
+    fn output_directory_is_created_if_missing() {
+        // AC #3: Output directory is created if it does not exist
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        // Create a path that doesn't exist yet
+        let new_output = dir.path().join("new_output_dir");
+        assert!(!new_output.exists());
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            new_output.to_str().unwrap(),
+            6881
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok(), "Should create output directory: {:?}", result);
+        assert!(new_output.exists(), "Output directory should now exist");
+        assert!(new_output.is_dir(), "Output should be a directory");
+    }
+
+    #[test]
+    fn nested_output_directory_is_created() {
+        // AC #3: Output directory is created with parent directories
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        // Create a nested path
+        let nested_output = dir.path().join("a/b/c/deep/path");
+        assert!(!nested_output.exists());
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            nested_output.to_str().unwrap(),
+            6881
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok(), "Should create nested output directory: {:?}", result);
+        assert!(nested_output.exists(), "Nested output directory should exist");
+    }
+
+    #[test]
+    fn output_path_is_file_produces_error() {
+        // If output path exists as a file, give clear error
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        // Create a file where we want a directory
+        let file_path = dir.path().join("not_a_dir");
+        File::create(&file_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            file_path.to_str().unwrap(),
+            6881
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+
+        assert!(
+            msg.contains("not a directory") || msg.contains("exists but"),
+            "Error should indicate path is not a directory: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn existing_writable_directory_passes() {
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            6881
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok(), "Existing writable directory should pass: {:?}", result);
+    }
+
+    // ========================================================================
+    // Port validation tests
+    // ========================================================================
+
+    #[test]
+    fn port_zero_produces_error() {
+        // AC #5: Invalid port number produces error message
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            0  // Invalid port
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+
+        // AC #7: All validation errors include the problematic value
+        assert!(
+            msg.contains("0") || msg.contains("Invalid port"),
+            "Error should mention port 0: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn privileged_port_produces_warning() {
+        // AC #6: Port below 1024 produces warning about privileged ports
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            80  // HTTP port - privileged
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok(), "Privileged port should pass (just warn): {:?}", result);
+
+        let validation = result.unwrap();
+        assert_eq!(validation.warnings.len(), 1);
+
+        let warning = &validation.warnings[0];
+        assert!(matches!(warning, ValidationWarning::PrivilegedPort { port: 80 }));
+
+        let warning_msg = warning.to_string();
+        assert!(
+            warning_msg.contains("80") && warning_msg.contains("privileged"),
+            "Warning should mention port 80 and privileged: {}",
+            warning_msg
+        );
+    }
+
+    #[test]
+    fn normal_port_produces_no_warning() {
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            6881  // Standard BitTorrent port
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+
+        let validation = result.unwrap();
+        assert!(
+            validation.warnings.is_empty(),
+            "Normal port should produce no warnings"
+        );
+    }
+
+    #[test]
+    fn port_1024_is_not_privileged() {
+        // Edge case: port 1024 is the first non-privileged port
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            1024
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+        assert!(result.unwrap().warnings.is_empty());
+    }
+
+    #[test]
+    fn port_1023_is_privileged() {
+        // Edge case: port 1023 is the last privileged port
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            1023
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().warnings.len(), 1);
+    }
+
+    #[test]
+    fn max_port_is_valid() {
+        let dir = tempdir().unwrap();
+        let torrent_path = dir.path().join("test.torrent");
+        File::create(&torrent_path).unwrap();
+
+        let args = make_args(
+            torrent_path.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            65535  // Maximum port
+        );
+
+        let result = validate_args(&args);
+        assert!(result.is_ok());
+        assert!(result.unwrap().warnings.is_empty());
+    }
+
+    // ========================================================================
+    // Error message quality tests
+    // ========================================================================
+
+    #[test]
+    fn error_messages_include_problematic_values() {
+        // AC #7: All validation errors include the problematic value
+        let specific_path = "/very/specific/path/that/does/not/exist.torrent";
+        let args = make_args(specific_path, "/tmp", 6881);
+
+        let result = validate_args(&args);
+        let msg = result.unwrap_err().to_string();
+
+        assert!(
+            msg.contains(specific_path),
+            "Error should include the exact problematic path: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn validation_error_is_debug() {
+        let err = ValidationError::TorrentNotFound {
+            path: PathBuf::from("/test/path"),
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("TorrentNotFound"));
+        assert!(debug.contains("/test/path"));
+    }
+
+    #[test]
+    fn validation_warning_is_debug_and_clone() {
+        let warning = ValidationWarning::PrivilegedPort { port: 80 };
+        let debug = format!("{:?}", warning);
+        assert!(debug.contains("PrivilegedPort"));
+        assert!(debug.contains("80"));
+
+        let cloned = warning.clone();
+        assert_eq!(warning, cloned);
+    }
+
+    #[test]
+    fn validation_result_is_debug() {
+        let result = ValidationResult { warnings: vec![] };
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("ValidationResult"));
     }
 }
 @
