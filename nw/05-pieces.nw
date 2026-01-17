@@ -1,0 +1,468 @@
+% Piece Management
+% Chapter 5 of the literate BitTorrent client
+
+\section{Piece Management}
+
+The BitTorrent protocol divides files into fixed-size pieces, each identified by
+a SHA1 hash stored in the torrent metadata. Piece management is the heart of a
+BitTorrent client: it tracks which pieces we have, verifies downloaded data
+against expected hashes, and writes verified pieces to disk.
+
+This chapter defines the error types for piece operations. Piece management can
+fail in several distinct ways, and our error types are designed to provide
+sufficient context for debugging without requiring additional logging.
+
+\subsection{Piece Error Types}
+
+Piece operations fail for four main reasons:
+
+\begin{description}
+\item[Hash mismatches] After downloading all blocks of a piece, we compute its
+  SHA1 hash and compare against the expected hash from the metainfo. A mismatch
+  means the data is corrupted---possibly due to a malicious peer, network
+  corruption, or bugs. We must discard the piece and re-download from different
+  peers.
+
+\item[Invalid piece indices] Requests for pieces outside the valid range
+  indicate bugs in our code or protocol violations by peers. The valid range
+  is $[0, \text{num\_pieces})$ where num\_pieces is determined by the torrent
+  metadata.
+
+\item[Invalid block offsets] Within a piece, blocks are requested at specific
+  offsets. An offset that exceeds the piece size, or a block that would extend
+  past the piece boundary, is invalid. This catches both our bugs and malicious
+  peer behavior.
+
+\item[Disk I/O failures] Writing verified pieces to disk can fail due to
+  filesystem errors: disk full, permission denied, hardware failures. We wrap
+  the underlying I/O error with context about what we were trying to write.
+\end{description}
+
+<<piece errors>>=
+use std::path::PathBuf;
+
+/// Errors that can occur during piece management operations.
+///
+/// These errors cover verification, storage, and geometry validation for
+/// BitTorrent pieces. Each variant includes sufficient context to diagnose
+/// the problem without requiring additional logging, following fail-fast
+/// principles.
+///
+/// # Recovery Strategies
+///
+/// - **Hash mismatch**: Discard the piece data, mark the piece as not-have,
+///   and re-request from different peers. Consider banning peers who
+///   repeatedly send bad data.
+/// - **Invalid index/offset**: These indicate programming bugs or protocol
+///   violations. Log the error and disconnect from misbehaving peers.
+/// - **Disk errors**: May be transient (disk full) or permanent (hardware
+///   failure). Retry after clearing space, or abort the download.
+#[derive(Debug, thiserror::Error)]
+pub enum PieceError {
+    /// The computed hash of a piece does not match the expected hash.
+    ///
+    /// After downloading all blocks of a piece, we compute its SHA1 hash
+    /// and compare against the expected hash from the torrent metadata.
+    /// A mismatch indicates data corruption, which could be caused by:
+    /// - A malicious peer intentionally sending bad data
+    /// - Network corruption (rare with TCP, but possible)
+    /// - Bugs in block assembly logic
+    ///
+    /// The piece data must be discarded and re-requested from different peers.
+    /// Peers who repeatedly send bad data should be banned temporarily.
+    #[error("piece {piece_index} hash mismatch: expected {expected_hash}, computed {computed_hash}")]
+    PieceHashMismatch {
+        /// The index of the piece that failed verification.
+        piece_index: u32,
+        /// The expected SHA1 hash from the torrent metadata (40 hex characters).
+        expected_hash: String,
+        /// The SHA1 hash computed from the downloaded data (40 hex characters).
+        computed_hash: String,
+    },
+
+    /// A piece index is outside the valid range for this torrent.
+    ///
+    /// Valid piece indices are in the range $[0, \text{num\_pieces})$. Receiving
+    /// a request or have message for an out-of-range index indicates either:
+    /// - A bug in our piece selection logic
+    /// - A protocol violation by a peer (e.g., claiming to have piece 999
+    ///   in a 100-piece torrent)
+    ///
+    /// This is a programming error or protocol violation, not a data error.
+    #[error("invalid piece index {index}: valid range is 0..{num_pieces}")]
+    InvalidPieceIndex {
+        /// The invalid piece index that was requested.
+        index: u32,
+        /// The total number of pieces in the torrent (exclusive upper bound).
+        num_pieces: u32,
+    },
+
+    /// A block offset is invalid for the given piece.
+    ///
+    /// Blocks are requested at byte offsets within a piece. An offset is
+    /// invalid if:
+    /// - It exceeds or equals the piece size (no data could be read)
+    /// - A block starting at this offset would extend past the piece end
+    ///
+    /// This indicates either a bug in block request logic or a malformed
+    /// request from a peer.
+    #[error("invalid block offset {offset} for piece {piece_index} (piece size: {piece_size})")]
+    InvalidBlockOffset {
+        /// The index of the piece containing the invalid offset.
+        piece_index: u32,
+        /// The invalid byte offset within the piece.
+        offset: u32,
+        /// The total size of the piece in bytes.
+        piece_size: u32,
+    },
+
+    /// A disk write operation failed.
+    ///
+    /// After verifying a piece's hash, we write it to the appropriate
+    /// location in the output file(s). This error wraps the underlying
+    /// I/O error with context about what we were trying to write.
+    ///
+    /// Common causes:
+    /// - Disk full (ENOSPC)
+    /// - Permission denied (EACCES)
+    /// - File system errors
+    /// - Hardware failures
+    ///
+    /// The file path and byte offset are included to help diagnose which
+    /// part of the download failed.
+    #[error("disk write failed at {path}:{byte_offset}: {source}")]
+    DiskWriteError {
+        /// Path to the file we were writing to.
+        path: PathBuf,
+        /// Byte offset within the file where the write failed.
+        byte_offset: u64,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+@
+
+The error enum demonstrates several important design choices:
+
+\begin{itemize}
+\item \textbf{Hex hashes}: The [[PieceHashMismatch]] variant stores hashes as
+  hex strings rather than raw bytes. This makes error messages immediately
+  readable without hex-encoding at display time, and matches how hashes appear
+  in torrent files and debugging output.
+
+\item \textbf{Bounds in error messages}: [[InvalidPieceIndex]] includes both
+  the invalid index and the valid range. This makes debugging trivial---you
+  can immediately see whether the index was off-by-one, wildly wrong, or
+  perhaps a signed/unsigned confusion.
+
+\item \textbf{Geometry context}: [[InvalidBlockOffset]] includes the piece
+  index and piece size alongside the invalid offset. The piece size is
+  especially important because the last piece is often smaller than the
+  standard piece size.
+
+\item \textbf{Wrapped I/O errors}: [[DiskWriteError]] uses [[#[source]]] rather
+  than [[#[from]]] because we need to add context (path and offset) to every
+  disk error. The [[#[source]]] attribute sets up the error chain correctly
+  so tools like [[anyhow]] can display the full cause chain.
+\end{itemize}
+
+\subsection{Helper Constructors}
+
+While the struct variants can be constructed directly, helper methods make the
+call sites cleaner and ensure consistent formatting of hash values.
+
+<<piece error helpers>>=
+/// Convert a 20-byte hash to a 40-character lowercase hex string.
+///
+/// We implement this inline rather than depending on an external `hex` crate,
+/// following the same approach used in other modules of this client.
+fn hash_to_hex(hash: &[u8; 20]) -> String {
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+impl PieceError {
+    /// Create a hash mismatch error with raw hash bytes.
+    ///
+    /// This helper converts the raw 20-byte SHA1 hashes to their hex string
+    /// representation, ensuring consistent formatting in error messages.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The index of the piece that failed verification
+    /// * `expected` - The expected 20-byte SHA1 hash from torrent metadata
+    /// * `computed` - The 20-byte SHA1 hash computed from downloaded data
+    pub fn hash_mismatch(piece_index: u32, expected: &[u8; 20], computed: &[u8; 20]) -> Self {
+        PieceError::PieceHashMismatch {
+            piece_index,
+            expected_hash: hash_to_hex(expected),
+            computed_hash: hash_to_hex(computed),
+        }
+    }
+
+    /// Create an invalid piece index error.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The invalid piece index
+    /// * `num_pieces` - The total number of pieces (exclusive upper bound)
+    pub fn invalid_index(index: u32, num_pieces: u32) -> Self {
+        PieceError::InvalidPieceIndex { index, num_pieces }
+    }
+
+    /// Create an invalid block offset error.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece containing the invalid offset
+    /// * `offset` - The invalid byte offset within the piece
+    /// * `piece_size` - The total size of the piece
+    pub fn invalid_offset(piece_index: u32, offset: u32, piece_size: u32) -> Self {
+        PieceError::InvalidBlockOffset {
+            piece_index,
+            offset,
+            piece_size,
+        }
+    }
+
+    /// Create a disk write error with context.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the file being written
+    /// * `byte_offset` - Byte offset within the file
+    /// * `source` - The underlying I/O error
+    pub fn disk_write(path: impl Into<PathBuf>, byte_offset: u64, source: std::io::Error) -> Self {
+        PieceError::DiskWriteError {
+            path: path.into(),
+            byte_offset,
+            source,
+        }
+    }
+}
+@
+
+\subsection{Module Assembly}
+
+The pieces module combines the error types and helpers.
+
+<<pieces.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/05-pieces.nw
+// Regenerate with: just tangle
+
+//! Piece management for the BitTorrent client.
+//!
+//! This module handles the verification and storage of downloaded pieces.
+//! A piece is the fundamental unit of data integrity in BitTorrent: each
+//! piece has a SHA1 hash in the torrent metadata, and downloaded data must
+//! match this hash before being written to disk.
+
+<<piece errors>>
+
+<<piece error helpers>>
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+
+    <<piece error display tests>>
+
+    <<piece error trait tests>>
+
+    <<piece error helper tests>>
+}
+@
+
+\subsection{Error Display Tests}
+
+We verify that each error variant produces a human-readable message containing
+the relevant information. These tests document the expected error message format.
+
+<<piece error display tests>>=
+#[test]
+fn hash_mismatch_displays_all_context() {
+    let err = PieceError::PieceHashMismatch {
+        piece_index: 42,
+        expected_hash: "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3".to_string(),
+        computed_hash: "0000000000000000000000000000000000000000".to_string(),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("42"), "should contain piece index: {}", msg);
+    assert!(msg.contains("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"),
+            "should contain expected hash: {}", msg);
+    assert!(msg.contains("0000000000000000000000000000000000000000"),
+            "should contain computed hash: {}", msg);
+    assert!(msg.contains("mismatch"), "should mention mismatch: {}", msg);
+}
+
+#[test]
+fn invalid_index_displays_index_and_range() {
+    let err = PieceError::InvalidPieceIndex {
+        index: 999,
+        num_pieces: 100,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("999"), "should contain invalid index: {}", msg);
+    assert!(msg.contains("100"), "should contain num_pieces: {}", msg);
+    assert!(msg.contains("invalid"), "should mention invalid: {}", msg);
+}
+
+#[test]
+fn invalid_offset_displays_full_context() {
+    let err = PieceError::InvalidBlockOffset {
+        piece_index: 5,
+        offset: 262144,
+        piece_size: 262144,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("5"), "should contain piece index: {}", msg);
+    assert!(msg.contains("262144"), "should contain offset and size: {}", msg);
+    assert!(msg.contains("offset"), "should mention offset: {}", msg);
+}
+
+#[test]
+fn disk_write_error_displays_path_and_offset() {
+    let io_err = io::Error::new(io::ErrorKind::Other, "disk full");
+    let err = PieceError::DiskWriteError {
+        path: PathBuf::from("/data/download.iso"),
+        byte_offset: 1048576,
+        source: io_err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("/data/download.iso"), "should contain path: {}", msg);
+    assert!(msg.contains("1048576"), "should contain byte offset: {}", msg);
+    assert!(msg.contains("disk full"), "should contain underlying error: {}", msg);
+}
+@
+
+\subsection{Error Trait Tests}
+
+We verify that [[PieceError]] implements the required traits correctly.
+
+<<piece error trait tests>>=
+#[test]
+fn piece_error_implements_std_error() {
+    fn assert_error<E: std::error::Error>() {}
+    assert_error::<PieceError>();
+}
+
+#[test]
+fn piece_error_implements_debug() {
+    let err = PieceError::InvalidPieceIndex {
+        index: 10,
+        num_pieces: 5,
+    };
+    // Debug formatting should not panic
+    let debug_str = format!("{:?}", err);
+    assert!(!debug_str.is_empty());
+}
+
+#[test]
+fn piece_error_implements_display() {
+    let err = PieceError::InvalidPieceIndex {
+        index: 10,
+        num_pieces: 5,
+    };
+    // Display formatting should not panic
+    let display_str = format!("{}", err);
+    assert!(!display_str.is_empty());
+}
+
+#[test]
+fn disk_write_error_has_source() {
+    use std::error::Error;
+
+    let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "access denied");
+    let err = PieceError::DiskWriteError {
+        path: PathBuf::from("/root/file"),
+        byte_offset: 0,
+        source: io_err,
+    };
+
+    // The error should have a source
+    assert!(err.source().is_some(), "DiskWriteError should have a source");
+}
+@
+
+\subsection{Helper Method Tests}
+
+We test the helper constructors to ensure they produce correctly-formatted errors.
+
+<<piece error helper tests>>=
+#[test]
+fn hash_mismatch_helper_formats_hashes_as_hex() {
+    let expected: [u8; 20] = [
+        0xa9, 0x4a, 0x8f, 0xe5, 0xcc, 0xb1, 0x9b, 0xa6, 0x1c, 0x4c,
+        0x08, 0x73, 0xd3, 0x91, 0xe9, 0x87, 0x98, 0x2f, 0xbb, 0xd3,
+    ];
+    let computed: [u8; 20] = [0u8; 20];
+
+    let err = PieceError::hash_mismatch(7, &expected, &computed);
+    let msg = err.to_string();
+
+    assert!(msg.contains("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3"),
+            "should contain hex-encoded expected hash: {}", msg);
+    assert!(msg.contains("0000000000000000000000000000000000000000"),
+            "should contain hex-encoded computed hash: {}", msg);
+    assert!(msg.contains("7"), "should contain piece index: {}", msg);
+}
+
+#[test]
+fn invalid_index_helper_constructs_correctly() {
+    let err = PieceError::invalid_index(50, 25);
+    match err {
+        PieceError::InvalidPieceIndex { index, num_pieces } => {
+            assert_eq!(index, 50);
+            assert_eq!(num_pieces, 25);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn invalid_offset_helper_constructs_correctly() {
+    let err = PieceError::invalid_offset(3, 16384, 16000);
+    match err {
+        PieceError::InvalidBlockOffset { piece_index, offset, piece_size } => {
+            assert_eq!(piece_index, 3);
+            assert_eq!(offset, 16384);
+            assert_eq!(piece_size, 16000);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn disk_write_helper_accepts_string_path() {
+    let err = PieceError::disk_write(
+        "/tmp/test.dat",
+        512,
+        io::Error::new(io::ErrorKind::NotFound, "not found"),
+    );
+    match err {
+        PieceError::DiskWriteError { path, byte_offset, .. } => {
+            assert_eq!(path, PathBuf::from("/tmp/test.dat"));
+            assert_eq!(byte_offset, 512);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn disk_write_helper_accepts_pathbuf() {
+    let err = PieceError::disk_write(
+        PathBuf::from("/var/data/file.bin"),
+        1024,
+        io::Error::new(io::ErrorKind::Other, "other"),
+    );
+    match err {
+        PieceError::DiskWriteError { path, byte_offset, .. } => {
+            assert_eq!(path, PathBuf::from("/var/data/file.bin"));
+            assert_eq!(byte_offset, 1024);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+@

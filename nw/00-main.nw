@@ -126,6 +126,7 @@ pub mod bencode;
 pub mod metainfo;
 pub mod tracker;
 pub mod messages;
+pub mod pieces;
 @
 
 \section{Next Steps}
