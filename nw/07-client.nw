@@ -720,6 +720,180 @@ messages. If a peer sends [[bitfield]] later, or sends multiple [[bitfield]]
 messages, that's a protocol violation. However, we handle the message whenever
 received---protocol enforcement is the caller's responsibility.
 
+\subsubsection{Higher-Level Message Handling}
+
+The [[PeerState]] methods described above handle the low-level state updates for
+individual peers. However, the client also needs higher-level processing that
+integrates with global state:
+
+\begin{enumerate}
+\item \textbf{Piece availability tracking}: When a peer reports having pieces
+  (via bitfield or have message), we must update the global [[PieceAvailability]]
+  tracker so rarest-first piece selection works correctly.
+\item \textbf{Interest determination}: After learning what pieces a peer has, we
+  must decide whether to become interested. We should be interested if the peer
+  has any pieces we still need (not yet verified).
+\end{enumerate}
+
+The flow for handling an incoming bitfield message is:
+
+\begin{verbatim}
+receive bitfield message
+    -> update peer's bitfield in PeerState
+    -> update global PieceAvailability for each piece the peer has
+    -> check if peer has pieces we need
+    -> if yes, send interested message
+\end{verbatim}
+
+For a have message, the flow is similar but simpler since it's a single piece:
+
+\begin{verbatim}
+receive have message
+    -> update peer's bitfield in PeerState
+    -> increment PieceAvailability for that piece
+    -> if we need that piece and weren't interested, send interested
+\end{verbatim}
+
+The [[handle\_incoming\_bitfield]] and [[handle\_incoming\_have]] functions
+implement this integration logic, coordinating between per-peer state and
+global availability tracking.
+
+<<incoming message handlers>>=
+use crate::pieces::PieceAvailability;
+
+/// Handles an incoming bitfield message from a peer.
+///
+/// This function performs the full integration of a bitfield message:
+/// 1. Updates the peer's bitfield in their PeerState
+/// 2. Updates the global PieceAvailability for each piece the peer has
+/// 3. Determines if we should become interested in this peer
+///
+/// # Arguments
+///
+/// * `peer_state` - The peer's connection state to update
+/// * `bits` - The raw bitfield bytes from the peer
+/// * `availability` - Global piece availability tracker
+/// * `piece_manager` - Manager tracking our piece download state
+///
+/// # Returns
+///
+/// * `Ok(true)` if we should send an Interested message to this peer
+/// * `Ok(false)` if we should not become interested
+/// * `Err(PeerError)` if the bitfield was invalid (wrong length)
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::{PeerState, handle_incoming_bitfield};
+/// use literate_bittorrent::pieces::{PieceManager, PieceAvailability};
+///
+/// let mut peer_state = PeerState::new(8);
+/// let mut availability = PieceAvailability::new(8);
+/// let hashes = vec![[0u8; 20]];
+/// let manager = PieceManager::new(100, 100, hashes).unwrap();
+///
+/// // Peer has piece 0 (0b10000000)
+/// let bits = vec![0b10000000];
+/// let should_be_interested = handle_incoming_bitfield(
+///     &mut peer_state,
+///     &bits,
+///     &mut availability,
+///     &manager,
+/// ).unwrap();
+///
+/// assert!(peer_state.has_piece(0));
+/// assert_eq!(availability.get_availability(0), Some(1));
+/// assert!(should_be_interested); // We need piece 0
+/// ```
+pub fn handle_incoming_bitfield(
+    peer_state: &mut PeerState,
+    bits: &[u8],
+    availability: &mut PieceAvailability,
+    piece_manager: &PieceManager,
+) -> Result<bool, crate::messages::PeerError> {
+    // First, update the peer's bitfield
+    peer_state.handle_bitfield(bits)?;
+
+    // Update global availability for each piece the peer has
+    let num_pieces = availability.num_pieces();
+    for piece_index in 0..num_pieces {
+        if peer_state.has_piece(piece_index as u32) {
+            availability.add_piece(piece_index as u32);
+        }
+    }
+
+    // Determine if we should be interested: does the peer have any piece we need?
+    let should_be_interested = (0..num_pieces).any(|i| {
+        peer_state.has_piece(i as u32) && !piece_manager.is_verified(i)
+    });
+
+    Ok(should_be_interested)
+}
+
+/// Handles an incoming have message from a peer.
+///
+/// This function performs the full integration of a have message:
+/// 1. Updates the peer's bitfield to mark the piece as available
+/// 2. Increments the global PieceAvailability for that piece
+/// 3. Determines if we should become interested in this peer
+///
+/// Unlike bitfield messages, have messages cannot fail (invalid indices
+/// are simply ignored). This matches the BitTorrent protocol behavior where
+/// clients typically ignore malformed have messages rather than disconnecting.
+///
+/// # Arguments
+///
+/// * `peer_state` - The peer's connection state to update
+/// * `piece_index` - The piece index the peer now has
+/// * `availability` - Global piece availability tracker
+/// * `piece_manager` - Manager tracking our piece download state
+///
+/// # Returns
+///
+/// * `true` if we should send an Interested message (peer has a piece we need)
+/// * `false` if we don't need this piece or the index was invalid
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::{PeerState, handle_incoming_have};
+/// use literate_bittorrent::pieces::{PieceManager, PieceAvailability};
+///
+/// let mut peer_state = PeerState::new(8);
+/// let mut availability = PieceAvailability::new(8);
+/// let hashes = vec![[0u8; 20]];
+/// let manager = PieceManager::new(100, 100, hashes).unwrap();
+///
+/// let should_be_interested = handle_incoming_have(
+///     &mut peer_state,
+///     0,
+///     &mut availability,
+///     &manager,
+/// );
+///
+/// assert!(peer_state.has_piece(0));
+/// assert_eq!(availability.get_availability(0), Some(1));
+/// assert!(should_be_interested); // We need piece 0
+/// ```
+pub fn handle_incoming_have(
+    peer_state: &mut PeerState,
+    piece_index: u32,
+    availability: &mut PieceAvailability,
+    piece_manager: &PieceManager,
+) -> bool {
+    // Update peer's bitfield (returns false if index invalid)
+    if !peer_state.handle_have(piece_index) {
+        return false;
+    }
+
+    // Update global availability
+    availability.add_piece(piece_index);
+
+    // Check if we need this piece
+    !piece_manager.is_verified(piece_index as usize)
+}
+@
+
 \subsection{Client Construction}
 
 Creating a [[Client]] requires a parsed [[Metainfo]] and configuration options.
@@ -1026,6 +1200,8 @@ The client module exports the [[Client]] struct and associated types.
 <<client struct>>
 
 <<client impl>>
+
+<<incoming message handlers>>
 
 <<peer connection manager>>
 
@@ -1625,6 +1801,214 @@ mod tests {
             assert!(state.has_piece(i), "Piece {} should be set", i);
         }
     }
+
+    // =========================================================================
+    // Tests for handle_incoming_bitfield and handle_incoming_have
+    // =========================================================================
+
+    #[test]
+    fn handle_incoming_bitfield_updates_availability() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(8);
+        let mut availability = PieceAvailability::new(8);
+        let hashes = vec![[0u8; 20]]; // 1 piece
+        let manager = PieceManager::new(100, 100, hashes).unwrap();
+
+        // Before: all availability counts are 0
+        for i in 0..8 {
+            assert_eq!(availability.get_availability(i), Some(0));
+        }
+
+        // Peer has pieces 0, 2, 4, 6 (0b10101010)
+        let bits = vec![0b10101010];
+        let result = handle_incoming_bitfield(
+            &mut peer_state,
+            &bits,
+            &mut availability,
+            &manager,
+        );
+        assert!(result.is_ok());
+
+        // Verify availability was updated for pieces the peer has
+        assert_eq!(availability.get_availability(0), Some(1));
+        assert_eq!(availability.get_availability(1), Some(0));
+        assert_eq!(availability.get_availability(2), Some(1));
+        assert_eq!(availability.get_availability(3), Some(0));
+        assert_eq!(availability.get_availability(4), Some(1));
+        assert_eq!(availability.get_availability(5), Some(0));
+        assert_eq!(availability.get_availability(6), Some(1));
+        assert_eq!(availability.get_availability(7), Some(0));
+    }
+
+    #[test]
+    fn handle_incoming_have_updates_availability() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(8);
+        let mut availability = PieceAvailability::new(8);
+        let hashes = vec![[0u8; 20]]; // 1 piece
+        let manager = PieceManager::new(100, 100, hashes).unwrap();
+
+        // Before: piece 3 has availability 0
+        assert_eq!(availability.get_availability(3), Some(0));
+
+        // Peer announces they have piece 3
+        let result = handle_incoming_have(
+            &mut peer_state,
+            3,
+            &mut availability,
+            &manager,
+        );
+
+        // Should return true because we need piece 3 (manager has only piece 0)
+        // Actually, manager only tracks 1 piece (index 0), so piece 3 is out of range for manager
+        // but we still update availability and peer_state. is_verified returns false for
+        // out-of-range indices, so this should return true.
+        assert!(result);
+        assert!(peer_state.has_piece(3));
+        assert_eq!(availability.get_availability(3), Some(1));
+    }
+
+    #[test]
+    fn handle_incoming_bitfield_returns_interested_when_peer_has_needed_pieces() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(4);
+        let mut availability = PieceAvailability::new(4);
+        // 4 pieces, none verified
+        let hashes = vec![[0u8; 20]; 4];
+        let manager = PieceManager::new(100, 400, hashes).unwrap();
+
+        // Peer has pieces 0 and 1
+        let bits = vec![0b11000000];
+        let result = handle_incoming_bitfield(
+            &mut peer_state,
+            &bits,
+            &mut availability,
+            &manager,
+        );
+
+        // Should return Ok(true) because peer has pieces we need
+        assert!(result.unwrap(), "Should be interested when peer has pieces we need");
+    }
+
+    #[test]
+    fn handle_incoming_bitfield_returns_not_interested_when_peer_has_no_needed_pieces() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(4);
+        let mut availability = PieceAvailability::new(4);
+        // 4 pieces
+        let hashes = vec![[0u8; 20]; 4];
+        let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+
+        // Mark pieces 0 and 1 as verified
+        manager.mark_verified(0).unwrap();
+        manager.mark_verified(1).unwrap();
+
+        // Peer only has pieces 0 and 1 (which we already have)
+        let bits = vec![0b11000000];
+        let result = handle_incoming_bitfield(
+            &mut peer_state,
+            &bits,
+            &mut availability,
+            &manager,
+        );
+
+        // Should return Ok(false) because peer only has pieces we've already verified
+        assert!(!result.unwrap(), "Should not be interested when peer only has verified pieces");
+    }
+
+    #[test]
+    fn handle_incoming_have_returns_true_when_we_need_the_piece() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(4);
+        let mut availability = PieceAvailability::new(4);
+        let hashes = vec![[0u8; 20]; 4];
+        let manager = PieceManager::new(100, 400, hashes).unwrap();
+
+        // Peer has piece 2 which we need
+        let result = handle_incoming_have(
+            &mut peer_state,
+            2,
+            &mut availability,
+            &manager,
+        );
+
+        assert!(result, "Should return true when we need the piece");
+    }
+
+    #[test]
+    fn handle_incoming_have_returns_false_when_we_have_the_piece() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(4);
+        let mut availability = PieceAvailability::new(4);
+        let hashes = vec![[0u8; 20]; 4];
+        let mut manager = PieceManager::new(100, 400, hashes).unwrap();
+
+        // Mark piece 2 as verified
+        manager.mark_verified(2).unwrap();
+
+        // Peer has piece 2 which we already have
+        let result = handle_incoming_have(
+            &mut peer_state,
+            2,
+            &mut availability,
+            &manager,
+        );
+
+        // Availability should still be updated
+        assert_eq!(availability.get_availability(2), Some(1));
+        // But we shouldn't become interested
+        assert!(!result, "Should return false when we already have the piece");
+    }
+
+    #[test]
+    fn handle_incoming_have_returns_false_for_invalid_index() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+
+        let mut peer_state = PeerState::new(4);
+        let mut availability = PieceAvailability::new(4);
+        let hashes = vec![[0u8; 20]; 4];
+        let manager = PieceManager::new(100, 400, hashes).unwrap();
+
+        // Invalid piece index (out of bounds for peer_state)
+        let result = handle_incoming_have(
+            &mut peer_state,
+            100,
+            &mut availability,
+            &manager,
+        );
+
+        assert!(!result, "Should return false for invalid index");
+        // Availability should not be updated (the piece doesn't exist in our range)
+        assert_eq!(availability.get_availability(100), None);
+    }
+
+    #[test]
+    fn handle_incoming_bitfield_rejects_wrong_length() {
+        use crate::pieces::{PieceManager, PieceAvailability};
+        use crate::messages::PeerError;
+
+        let mut peer_state = PeerState::new(16); // Expects 2 bytes
+        let mut availability = PieceAvailability::new(16);
+        let hashes = vec![[0u8; 20]; 2];
+        let manager = PieceManager::new(100, 200, hashes).unwrap();
+
+        // Wrong length bitfield
+        let bits = vec![0xFF]; // Only 1 byte, expected 2
+        let result = handle_incoming_bitfield(
+            &mut peer_state,
+            &bits,
+            &mut availability,
+            &manager,
+        );
+
+        assert!(matches!(result, Err(PeerError::BitfieldWrongLength { expected: 2, actual: 1 })));
+    }
 }
 @
 
@@ -1645,6 +2029,14 @@ The tests verify each aspect of client construction:
   \item [[handle\_not\_interested]] clears [[peer\_interested]]
   \item [[handle\_have]] sets bitfield bits with bounds checking
   \item [[handle\_bitfield]] replaces bitfield with length validation
+  \end{itemize}
+\item Higher-level message handlers coordinate global state:
+  \begin{itemize}
+  \item [[handle\_incoming\_bitfield]] updates peer state, availability, and determines interest
+  \item [[handle\_incoming\_have]] updates peer state, availability for single piece, determines interest
+  \item Both correctly return whether we should send an Interested message
+  \item Availability counts are incremented for pieces the peer has
+  \item Invalid bitfield lengths are rejected with appropriate errors
   \end{itemize}
 \end{itemize}
 

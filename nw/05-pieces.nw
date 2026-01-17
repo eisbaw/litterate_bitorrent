@@ -1013,6 +1013,40 @@ impl PieceManager {
     pub fn is_complete(&self) -> bool {
         self.piece_states.iter().all(|s| s.is_verified())
     }
+
+    /// Checks if a specific piece has been verified (hash matched).
+    ///
+    /// This is used to determine if we still need a piece when deciding
+    /// whether to become interested in a peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The zero-based index of the piece
+    ///
+    /// # Returns
+    ///
+    /// * `true` if the piece is verified
+    /// * `false` if the piece is missing, in progress, failed, or index is invalid
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::PieceManager;
+    ///
+    /// let hashes = vec![[0u8; 20]; 3];
+    /// let mut manager = PieceManager::new(100, 300, hashes).unwrap();
+    ///
+    /// assert!(!manager.is_verified(0)); // Not yet verified
+    /// manager.mark_verified(0).unwrap();
+    /// assert!(manager.is_verified(0));  // Now verified
+    /// assert!(!manager.is_verified(100)); // Invalid index returns false
+    /// ```
+    pub fn is_verified(&self, piece_index: usize) -> bool {
+        self.piece_states
+            .get(piece_index)
+            .map(|s| s.is_verified())
+            .unwrap_or(false)
+    }
 }
 @
 
