@@ -91,11 +91,12 @@ one per torrent.
 
 <<client struct>>=
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::net::SocketAddr;
 
 use crate::metainfo::Metainfo;
-use crate::pieces::PieceManager;
+use crate::pieces::{PieceManager, BlockRequest};
 
 /// Central orchestration point for a BitTorrent download.
 ///
@@ -211,22 +212,270 @@ pub struct Client {
     completed_announced: bool,
 }
 
-/// Placeholder for per-peer connection state.
+/// Per-peer connection state tracking the 4-bit choking/interest state machine.
 ///
-/// This will be expanded in the peer connection chapter to track:
-/// - Choking/interested state (both directions)
-/// - Peer's bitfield of available pieces
-/// - Pending requests
-/// - Download/upload statistics
-#[derive(Debug, Clone, Default)]
+/// The BitTorrent protocol uses a symmetric state machine between peers. Each
+/// side maintains two bits about itself (am I choking them? am I interested?)
+/// and infers two bits about the remote peer (are they choking me? are they
+/// interested?). This creates a 4-bit state that determines data flow:
+///
+/// ```text
+///   am_choking      - We are refusing to upload to them (default: true)
+///   am_interested   - We want pieces they have (default: false)
+///   peer_choking    - They are refusing to upload to us (default: true)
+///   peer_interested - They want pieces we have (default: false)
+/// ```
+///
+/// # Data Flow Conditions
+///
+/// Data transfer can only occur when certain conditions are met:
+///
+/// - **We can request from them** when: `!peer_choking && am_interested`
+///   (they're willing to send, and we want data)
+/// - **They can request from us** when: `!am_choking && peer_interested`
+///   (we're willing to send, and they want data)
+///
+/// # State Transitions
+///
+/// State changes happen via protocol messages:
+/// - `choke` / `unchoke` messages change the choking state
+/// - `interested` / `not interested` messages change the interest state
+///
+/// When a peer chokes us, all pending requests to that peer should be
+/// considered cancelled and may need to be re-requested from other peers.
+///
+/// # Bitfield Tracking
+///
+/// The `bitfield` tracks which pieces the remote peer has. This is initialized
+/// from the peer's `bitfield` message (sent after handshake) and updated by
+/// `have` messages as they complete pieces.
+///
+/// # Request Pipelining
+///
+/// `pending_requests` tracks in-flight block requests to this peer. BitTorrent
+/// allows pipelining multiple requests (typically 10-16) to maximize throughput.
+/// Each request includes a timestamp for timeout detection.
+#[derive(Debug, Clone)]
 pub struct PeerState {
-    // Placeholder - will be expanded when implementing peer connections
+    /// True if we are choking this peer (refusing to upload).
+    ///
+    /// Default is `true` because we start by choking all peers until we
+    /// decide to unchoke them based on our upload strategy.
+    pub am_choking: bool,
+
+    /// True if we are interested in this peer's pieces.
+    ///
+    /// We become interested when the peer has pieces we need. This is
+    /// updated when we receive their bitfield or have messages.
+    pub am_interested: bool,
+
+    /// True if the peer is choking us (refusing to upload).
+    ///
+    /// Default is `true` because peers start by choking us. We must wait
+    /// for an `unchoke` message before we can request pieces.
+    pub peer_choking: bool,
+
+    /// True if the peer is interested in our pieces.
+    ///
+    /// Updated when we receive `interested` or `not interested` messages.
+    pub peer_interested: bool,
+
+    /// Bitfield of pieces this peer has.
+    ///
+    /// Each bit represents one piece: bit i is set if the peer has piece i.
+    /// Bits are packed into bytes, with bit 0 of byte 0 representing piece 0.
+    /// The size is `ceil(num_pieces / 8)` bytes.
+    pub bitfield: Vec<u8>,
+
+    /// Queue of pending block requests sent to this peer.
+    ///
+    /// BitTorrent allows pipelining multiple requests to maximize throughput.
+    /// Each request includes timing information for timeout detection. When
+    /// the peer chokes us, these requests are effectively cancelled.
+    pub pending_requests: VecDeque<BlockRequest>,
+}
+
+impl PeerState {
+    /// Creates a new PeerState with protocol-default values.
+    ///
+    /// The initial state reflects BitTorrent's connection semantics:
+    /// - Both sides start choking each other (no data transfer)
+    /// - Neither side is interested yet
+    /// - The bitfield is empty (sized for the torrent)
+    /// - No pending requests
+    ///
+    /// # Arguments
+    ///
+    /// * `num_pieces` - Total number of pieces in the torrent
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let state = PeerState::new(100); // 100-piece torrent
+    /// assert!(state.am_choking);       // We choke them initially
+    /// assert!(!state.am_interested);   // Not interested until we see their pieces
+    /// assert!(state.peer_choking);     // They choke us initially
+    /// assert!(!state.peer_interested);
+    /// ```
+    pub fn new(num_pieces: u32) -> Self {
+        // Calculate bitfield size: ceil(num_pieces / 8)
+        let bitfield_len = ((num_pieces + 7) / 8) as usize;
+
+        PeerState {
+            am_choking: true,       // We choke them by default
+            am_interested: false,   // Not interested until we see their pieces
+            peer_choking: true,     // Assume they're choking us until told otherwise
+            peer_interested: false, // Assume they're not interested
+            bitfield: vec![0u8; bitfield_len],
+            pending_requests: VecDeque::new(),
+        }
+    }
+
+    /// Returns true if we can send requests to this peer.
+    ///
+    /// We can only request pieces when:
+    /// 1. The peer is NOT choking us (willing to send data)
+    /// 2. We ARE interested in their pieces
+    ///
+    /// Both conditions must be true. If we're not interested, requesting
+    /// would be pointless. If they're choking us, they'll ignore our requests.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    ///
+    /// // Initially can't request: we're not interested and they're choking
+    /// assert!(!state.can_request());
+    ///
+    /// // Become interested and get unchoked
+    /// state.am_interested = true;
+    /// state.peer_choking = false;
+    /// assert!(state.can_request());
+    ///
+    /// // If they choke us again, can't request
+    /// state.peer_choking = true;
+    /// assert!(!state.can_request());
+    /// ```
+    #[inline]
+    pub fn can_request(&self) -> bool {
+        !self.peer_choking && self.am_interested
+    }
+
+    /// Returns true if the peer has the specified piece.
+    ///
+    /// Checks the bitfield to determine if the peer has announced ownership
+    /// of the given piece (either via bitfield message or have message).
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The piece index to check
+    ///
+    /// # Returns
+    ///
+    /// `true` if the peer has the piece, `false` otherwise. Returns `false`
+    /// for out-of-bounds indices (defensive behavior).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerState;
+    ///
+    /// let mut state = PeerState::new(100);
+    ///
+    /// // Initially peer has no pieces
+    /// assert!(!state.has_piece(0));
+    /// assert!(!state.has_piece(42));
+    ///
+    /// // Simulate receiving have(42)
+    /// let byte_idx = 42 / 8;
+    /// let bit_idx = 7 - (42 % 8); // MSB first
+    /// state.bitfield[byte_idx] |= 1 << bit_idx;
+    ///
+    /// assert!(state.has_piece(42));
+    /// assert!(!state.has_piece(41)); // Other pieces still missing
+    /// ```
+    #[inline]
+    pub fn has_piece(&self, index: u32) -> bool {
+        let byte_idx = (index / 8) as usize;
+        let bit_idx = 7 - (index % 8); // MSB first (BitTorrent convention)
+
+        if byte_idx >= self.bitfield.len() {
+            return false; // Out of bounds, defensive
+        }
+
+        (self.bitfield[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Sets the bit for a piece in the bitfield (peer has this piece).
+    ///
+    /// Called when processing a `have` message from the peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The piece index to mark as available
+    ///
+    /// # Returns
+    ///
+    /// `true` if the bit was set, `false` if index was out of bounds.
+    pub fn set_piece(&mut self, index: u32) -> bool {
+        let byte_idx = (index / 8) as usize;
+        let bit_idx = 7 - (index % 8); // MSB first
+
+        if byte_idx >= self.bitfield.len() {
+            return false;
+        }
+
+        self.bitfield[byte_idx] |= 1 << bit_idx;
+        true
+    }
+
+    /// Returns the number of pieces this peer has.
+    ///
+    /// Counts all set bits in the bitfield. Useful for determining
+    /// if a peer is a seeder (has all pieces) or assessing peer value.
+    pub fn piece_count(&self) -> u32 {
+        self.bitfield
+            .iter()
+            .map(|byte| byte.count_ones())
+            .sum()
+    }
+
+    /// Returns true if this peer is a seeder (has all pieces).
+    ///
+    /// # Arguments
+    ///
+    /// * `num_pieces` - Total number of pieces in the torrent
+    pub fn is_seeder(&self, num_pieces: u32) -> bool {
+        self.piece_count() == num_pieces
+    }
+}
+
+impl Default for PeerState {
+    /// Creates a PeerState with a zero-length bitfield.
+    ///
+    /// This is primarily useful for testing. In production, use `PeerState::new()`
+    /// with the actual number of pieces.
+    fn default() -> Self {
+        PeerState {
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+            bitfield: Vec::new(),
+            pending_requests: VecDeque::new(),
+        }
+    }
 }
 @
 
 The [[active\_peers]] map uses [[SocketAddr]] as the key because a peer is
-uniquely identified by their IP address and port. The [[PeerState]] struct is
-a placeholder that will be expanded when we implement peer connections.
+uniquely identified by their IP address and port. The [[PeerState]] struct
+tracks the 4-bit state machine that governs data flow with each peer.
 
 \subsection{Client Construction}
 
@@ -787,6 +1036,200 @@ mod tests {
         assert_eq!(client.total_length(), 3303444480);
         assert!(client.peer_id().starts_with(b"-LB0001-"));
     }
+
+    // ========================================================================
+    // PeerState Tests
+    // ========================================================================
+
+    #[test]
+    fn peer_state_new_initializes_defaults() {
+        // AC #1: am_choking true, am_interested false, peer_choking true, peer_interested false
+        let state = PeerState::new(100);
+
+        assert!(state.am_choking, "Should start choking peer");
+        assert!(!state.am_interested, "Should not be interested initially");
+        assert!(state.peer_choking, "Peer should be choking us initially");
+        assert!(!state.peer_interested, "Peer should not be interested initially");
+    }
+
+    #[test]
+    fn peer_state_new_creates_correct_bitfield_size() {
+        // AC #2, AC #4: bitfield Vec<u8> with correct size
+        // 100 pieces needs ceil(100/8) = 13 bytes
+        let state = PeerState::new(100);
+        assert_eq!(state.bitfield.len(), 13);
+
+        // 8 pieces needs exactly 1 byte
+        let state = PeerState::new(8);
+        assert_eq!(state.bitfield.len(), 1);
+
+        // 1 piece needs 1 byte
+        let state = PeerState::new(1);
+        assert_eq!(state.bitfield.len(), 1);
+
+        // 9 pieces needs 2 bytes
+        let state = PeerState::new(9);
+        assert_eq!(state.bitfield.len(), 2);
+
+        // 0 pieces needs 0 bytes (edge case)
+        let state = PeerState::new(0);
+        assert_eq!(state.bitfield.len(), 0);
+    }
+
+    #[test]
+    fn peer_state_new_bitfield_starts_empty() {
+        let state = PeerState::new(100);
+        for byte in &state.bitfield {
+            assert_eq!(*byte, 0, "Bitfield should be all zeros");
+        }
+    }
+
+    #[test]
+    fn peer_state_pending_requests_starts_empty() {
+        // AC #3: pending_requests VecDeque starts empty
+        let state = PeerState::new(100);
+        assert!(state.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn peer_state_can_request_when_unchoked_and_interested() {
+        // AC #5: can_request returns true only when !peer_choking && am_interested
+        let mut state = PeerState::new(100);
+
+        // Initially: choking + not interested = can't request
+        assert!(!state.can_request());
+
+        // Interested but still choked = can't request
+        state.am_interested = true;
+        assert!(!state.can_request());
+
+        // Interested and unchoked = CAN request
+        state.peer_choking = false;
+        assert!(state.can_request());
+
+        // Unchoked but not interested = can't request
+        state.am_interested = false;
+        assert!(!state.can_request());
+    }
+
+    #[test]
+    fn peer_state_has_piece_checks_bitfield() {
+        // AC #6: has_piece checks bitfield
+        let mut state = PeerState::new(100);
+
+        // Initially no pieces
+        assert!(!state.has_piece(0));
+        assert!(!state.has_piece(42));
+        assert!(!state.has_piece(99));
+
+        // Set piece 0 (bit 7 of byte 0 in MSB-first order)
+        state.bitfield[0] = 0b1000_0000;
+        assert!(state.has_piece(0));
+        assert!(!state.has_piece(1));
+
+        // Set piece 7 (bit 0 of byte 0)
+        state.bitfield[0] = 0b0000_0001;
+        assert!(state.has_piece(7));
+        assert!(!state.has_piece(0));
+
+        // Set piece 8 (bit 7 of byte 1)
+        state.bitfield[1] = 0b1000_0000;
+        assert!(state.has_piece(8));
+        assert!(!state.has_piece(9));
+    }
+
+    #[test]
+    fn peer_state_has_piece_out_of_bounds_returns_false() {
+        let state = PeerState::new(8);
+
+        // Valid index
+        assert!(!state.has_piece(0));
+        assert!(!state.has_piece(7));
+
+        // Out of bounds indices
+        assert!(!state.has_piece(8));
+        assert!(!state.has_piece(100));
+        assert!(!state.has_piece(u32::MAX));
+    }
+
+    #[test]
+    fn peer_state_set_piece_marks_bitfield() {
+        let mut state = PeerState::new(100);
+
+        assert!(!state.has_piece(42));
+        assert!(state.set_piece(42));
+        assert!(state.has_piece(42));
+
+        // Other pieces unaffected
+        assert!(!state.has_piece(41));
+        assert!(!state.has_piece(43));
+    }
+
+    #[test]
+    fn peer_state_set_piece_out_of_bounds_returns_false() {
+        let mut state = PeerState::new(8);
+
+        assert!(!state.set_piece(8));
+        assert!(!state.set_piece(100));
+    }
+
+    #[test]
+    fn peer_state_piece_count_counts_set_bits() {
+        let mut state = PeerState::new(16);
+
+        assert_eq!(state.piece_count(), 0);
+
+        state.set_piece(0);
+        assert_eq!(state.piece_count(), 1);
+
+        state.set_piece(7);
+        state.set_piece(15);
+        assert_eq!(state.piece_count(), 3);
+
+        // Set all pieces
+        state.bitfield = vec![0xFF, 0xFF];
+        assert_eq!(state.piece_count(), 16);
+    }
+
+    #[test]
+    fn peer_state_is_seeder() {
+        let mut state = PeerState::new(16);
+
+        assert!(!state.is_seeder(16));
+
+        // Set all pieces
+        state.bitfield = vec![0xFF, 0xFF];
+        assert!(state.is_seeder(16));
+    }
+
+    #[test]
+    fn peer_state_default_has_empty_bitfield() {
+        let state = PeerState::default();
+        assert!(state.bitfield.is_empty());
+        assert!(state.am_choking);
+        assert!(!state.am_interested);
+        assert!(state.peer_choking);
+        assert!(!state.peer_interested);
+    }
+
+    #[test]
+    fn peer_state_is_debug() {
+        let state = PeerState::new(100);
+        let debug = format!("{:?}", state);
+        assert!(debug.contains("PeerState"));
+        assert!(debug.contains("am_choking"));
+    }
+
+    #[test]
+    fn peer_state_is_clone() {
+        let mut state = PeerState::new(100);
+        state.am_interested = true;
+        state.set_piece(42);
+
+        let cloned = state.clone();
+        assert!(cloned.am_interested);
+        assert!(cloned.has_piece(42));
+    }
 }
 @
 
@@ -797,6 +1240,8 @@ The tests verify each aspect of client construction:
 \item Accessor methods return the expected values
 \item Error handling rejects invalid inputs
 \item Integration with real torrent files works correctly
+\item PeerState correctly implements the 4-bit state machine
+\item PeerState bitfield operations work correctly
 \end{itemize}
 
 \subsection{Graceful Shutdown}
