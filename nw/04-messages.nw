@@ -1713,12 +1713,194 @@ impl Message {
             Message::Cancel { .. } => Some(MSG_CANCEL),
         }
     }
+
+    <<message to_bytes>>
 }
 @
 
 The [[id()]] method returns [[Option<u8>]] rather than [[u8]] to accurately
 represent that keep-alive has no ID. This forces callers to handle the keep-alive
 case explicitly, preventing bugs where code assumes all messages have IDs.
+
+\subsubsection{Message Serialization}
+
+To transmit a message over the wire, we must serialize it to the format specified
+by BEP 3. Every message (including keep-alive) begins with a 4-byte big-endian
+length prefix indicating how many bytes follow. For keep-alive, this length is
+zero and no further bytes follow. For all other messages, the length includes
+one byte for the message ID plus any payload bytes.
+
+The wire format for each message type is:
+
+\begin{description}
+\item[KeepAlive] Length = 0, no ID, no payload.
+  Wire format: [[0x00, 0x00, 0x00, 0x00]] (4 bytes total)
+
+\item[Choke, Unchoke, Interested, NotInterested] Length = 1, ID only.
+  Wire format: [[0x00, 0x00, 0x00, 0x01, id]] (5 bytes total)
+
+\item[Have] Length = 5, ID + 4-byte piece index.
+  Wire format: [[0x00, 0x00, 0x00, 0x05, 0x04, index\_be[4]]] (9 bytes total)
+
+\item[Bitfield] Length = 1 + bitfield.len(), ID + raw bitfield bytes.
+  Wire format: [[length\_be[4], 0x05, bitfield...]]
+
+\item[Request, Cancel] Length = 13, ID + 4-byte index + 4-byte begin + 4-byte length.
+  Wire format: [[0x00, 0x00, 0x00, 0x0D, id, index\_be[4], begin\_be[4], length\_be[4]]]
+  (17 bytes total)
+
+\item[Piece] Length = 9 + data.len(), ID + 4-byte index + 4-byte begin + data.
+  Wire format: [[length\_be[4], 0x07, index\_be[4], begin\_be[4], data...]]
+\end{description}
+
+All multi-byte integers are encoded in big-endian (network) byte order, as is
+standard for network protocols. The length prefix counts only the bytes that
+follow---it does not include itself.
+
+<<message to_bytes>>=
+/// Serializes this message to its wire format.
+///
+/// The wire format is: `<length><id><payload>` where:
+/// - `length` is a 4-byte big-endian integer (bytes following the length field)
+/// - `id` is a 1-byte message type identifier (omitted for keep-alive)
+/// - `payload` varies by message type
+///
+/// The returned `Vec<u8>` can be written directly to a TCP socket.
+///
+/// # Wire Format by Message Type
+///
+/// | Message | Length | Wire Format |
+/// |---------|--------|-------------|
+/// | KeepAlive | 0 | `[0,0,0,0]` |
+/// | Choke | 1 | `[0,0,0,1,0]` |
+/// | Unchoke | 1 | `[0,0,0,1,1]` |
+/// | Interested | 1 | `[0,0,0,1,2]` |
+/// | NotInterested | 1 | `[0,0,0,1,3]` |
+/// | Have | 5 | `[0,0,0,5,4,idx[4]]` |
+/// | Bitfield | 1+n | `[len[4],5,bits[n]]` |
+/// | Request | 13 | `[0,0,0,13,6,idx[4],begin[4],len[4]]` |
+/// | Piece | 9+n | `[len[4],7,idx[4],begin[4],data[n]]` |
+/// | Cancel | 13 | `[0,0,0,13,8,idx[4],begin[4],len[4]]` |
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::messages::Message;
+///
+/// // Keep-alive is just four zero bytes
+/// let keepalive = Message::KeepAlive;
+/// assert_eq!(keepalive.to_bytes(), vec![0, 0, 0, 0]);
+///
+/// // Choke is length=1, id=0
+/// let choke = Message::Choke;
+/// assert_eq!(choke.to_bytes(), vec![0, 0, 0, 1, 0]);
+///
+/// // Have is length=5, id=4, then 4-byte piece index
+/// let have = Message::Have(42);
+/// assert_eq!(have.to_bytes(), vec![0, 0, 0, 5, 4, 0, 0, 0, 42]);
+/// ```
+#[must_use]
+pub fn to_bytes(&self) -> Vec<u8> {
+    match self {
+        // Keep-alive: length = 0, no ID, no payload
+        Message::KeepAlive => vec![0, 0, 0, 0],
+
+        // Messages with no payload: length = 1 (just the ID byte)
+        Message::Choke => {
+            let mut buf = Vec::with_capacity(5);
+            buf.extend_from_slice(&1u32.to_be_bytes()); // length = 1
+            buf.push(MSG_CHOKE);
+            buf
+        }
+        Message::Unchoke => {
+            let mut buf = Vec::with_capacity(5);
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.push(MSG_UNCHOKE);
+            buf
+        }
+        Message::Interested => {
+            let mut buf = Vec::with_capacity(5);
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.push(MSG_INTERESTED);
+            buf
+        }
+        Message::NotInterested => {
+            let mut buf = Vec::with_capacity(5);
+            buf.extend_from_slice(&1u32.to_be_bytes());
+            buf.push(MSG_NOT_INTERESTED);
+            buf
+        }
+
+        // Have: length = 5 (1 byte ID + 4 bytes piece index)
+        Message::Have(piece_index) => {
+            let mut buf = Vec::with_capacity(9);
+            buf.extend_from_slice(&5u32.to_be_bytes()); // length = 5
+            buf.push(MSG_HAVE);
+            buf.extend_from_slice(&piece_index.to_be_bytes());
+            buf
+        }
+
+        // Bitfield: length = 1 + bitfield.len()
+        Message::Bitfield(bitfield) => {
+            let length = 1 + bitfield.len() as u32;
+            let mut buf = Vec::with_capacity(4 + 1 + bitfield.len());
+            buf.extend_from_slice(&length.to_be_bytes());
+            buf.push(MSG_BITFIELD);
+            buf.extend_from_slice(bitfield);
+            buf
+        }
+
+        // Request: length = 13 (1 byte ID + 3 * 4 bytes)
+        Message::Request { index, begin, length } => {
+            let mut buf = Vec::with_capacity(17);
+            buf.extend_from_slice(&13u32.to_be_bytes()); // length = 13
+            buf.push(MSG_REQUEST);
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.extend_from_slice(&begin.to_be_bytes());
+            buf.extend_from_slice(&length.to_be_bytes());
+            buf
+        }
+
+        // Piece: length = 9 + data.len() (1 byte ID + 4 + 4 + data)
+        Message::Piece { index, begin, data } => {
+            let length = 9 + data.len() as u32;
+            let mut buf = Vec::with_capacity(4 + 9 + data.len());
+            buf.extend_from_slice(&length.to_be_bytes());
+            buf.push(MSG_PIECE);
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.extend_from_slice(&begin.to_be_bytes());
+            buf.extend_from_slice(data);
+            buf
+        }
+
+        // Cancel: length = 13 (same structure as Request)
+        Message::Cancel { index, begin, length } => {
+            let mut buf = Vec::with_capacity(17);
+            buf.extend_from_slice(&13u32.to_be_bytes());
+            buf.push(MSG_CANCEL);
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.extend_from_slice(&begin.to_be_bytes());
+            buf.extend_from_slice(&length.to_be_bytes());
+            buf
+        }
+    }
+}
+@
+
+The implementation uses [[Vec::with_capacity]] to pre-allocate the exact buffer
+size needed, avoiding reallocations. Each message type knows its exact wire
+size: fixed-size messages have constant capacities, while variable-size messages
+(Bitfield, Piece) compute capacity from their payload length.
+
+The [[to_be_bytes()]] method on [[u32]] returns a [[4; u8]]] array containing
+the big-endian representation. We use [[extend_from_slice]] to append these
+bytes to the buffer, which is efficient because it copies contiguous memory.
+
+Note that we do not validate the message contents during serialization. For
+example, we do not check that a Request's length is a reasonable block size,
+or that a Bitfield has valid spare bits. Validation is the responsibility of
+higher-level code; the serializer's job is to faithfully encode whatever
+message it receives.
 
 \subsubsection{Message Tests}
 
@@ -1945,6 +2127,8 @@ fn cancel_stores_fields() {
         panic!("expected Cancel variant");
     }
 }
+
+<<message serialization tests>>
 @
 
 These tests verify:
@@ -1958,11 +2142,363 @@ These tests verify:
 \item Message variants correctly store their payloads
 \end{itemize}
 
+\subsubsection{Message Serialization Tests}
+
+The serialization tests verify that [[to_bytes]] produces the exact wire format
+specified by BEP 3. Each test checks the complete byte sequence including the
+length prefix, ensuring protocol compliance.
+
+<<message serialization tests>>=
+#[test]
+fn to_bytes_keepalive() {
+    // Keep-alive: length = 0, no ID, no payload
+    // Wire format: [0, 0, 0, 0]
+    let msg = Message::KeepAlive;
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 0]);
+    assert_eq!(bytes.len(), 4);
+}
+
+#[test]
+fn to_bytes_choke() {
+    // Choke: length = 1, ID = 0
+    // Wire format: [0, 0, 0, 1, 0]
+    let msg = Message::Choke;
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 1, 0]);
+    assert_eq!(bytes.len(), 5);
+}
+
+#[test]
+fn to_bytes_unchoke() {
+    // Unchoke: length = 1, ID = 1
+    // Wire format: [0, 0, 0, 1, 1]
+    let msg = Message::Unchoke;
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 1, 1]);
+    assert_eq!(bytes.len(), 5);
+}
+
+#[test]
+fn to_bytes_interested() {
+    // Interested: length = 1, ID = 2
+    // Wire format: [0, 0, 0, 1, 2]
+    let msg = Message::Interested;
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 1, 2]);
+    assert_eq!(bytes.len(), 5);
+}
+
+#[test]
+fn to_bytes_not_interested() {
+    // NotInterested: length = 1, ID = 3
+    // Wire format: [0, 0, 0, 1, 3]
+    let msg = Message::NotInterested;
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 1, 3]);
+    assert_eq!(bytes.len(), 5);
+}
+
+#[test]
+fn to_bytes_have_zero() {
+    // Have: length = 5, ID = 4, piece_index = 0
+    // Wire format: [0, 0, 0, 5, 4, 0, 0, 0, 0]
+    let msg = Message::Have(0);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 5, 4, 0, 0, 0, 0]);
+    assert_eq!(bytes.len(), 9);
+}
+
+#[test]
+fn to_bytes_have_small() {
+    // Have with piece index 42 (0x0000002A)
+    let msg = Message::Have(42);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 5, 4, 0, 0, 0, 42]);
+}
+
+#[test]
+fn to_bytes_have_large() {
+    // Have with piece index 0x12345678
+    // Big-endian: 0x12, 0x34, 0x56, 0x78
+    let msg = Message::Have(0x12345678);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 5, 4, 0x12, 0x34, 0x56, 0x78]);
+}
+
+#[test]
+fn to_bytes_have_max() {
+    // Have with maximum piece index (u32::MAX)
+    let msg = Message::Have(u32::MAX);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 5, 4, 0xFF, 0xFF, 0xFF, 0xFF]);
+}
+
+#[test]
+fn to_bytes_bitfield_empty() {
+    // Bitfield with no pieces: length = 1, ID = 5, no data
+    // This is unusual but valid (represents a peer with zero pieces)
+    let msg = Message::Bitfield(vec![]);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 1, 5]);
+    assert_eq!(bytes.len(), 5);
+}
+
+#[test]
+fn to_bytes_bitfield_one_byte() {
+    // Bitfield with 8 pieces: length = 2, ID = 5, one byte
+    let msg = Message::Bitfield(vec![0b11110000]);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 2, 5, 0b11110000]);
+    assert_eq!(bytes.len(), 6);
+}
+
+#[test]
+fn to_bytes_bitfield_multiple_bytes() {
+    // Bitfield with 16 pieces: length = 3, ID = 5, two bytes
+    let msg = Message::Bitfield(vec![0xFF, 0x00]);
+    let bytes = msg.to_bytes();
+    assert_eq!(bytes, vec![0, 0, 0, 3, 5, 0xFF, 0x00]);
+    assert_eq!(bytes.len(), 7);
+}
+
+#[test]
+fn to_bytes_bitfield_large() {
+    // Bitfield for a torrent with 1000 pieces (125 bytes)
+    let bitfield_data = vec![0xAB; 125];
+    let msg = Message::Bitfield(bitfield_data.clone());
+    let bytes = msg.to_bytes();
+
+    // length = 1 + 125 = 126 = 0x0000007E
+    assert_eq!(bytes[0..4], [0, 0, 0, 126]);
+    assert_eq!(bytes[4], 5); // ID
+    assert_eq!(&bytes[5..], &bitfield_data[..]);
+    assert_eq!(bytes.len(), 4 + 1 + 125);
+}
+
+#[test]
+fn to_bytes_request() {
+    // Request: length = 13, ID = 6, index, begin, length
+    // Wire format: [0, 0, 0, 13, 6, index[4], begin[4], length[4]]
+    let msg = Message::Request {
+        index: 1,
+        begin: 0,
+        length: BLOCK_SIZE,
+    };
+    let bytes = msg.to_bytes();
+
+    // length prefix = 13 = 0x0000000D
+    assert_eq!(bytes[0..4], [0, 0, 0, 13]);
+    assert_eq!(bytes[4], 6); // MSG_REQUEST
+
+    // index = 1 = 0x00000001
+    assert_eq!(bytes[5..9], [0, 0, 0, 1]);
+
+    // begin = 0 = 0x00000000
+    assert_eq!(bytes[9..13], [0, 0, 0, 0]);
+
+    // length = 16384 = 0x00004000
+    assert_eq!(bytes[13..17], [0, 0, 0x40, 0]);
+
+    assert_eq!(bytes.len(), 17);
+}
+
+#[test]
+fn to_bytes_request_with_offset() {
+    // Request for second block in piece 42
+    let msg = Message::Request {
+        index: 42,
+        begin: BLOCK_SIZE, // 16384
+        length: BLOCK_SIZE,
+    };
+    let bytes = msg.to_bytes();
+
+    assert_eq!(bytes[0..5], [0, 0, 0, 13, 6]); // length + ID
+
+    // index = 42 = 0x0000002A
+    assert_eq!(bytes[5..9], [0, 0, 0, 42]);
+
+    // begin = 16384 = 0x00004000
+    assert_eq!(bytes[9..13], [0, 0, 0x40, 0]);
+
+    // length = 16384
+    assert_eq!(bytes[13..17], [0, 0, 0x40, 0]);
+}
+
+#[test]
+fn to_bytes_piece_empty() {
+    // Piece with no data: length = 9, ID = 7, index, begin
+    // This is unusual but valid (empty block)
+    let msg = Message::Piece {
+        index: 0,
+        begin: 0,
+        data: vec![],
+    };
+    let bytes = msg.to_bytes();
+
+    // length = 9 = 0x00000009
+    assert_eq!(bytes[0..4], [0, 0, 0, 9]);
+    assert_eq!(bytes[4], 7); // MSG_PIECE
+    assert_eq!(bytes[5..9], [0, 0, 0, 0]); // index
+    assert_eq!(bytes[9..13], [0, 0, 0, 0]); // begin
+    assert_eq!(bytes.len(), 13);
+}
+
+#[test]
+fn to_bytes_piece_small() {
+    // Piece with 10 bytes of data
+    let data = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    let msg = Message::Piece {
+        index: 5,
+        begin: 100,
+        data: data.clone(),
+    };
+    let bytes = msg.to_bytes();
+
+    // length = 9 + 10 = 19 = 0x00000013
+    assert_eq!(bytes[0..4], [0, 0, 0, 19]);
+    assert_eq!(bytes[4], 7); // MSG_PIECE
+
+    // index = 5
+    assert_eq!(bytes[5..9], [0, 0, 0, 5]);
+
+    // begin = 100 = 0x00000064
+    assert_eq!(bytes[9..13], [0, 0, 0, 100]);
+
+    // data
+    assert_eq!(&bytes[13..], &data[..]);
+    assert_eq!(bytes.len(), 23);
+}
+
+#[test]
+fn to_bytes_piece_full_block() {
+    // Piece with a full 16KB block
+    let data = vec![0xAB; BLOCK_SIZE as usize];
+    let msg = Message::Piece {
+        index: 10,
+        begin: 32768, // 2 * BLOCK_SIZE
+        data: data.clone(),
+    };
+    let bytes = msg.to_bytes();
+
+    // length = 9 + 16384 = 16393 = 0x00004009
+    assert_eq!(bytes[0..4], [0, 0, 0x40, 0x09]);
+    assert_eq!(bytes[4], 7); // MSG_PIECE
+
+    // index = 10
+    assert_eq!(bytes[5..9], [0, 0, 0, 10]);
+
+    // begin = 32768 = 0x00008000
+    assert_eq!(bytes[9..13], [0, 0, 0x80, 0]);
+
+    // data
+    assert_eq!(&bytes[13..], &data[..]);
+    assert_eq!(bytes.len(), 4 + 9 + BLOCK_SIZE as usize);
+}
+
+#[test]
+fn to_bytes_cancel() {
+    // Cancel: length = 13, ID = 8, same structure as Request
+    let msg = Message::Cancel {
+        index: 7,
+        begin: BLOCK_SIZE * 3,
+        length: BLOCK_SIZE,
+    };
+    let bytes = msg.to_bytes();
+
+    // length = 13
+    assert_eq!(bytes[0..4], [0, 0, 0, 13]);
+    assert_eq!(bytes[4], 8); // MSG_CANCEL
+
+    // index = 7
+    assert_eq!(bytes[5..9], [0, 0, 0, 7]);
+
+    // begin = 49152 = 0x0000C000
+    assert_eq!(bytes[9..13], [0, 0, 0xC0, 0]);
+
+    // length = 16384 = 0x00004000
+    assert_eq!(bytes[13..17], [0, 0, 0x40, 0]);
+
+    assert_eq!(bytes.len(), 17);
+}
+
+#[test]
+fn message_to_bytes_deterministic() {
+    // Calling to_bytes multiple times should produce identical output
+    let messages = vec![
+        Message::KeepAlive,
+        Message::Choke,
+        Message::Have(12345),
+        Message::Bitfield(vec![0xFF, 0x00, 0xAB]),
+        Message::Request { index: 1, begin: 2, length: 3 },
+        Message::Piece { index: 4, begin: 5, data: vec![6, 7, 8] },
+        Message::Cancel { index: 9, begin: 10, length: 11 },
+    ];
+
+    for msg in messages {
+        let bytes1 = msg.to_bytes();
+        let bytes2 = msg.to_bytes();
+        assert_eq!(bytes1, bytes2, "to_bytes should be deterministic for {:?}", msg);
+    }
+}
+
+#[test]
+fn message_to_bytes_length_prefix_is_correct() {
+    // Verify the length prefix matches the actual payload length
+    // for each message type
+
+    let test_cases: Vec<(Message, u32)> = vec![
+        (Message::KeepAlive, 0),
+        (Message::Choke, 1),
+        (Message::Unchoke, 1),
+        (Message::Interested, 1),
+        (Message::NotInterested, 1),
+        (Message::Have(0), 5),
+        (Message::Bitfield(vec![]), 1),
+        (Message::Bitfield(vec![0; 10]), 11),
+        (Message::Request { index: 0, begin: 0, length: 0 }, 13),
+        (Message::Piece { index: 0, begin: 0, data: vec![] }, 9),
+        (Message::Piece { index: 0, begin: 0, data: vec![0; 100] }, 109),
+        (Message::Cancel { index: 0, begin: 0, length: 0 }, 13),
+    ];
+
+    for (msg, expected_length) in test_cases {
+        let bytes = msg.to_bytes();
+
+        // Extract length from first 4 bytes (big-endian)
+        let actual_length = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(
+            actual_length, expected_length,
+            "Wrong length prefix for {:?}: expected {}, got {}",
+            msg, expected_length, actual_length
+        );
+
+        // Verify total message length = 4 + payload length
+        assert_eq!(
+            bytes.len(),
+            4 + expected_length as usize,
+            "Wrong total length for {:?}",
+            msg
+        );
+    }
+}
+@
+
+These serialization tests verify:
+\begin{itemize}
+\item Each message type produces the exact wire format per BEP 3
+\item Keep-alive serializes to [[0,0,0,0]] (length=0, no ID)
+\item Fixed-length messages have correct constant lengths
+\item Variable-length messages compute length correctly
+\item Big-endian encoding is correct for all integer fields
+\item Serialization is deterministic (same input produces same output)
+\item Length prefix matches actual payload size
+\end{itemize}
+
 \subsection{Next Steps}
 
-With the Message enum complete, the messages module is ready for:
+With message serialization complete, the messages module is ready for:
 \begin{enumerate}
-\item Message serialization ([[to_bytes]]) for sending messages
 \item Message parsing ([[from_bytes]]) for receiving messages
 \item Async I/O wrappers for framed message exchange
 \end{enumerate}
