@@ -1,0 +1,715 @@
+% Client Module
+% Chapter 7 of the literate BitTorrent client
+
+\section{The Client: Central Orchestration}
+
+The [[Client]] struct is the central orchestration point for a BitTorrent download.
+It owns all the state needed to manage a torrent: the parsed metadata, piece
+tracking, peer connections, and download coordination. While previous chapters
+defined individual components in isolation, this chapter brings them together
+into a cohesive whole.
+
+\subsection{Design Philosophy}
+
+A BitTorrent client has several responsibilities:
+
+\begin{enumerate}
+\item \textbf{State ownership}: Hold the torrent metadata, piece manager, and
+  connection state in a single place where their lifetimes are coordinated.
+
+\item \textbf{Identity}: Maintain a unique peer ID that identifies us to other
+  peers in the swarm.
+
+\item \textbf{Configuration}: Store user preferences like output directory and
+  listen port.
+
+\item \textbf{Coordination}: Provide the foundation for the event loop that will
+  drive peer communication and piece assembly.
+\end{enumerate}
+
+The [[Client]] struct is designed to be the owner of mutable state, passed by
+reference to the various subsystems that need to read or modify it. This
+centralized ownership simplifies reasoning about lifetimes and mutation.
+
+\subsection{Peer Identification}
+
+Every BitTorrent peer needs a unique 20-byte identifier called a \emph{peer ID}.
+The peer ID is sent during the handshake with other peers and reported to
+trackers. While the exact format is not mandated by the protocol, convention
+is to start with a client identifier followed by random bytes.
+
+We use the Azureus-style convention: [[-LB0001-]] followed by 12 random bytes.
+Here [[LB]] stands for ``Literate BitTorrent'' and [[0001]] is our version
+number. The hyphen prefix and suffix are traditional.
+
+<<peer id generation>>=
+use rand::Rng;
+
+/// Generates a unique 20-byte peer ID in Azureus style.
+///
+/// Format: `-LB0001-` followed by 12 random alphanumeric bytes.
+///
+/// - `LB` = Literate BitTorrent (our client identifier)
+/// - `0001` = version 0.0.0.1
+/// - `-` prefix and suffix follow the Azureus convention
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::generate_peer_id;
+///
+/// let peer_id = generate_peer_id();
+/// assert_eq!(peer_id.len(), 20);
+/// assert!(peer_id.starts_with(b"-LB0001-"));
+/// ```
+pub fn generate_peer_id() -> [u8; 20] {
+    let mut peer_id = [0u8; 20];
+
+    // Client identifier prefix: -LB0001-
+    peer_id[..8].copy_from_slice(b"-LB0001-");
+
+    // Fill remaining 12 bytes with random alphanumeric characters
+    let mut rng = rand::thread_rng();
+    const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    for byte in &mut peer_id[8..] {
+        *byte = CHARSET[rng.gen_range(0..CHARSET.len())];
+    }
+
+    peer_id
+}
+@
+
+Using alphanumeric characters in the random portion ensures the peer ID is
+printable, which aids debugging when examining protocol traces.
+
+\subsection{Client State}
+
+The [[Client]] struct holds all state for a single torrent download. In the
+future, a multi-torrent client could maintain multiple [[Client]] instances,
+one per torrent.
+
+<<client struct>>=
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::net::SocketAddr;
+
+use crate::metainfo::Metainfo;
+use crate::pieces::PieceManager;
+
+/// Central orchestration point for a BitTorrent download.
+///
+/// The `Client` owns all state needed to manage a torrent download:
+/// - Torrent metadata from the .torrent file
+/// - Piece tracking for download progress and verification
+/// - Our peer identity for protocol handshakes
+/// - Configuration like output directory and listen port
+///
+/// # Design Notes
+///
+/// The `Client` is designed as a single owner of mutable state. Subsystems
+/// like peer connections receive references to the client rather than owning
+/// their own copies of state. This simplifies lifetime management and makes
+/// state changes explicit.
+///
+/// # Async Runtime
+///
+/// BitTorrent clients are inherently concurrent: we communicate with many
+/// peers simultaneously, each in their own connection. The `runtime_handle`
+/// field stores a handle to the Tokio runtime, allowing the client to spawn
+/// tasks for peer connections.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::path::PathBuf;
+/// use literate_bittorrent::client::Client;
+/// use literate_bittorrent::metainfo;
+///
+/// // Parse the torrent file
+/// let torrent_data = std::fs::read("example.torrent").unwrap();
+/// let metainfo = metainfo::parse(&torrent_data).unwrap();
+///
+/// // Create client with default configuration
+/// let client = Client::new(
+///     metainfo,
+///     PathBuf::from("./downloads"),
+///     6881,
+/// ).unwrap();
+///
+/// println!("Downloading: {}", client.name());
+/// println!("Info hash: {:?}", client.info_hash());
+/// ```
+#[derive(Debug)]
+pub struct Client {
+    /// Parsed torrent metadata.
+    ///
+    /// Contains tracker URL, file information, piece hashes, and other
+    /// data from the .torrent file.
+    metainfo: Metainfo,
+
+    /// The 20-byte SHA1 hash identifying this torrent.
+    ///
+    /// This is cached from `metainfo.info_hash` for convenience, as it's
+    /// needed frequently for handshakes and tracker announces.
+    info_hash: [u8; 20],
+
+    /// Our unique 20-byte peer identifier.
+    ///
+    /// Generated once at client creation and used for all peer handshakes
+    /// and tracker announces.
+    peer_id: [u8; 20],
+
+    /// Tracks download state for each piece.
+    ///
+    /// The piece manager owns the bitfield of which pieces we have,
+    /// tracks in-progress downloads, and verifies completed pieces.
+    piece_manager: PieceManager,
+
+    /// Directory where downloaded files will be saved.
+    output_dir: PathBuf,
+
+    /// TCP port for incoming peer connections.
+    ///
+    /// This port is announced to the tracker so other peers can connect
+    /// to us. Standard BitTorrent ports are 6881-6889.
+    port: u16,
+
+    /// Currently connected peers, keyed by their socket address.
+    ///
+    /// This map tracks all active peer connections. The value will be
+    /// expanded to hold peer-specific state (choking, interested, bitfield)
+    /// in future chapters.
+    active_peers: HashMap<SocketAddr, PeerState>,
+
+    /// Handle to the Tokio async runtime.
+    ///
+    /// Used to spawn tasks for peer connections. Stored here so all
+    /// async operations use the same runtime.
+    runtime_handle: tokio::runtime::Handle,
+}
+
+/// Placeholder for per-peer connection state.
+///
+/// This will be expanded in the peer connection chapter to track:
+/// - Choking/interested state (both directions)
+/// - Peer's bitfield of available pieces
+/// - Pending requests
+/// - Download/upload statistics
+#[derive(Debug, Clone, Default)]
+pub struct PeerState {
+    // Placeholder - will be expanded when implementing peer connections
+}
+@
+
+The [[active\_peers]] map uses [[SocketAddr]] as the key because a peer is
+uniquely identified by their IP address and port. The [[PeerState]] struct is
+a placeholder that will be expanded when we implement peer connections.
+
+\subsection{Client Construction}
+
+Creating a [[Client]] requires a parsed [[Metainfo]] and configuration options.
+The constructor initializes the piece manager from the torrent metadata and
+generates a fresh peer ID.
+
+<<client impl>>=
+/// Errors that can occur when constructing a Client.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// Failed to initialize the piece manager.
+    #[error("piece manager initialization failed: {0}")]
+    PieceManagerError(#[from] crate::pieces::PieceError),
+}
+
+impl Client {
+    /// Creates a new Client for downloading a torrent.
+    ///
+    /// # Arguments
+    ///
+    /// * `metainfo` - Parsed torrent metadata
+    /// * `output_dir` - Directory where files will be saved
+    /// * `port` - TCP port for incoming peer connections
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Client)` on success
+    /// * `Err(ClientError)` if piece manager initialization fails
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use std::path::PathBuf;
+    /// use literate_bittorrent::client::Client;
+    /// use literate_bittorrent::metainfo;
+    ///
+    /// let data = std::fs::read("test.torrent").unwrap();
+    /// let metainfo = metainfo::parse(&data).unwrap();
+    /// let client = Client::new(metainfo, PathBuf::from("."), 6881).unwrap();
+    /// ```
+    pub fn new(
+        metainfo: Metainfo,
+        output_dir: PathBuf,
+        port: u16,
+    ) -> Result<Self, ClientError> {
+        // Initialize piece manager from torrent metadata
+        let piece_manager = PieceManager::new(
+            metainfo.piece_length,
+            metainfo.total_length,
+            metainfo.piece_hashes.clone(),
+        )?;
+
+        // Cache the info hash for frequent access
+        let info_hash = metainfo.info_hash;
+
+        // Generate our peer ID
+        let peer_id = generate_peer_id();
+
+        // Get a handle to the current Tokio runtime
+        // This will panic if called outside a Tokio context, which is
+        // acceptable since the client is designed for async operation
+        let runtime_handle = tokio::runtime::Handle::current();
+
+        Ok(Client {
+            metainfo,
+            info_hash,
+            peer_id,
+            piece_manager,
+            output_dir,
+            port,
+            active_peers: HashMap::new(),
+            runtime_handle,
+        })
+    }
+
+    /// Creates a new Client for testing without requiring a Tokio runtime.
+    ///
+    /// This constructor is identical to `new()` except it creates its own
+    /// single-threaded runtime. Use this only for unit tests that don't
+    /// need the runtime for async operations.
+    #[cfg(test)]
+    pub fn new_for_test(
+        metainfo: Metainfo,
+        output_dir: PathBuf,
+        port: u16,
+    ) -> Result<Self, ClientError> {
+        let piece_manager = PieceManager::new(
+            metainfo.piece_length,
+            metainfo.total_length,
+            metainfo.piece_hashes.clone(),
+        )?;
+
+        let info_hash = metainfo.info_hash;
+        let peer_id = generate_peer_id();
+
+        // Create a minimal runtime for testing
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create test runtime");
+        let runtime_handle = runtime.handle().clone();
+
+        // Leak the runtime to keep the handle valid
+        // This is acceptable in tests where we don't care about cleanup
+        std::mem::forget(runtime);
+
+        Ok(Client {
+            metainfo,
+            info_hash,
+            peer_id,
+            piece_manager,
+            output_dir,
+            port,
+            active_peers: HashMap::new(),
+            runtime_handle,
+        })
+    }
+
+    // ========================================================================
+    // Accessor methods
+    // ========================================================================
+
+    /// Returns the torrent name.
+    ///
+    /// For single-file torrents, this is the filename.
+    /// For multi-file torrents, this is the root directory name.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.metainfo.name
+    }
+
+    /// Returns the 20-byte info hash identifying this torrent.
+    #[inline]
+    pub fn info_hash(&self) -> &[u8; 20] {
+        &self.info_hash
+    }
+
+    /// Returns our 20-byte peer ID.
+    #[inline]
+    pub fn peer_id(&self) -> &[u8; 20] {
+        &self.peer_id
+    }
+
+    /// Returns a reference to the piece manager.
+    #[inline]
+    pub fn piece_manager(&self) -> &PieceManager {
+        &self.piece_manager
+    }
+
+    /// Returns a mutable reference to the piece manager.
+    #[inline]
+    pub fn piece_manager_mut(&mut self) -> &mut PieceManager {
+        &mut self.piece_manager
+    }
+
+    /// Returns the output directory path.
+    #[inline]
+    pub fn output_dir(&self) -> &PathBuf {
+        &self.output_dir
+    }
+
+    /// Returns the listen port.
+    #[inline]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Returns the tracker announce URL.
+    #[inline]
+    pub fn announce_url(&self) -> &str {
+        &self.metainfo.announce
+    }
+
+    /// Returns a reference to the full metainfo.
+    #[inline]
+    pub fn metainfo(&self) -> &Metainfo {
+        &self.metainfo
+    }
+
+    /// Returns the number of pieces in this torrent.
+    #[inline]
+    pub fn num_pieces(&self) -> u32 {
+        self.piece_manager.num_pieces()
+    }
+
+    /// Returns the total content size in bytes.
+    #[inline]
+    pub fn total_length(&self) -> u64 {
+        self.metainfo.total_length
+    }
+
+    /// Returns the number of currently connected peers.
+    #[inline]
+    pub fn num_peers(&self) -> usize {
+        self.active_peers.len()
+    }
+
+    /// Returns a handle to the Tokio runtime.
+    #[inline]
+    pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.runtime_handle
+    }
+}
+@
+
+The accessor methods provide read-only access to internal state, following Rust's
+ownership principles. The [[piece\_manager\_mut]] method allows subsystems to
+update piece state during downloads.
+
+\subsection{Module Structure}
+
+The client module exports the [[Client]] struct and associated types.
+
+<<client.rs>>=
+// GENERATED CODE - DO NOT EDIT
+// Source: nw/07-client.nw
+// Regenerate with: just tangle
+
+//! Client orchestration for BitTorrent downloads.
+//!
+//! The [`Client`] struct is the central point for managing a torrent download.
+//! It owns all state: metadata, piece tracking, peer connections, and
+//! configuration. This module also provides peer ID generation.
+//!
+//! # Example
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//! use literate_bittorrent::client::Client;
+//! use literate_bittorrent::metainfo;
+//!
+//! let data = std::fs::read("example.torrent").unwrap();
+//! let metainfo = metainfo::parse(&data).unwrap();
+//!
+//! let client = Client::new(
+//!     metainfo,
+//!     PathBuf::from("./downloads"),
+//!     6881,
+//! ).unwrap();
+//!
+//! println!("Torrent: {}", client.name());
+//! println!("Pieces: {}", client.num_pieces());
+//! ```
+
+<<peer id generation>>
+
+<<client struct>>
+
+<<client impl>>
+
+<<client tests>>
+@
+
+\subsection{Testing}
+
+We test the client construction and accessor methods to verify the integration
+of components.
+
+<<client tests>>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use crate::bencode::{BencodeValue, encode};
+
+    /// Helper to create a minimal valid single-file torrent.
+    fn make_test_metainfo(
+        name: &str,
+        total_length: u64,
+        piece_length: u32,
+        num_pieces: usize,
+    ) -> Metainfo {
+        // Create piece hashes (all zeros for testing)
+        let piece_hashes: Vec<[u8; 20]> = vec![[0u8; 20]; num_pieces];
+
+        // Compute a fake info hash
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(total_length as i64));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(name.as_bytes().to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(piece_length as i64));
+        info.insert(
+            b"pieces".to_vec(),
+            BencodeValue::Bytes(vec![0u8; num_pieces * 20]),
+        );
+        let info_value = BencodeValue::Dict(info);
+
+        use sha1::{Sha1, Digest};
+        let encoded = encode(&info_value);
+        let mut hasher = Sha1::new();
+        hasher.update(&encoded);
+        let hash_result = hasher.finalize();
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&hash_result);
+
+        Metainfo {
+            announce: "http://tracker.example.com/announce".to_string(),
+            info_hash,
+            piece_length,
+            piece_hashes,
+            total_length,
+            files: vec![crate::metainfo::FileInfo {
+                length: total_length,
+                path: PathBuf::from(name),
+            }],
+            name: name.to_string(),
+        }
+    }
+
+    // ========================================================================
+    // Peer ID Generation Tests
+    // ========================================================================
+
+    #[test]
+    fn peer_id_has_correct_length() {
+        // AC #1: Client struct defined with peer_id field
+        let peer_id = generate_peer_id();
+        assert_eq!(peer_id.len(), 20, "Peer ID must be exactly 20 bytes");
+    }
+
+    #[test]
+    fn peer_id_has_correct_prefix() {
+        let peer_id = generate_peer_id();
+        assert!(
+            peer_id.starts_with(b"-LB0001-"),
+            "Peer ID should start with -LB0001-, got: {:?}",
+            String::from_utf8_lossy(&peer_id)
+        );
+    }
+
+    #[test]
+    fn peer_id_suffix_is_alphanumeric() {
+        let peer_id = generate_peer_id();
+        let suffix = &peer_id[8..];
+        for &byte in suffix {
+            assert!(
+                byte.is_ascii_alphanumeric(),
+                "Peer ID suffix should be alphanumeric, got byte: {}",
+                byte
+            );
+        }
+    }
+
+    #[test]
+    fn peer_id_is_unique() {
+        // Generate multiple peer IDs and verify they're different
+        let id1 = generate_peer_id();
+        let id2 = generate_peer_id();
+        let id3 = generate_peer_id();
+
+        assert_ne!(id1, id2, "Peer IDs should be unique");
+        assert_ne!(id2, id3, "Peer IDs should be unique");
+        assert_ne!(id1, id3, "Peer IDs should be unique");
+    }
+
+    // ========================================================================
+    // Client Construction Tests
+    // ========================================================================
+
+    #[test]
+    fn client_new_from_valid_metainfo() {
+        // AC #2: Client implements new() constructor that initializes all state
+        // AC #4: Unit test verifies Client can be constructed from valid Metainfo
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let output_dir = PathBuf::from("/tmp/downloads");
+
+        let client = Client::new_for_test(metainfo.clone(), output_dir.clone(), 6881);
+        assert!(client.is_ok(), "Client::new should succeed with valid metainfo");
+
+        let client = client.unwrap();
+        assert_eq!(client.name(), "test.txt");
+        assert_eq!(client.port(), 6881);
+        assert_eq!(client.output_dir(), &output_dir);
+        assert_eq!(client.num_pieces(), 4);
+        assert_eq!(client.total_length(), 1024);
+    }
+
+    #[test]
+    fn client_stores_info_hash() {
+        // AC #1: Client struct defined with info_hash field
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let expected_hash = metainfo.info_hash;
+
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+        assert_eq!(client.info_hash(), &expected_hash);
+    }
+
+    #[test]
+    fn client_stores_peer_id() {
+        // AC #1: Client struct defined with peer_id field
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        let peer_id = client.peer_id();
+        assert_eq!(peer_id.len(), 20);
+        assert!(peer_id.starts_with(b"-LB0001-"));
+    }
+
+    #[test]
+    fn client_initializes_piece_manager() {
+        // AC #1: Client struct defined with piece_manager field
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        let pm = client.piece_manager();
+        assert_eq!(pm.num_pieces(), 4);
+        assert_eq!(pm.piece_length(), 256);
+        assert_eq!(pm.total_length(), 1024);
+    }
+
+    #[test]
+    fn client_provides_mutable_piece_manager() {
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let mut client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        // Should be able to get mutable reference
+        let _pm_mut = client.piece_manager_mut();
+        // Just verify we can get the mutable reference without compile errors
+    }
+
+    #[test]
+    fn client_announce_url() {
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        assert_eq!(client.announce_url(), "http://tracker.example.com/announce");
+    }
+
+    #[test]
+    fn client_num_peers_starts_at_zero() {
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        assert_eq!(client.num_peers(), 0, "Should start with no connected peers");
+    }
+
+    #[test]
+    fn client_stores_runtime_handle() {
+        // AC #3: Client owns tokio runtime handles for spawned peer connections
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo, PathBuf::from("."), 6881).unwrap();
+
+        // Verify we can access the runtime handle
+        let _handle = client.runtime_handle();
+        // The handle should be valid (existence is the test)
+    }
+
+    #[test]
+    fn client_provides_metainfo_reference() {
+        let metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        let client = Client::new_for_test(metainfo.clone(), PathBuf::from("."), 6881).unwrap();
+
+        assert_eq!(client.metainfo().announce, metainfo.announce);
+        assert_eq!(client.metainfo().name, metainfo.name);
+    }
+
+    // ========================================================================
+    // Error Handling Tests
+    // ========================================================================
+
+    #[test]
+    fn client_rejects_mismatched_piece_count() {
+        // Create metainfo with wrong number of piece hashes
+        let mut metainfo = make_test_metainfo("test.txt", 1024, 256, 4);
+        // Remove one piece hash to create a mismatch
+        metainfo.piece_hashes.pop();
+
+        let result = Client::new_for_test(metainfo, PathBuf::from("."), 6881);
+        assert!(result.is_err(), "Should reject mismatched piece count");
+    }
+
+    // ========================================================================
+    // Integration Test with ubuntu.torrent
+    // ========================================================================
+
+    #[test]
+    fn client_from_ubuntu_torrent() {
+        let torrent_path = "tests/fixtures/ubuntu.torrent";
+        if !std::path::Path::new(torrent_path).exists() {
+            // Skip test if fixture doesn't exist
+            return;
+        }
+
+        let torrent_data = std::fs::read(torrent_path).unwrap();
+        let metainfo = crate::metainfo::parse(&torrent_data).unwrap();
+
+        let client = Client::new_for_test(
+            metainfo,
+            PathBuf::from("/tmp/downloads"),
+            6881,
+        ).unwrap();
+
+        assert_eq!(client.name(), "ubuntu-24.04.3-live-server-amd64.iso");
+        assert_eq!(client.num_pieces(), 12602);
+        assert_eq!(client.total_length(), 3303444480);
+        assert!(client.peer_id().starts_with(b"-LB0001-"));
+    }
+}
+@
+
+The tests verify each aspect of client construction:
+\begin{itemize}
+\item Peer ID generation produces valid 20-byte identifiers
+\item The constructor initializes all fields correctly
+\item Accessor methods return the expected values
+\item Error handling rejects invalid inputs
+\item Integration with real torrent files works correctly
+\end{itemize}
