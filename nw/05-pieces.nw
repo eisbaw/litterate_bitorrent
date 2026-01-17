@@ -2497,6 +2497,379 @@ fn tiebreaker_handles_large_availability_counts() {
 }
 @
 
+\subsection{Block Selection Within a Piece}
+
+Once we have selected a piece to download, we must determine which blocks within
+that piece to request. A piece is divided into blocks of [[BLOCK_SIZE]] bytes
+(16384 bytes by default), with the last block potentially being smaller if the
+piece size is not evenly divisible.
+
+Block selection within a piece is simpler than piece selection: we iterate
+sequentially through blocks at offsets 0, [[BLOCK_SIZE]], [[2*BLOCK_SIZE]], and
+so on. The challenge is avoiding duplicate requests:
+
+\begin{description}
+\item[Already received] Blocks that have been received and stored should not be
+  re-requested. The [[PieceState::InProgress]] variant tracks received blocks
+  via a bit vector.
+\item[In-flight requests] Blocks for which we have sent a request but not yet
+  received a response should not be re-requested to the same peer. However, we
+  may want to duplicate requests to different peers for endgame mode---but that
+  is a separate concern handled by the download manager.
+\end{description}
+
+The [[select_next_blocks]] function takes the piece manager, piece index, a set
+of in-flight block offsets, and a maximum count. It returns a list of (offset,
+length) pairs representing blocks that should be requested.
+
+<<block selection>>=
+use std::collections::HashSet;
+
+/// A block descriptor: (offset within piece, length in bytes).
+///
+/// The offset is a byte offset from the start of the piece, always a multiple
+/// of `BLOCK_SIZE` (except the offset 0 which is trivially a multiple). The
+/// length is either `BLOCK_SIZE` or smaller for the final block.
+pub type BlockDescriptor = (u32, u32);
+
+/// Selects blocks within a piece that need to be requested.
+///
+/// This function examines the state of a piece and returns a list of blocks
+/// that have not yet been received and are not currently in-flight. The caller
+/// can then send request messages for these blocks.
+///
+/// # Arguments
+///
+/// * `manager` - The piece manager tracking piece state
+/// * `piece_index` - The zero-based index of the piece to examine
+/// * `in_flight_offsets` - Set of block offsets that are currently being
+///   requested (awaiting response). These will be skipped to avoid duplicates.
+/// * `max_blocks` - Maximum number of blocks to return. This limits pipeline
+///   depth per piece. Pass `usize::MAX` to get all unrequested blocks.
+///
+/// # Returns
+///
+/// A vector of (offset, length) pairs for blocks that need to be requested.
+/// Returns an empty vector if:
+/// - All blocks have been received
+/// - All unreceived blocks are in-flight
+/// - The piece index is invalid
+/// - The piece is not in `InProgress` state
+///
+/// # Block Ordering
+///
+/// Blocks are returned in sequential order by offset (0, BLOCK_SIZE,
+/// 2*BLOCK_SIZE, etc.). This predictable ordering simplifies testing and
+/// debugging, though the caller is free to request them in any order.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::{PieceManager, select_next_blocks, BLOCK_SIZE};
+/// use std::collections::HashSet;
+///
+/// // Create a manager for a single 64KB piece (4 blocks of 16KB)
+/// let hashes = vec![[0u8; 20]; 1];
+/// let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+///
+/// // Start downloading the piece
+/// manager.start_piece(0).unwrap();
+///
+/// // Get all unrequested blocks
+/// let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+///
+/// // Should return 4 blocks
+/// assert_eq!(blocks.len(), 4);
+/// assert_eq!(blocks[0], (0, BLOCK_SIZE));           // Block 0
+/// assert_eq!(blocks[1], (BLOCK_SIZE, BLOCK_SIZE)); // Block 1
+/// ```
+///
+/// # Performance
+///
+/// Time complexity: O(num_blocks) where num_blocks is the number of blocks
+/// in the piece. For typical piece sizes (256 KiB = 16 blocks), this is
+/// negligible.
+pub fn select_next_blocks(
+    manager: &PieceManager,
+    piece_index: u32,
+    in_flight_offsets: &HashSet<u32>,
+    max_blocks: usize,
+) -> Vec<BlockDescriptor> {
+    // Get piece state - return empty if piece is not in progress
+    let state = match manager.get_state(piece_index) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    // Only process pieces that are being downloaded
+    let blocks_received = match state {
+        PieceState::InProgress { blocks_received } => blocks_received,
+        _ => return Vec::new(),
+    };
+
+    // Get piece geometry
+    let piece_size = match manager.get_piece_size(piece_index) {
+        Ok(size) => size,
+        Err(_) => return Vec::new(),
+    };
+    let num_blocks = blocks_per_piece(piece_size);
+
+    // Collect blocks that need requesting
+    let mut result = Vec::new();
+
+    for block_idx in 0..num_blocks {
+        // Stop if we've collected enough blocks
+        if result.len() >= max_blocks {
+            break;
+        }
+
+        // Skip blocks that have been received
+        if block_idx < blocks_received.len() as u32 && blocks_received[block_idx as usize] {
+            continue;
+        }
+
+        // Calculate offset for this block
+        let offset = block_offset(block_idx);
+
+        // Skip blocks that are in-flight
+        if in_flight_offsets.contains(&offset) {
+            continue;
+        }
+
+        // Calculate the length of this block
+        let length = if block_idx == num_blocks - 1 {
+            // Last block may be smaller
+            piece_size - offset
+        } else {
+            BLOCK_SIZE
+        };
+
+        result.push((offset, length));
+    }
+
+    result
+}
+@
+
+\subsubsection{Block Selection Tests}
+
+We test block selection with the specific cases from the acceptance criteria,
+plus edge cases for completeness.
+
+<<block selection tests>>=
+#[test]
+fn select_next_blocks_64kb_piece_produces_4_blocks() {
+    // AC #6: 64KB piece produces 4 blocks of 16KB each
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert_eq!(blocks.len(), 4, "64KB piece should have 4 blocks");
+    assert_eq!(blocks[0], (0, BLOCK_SIZE));
+    assert_eq!(blocks[1], (BLOCK_SIZE, BLOCK_SIZE));
+    assert_eq!(blocks[2], (2 * BLOCK_SIZE, BLOCK_SIZE));
+    assert_eq!(blocks[3], (3 * BLOCK_SIZE, BLOCK_SIZE));
+}
+
+#[test]
+fn select_next_blocks_50kb_piece_produces_3_full_and_1_partial() {
+    // AC #7: 50KB piece produces 3 blocks of 16KB and 1 block of 2KB
+    // 51200 bytes = 50 * 1024 = 50KB
+    // 51200 / 16384 = 3.125, so 4 blocks total
+    // Block 0: 16384, Block 1: 16384, Block 2: 16384, Block 3: 51200 - 3*16384 = 2048
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(51200, 51200, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert_eq!(blocks.len(), 4, "50KB piece should have 4 blocks");
+    assert_eq!(blocks[0], (0, BLOCK_SIZE));
+    assert_eq!(blocks[1], (BLOCK_SIZE, BLOCK_SIZE));
+    assert_eq!(blocks[2], (2 * BLOCK_SIZE, BLOCK_SIZE));
+    // Last block: 51200 - 3*16384 = 51200 - 49152 = 2048
+    assert_eq!(blocks[3], (3 * BLOCK_SIZE, 2048), "Last block should be 2KB");
+}
+
+#[test]
+fn select_next_blocks_skips_received_blocks() {
+    // AC #8: skips already-received blocks correctly
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // Mark blocks 0 and 2 as received
+    manager.mark_block_received(0, 0).unwrap();
+    manager.mark_block_received(0, 2).unwrap();
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    // Should only return blocks 1 and 3
+    assert_eq!(blocks.len(), 2, "Should skip 2 received blocks");
+    assert_eq!(blocks[0], (BLOCK_SIZE, BLOCK_SIZE), "Block 1");
+    assert_eq!(blocks[1], (3 * BLOCK_SIZE, BLOCK_SIZE), "Block 3");
+}
+
+#[test]
+fn select_next_blocks_skips_in_flight_blocks() {
+    // AC #5: skips blocks already in-flight
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // Block 1 is in-flight
+    let mut in_flight = HashSet::new();
+    in_flight.insert(BLOCK_SIZE); // offset of block 1
+
+    let blocks = select_next_blocks(&manager, 0, &in_flight, 10);
+
+    // Should return blocks 0, 2, 3 (skipping block 1)
+    assert_eq!(blocks.len(), 3, "Should skip 1 in-flight block");
+    assert_eq!(blocks[0], (0, BLOCK_SIZE), "Block 0");
+    assert_eq!(blocks[1], (2 * BLOCK_SIZE, BLOCK_SIZE), "Block 2");
+    assert_eq!(blocks[2], (3 * BLOCK_SIZE, BLOCK_SIZE), "Block 3");
+}
+
+#[test]
+fn select_next_blocks_respects_max_blocks() {
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // Request only 2 blocks
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 2);
+
+    assert_eq!(blocks.len(), 2, "Should respect max_blocks limit");
+    assert_eq!(blocks[0], (0, BLOCK_SIZE));
+    assert_eq!(blocks[1], (BLOCK_SIZE, BLOCK_SIZE));
+}
+
+#[test]
+fn select_next_blocks_returns_empty_for_missing_piece() {
+    let hashes = vec![[0u8; 20]; 1];
+    let manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    // Piece is still in Missing state (not started)
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert!(blocks.is_empty(), "Missing piece should return no blocks");
+}
+
+#[test]
+fn select_next_blocks_returns_empty_for_verified_piece() {
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.mark_verified(0).unwrap();
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert!(blocks.is_empty(), "Verified piece should return no blocks");
+}
+
+#[test]
+fn select_next_blocks_returns_empty_for_invalid_piece_index() {
+    let hashes = vec![[0u8; 20]; 1];
+    let manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    let blocks = select_next_blocks(&manager, 999, &HashSet::new(), 10);
+
+    assert!(blocks.is_empty(), "Invalid piece index should return no blocks");
+}
+
+#[test]
+fn select_next_blocks_returns_empty_when_all_received() {
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // Mark all 4 blocks as received
+    for i in 0..4 {
+        manager.mark_block_received(0, i).unwrap();
+    }
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert!(blocks.is_empty(), "All received should return no blocks");
+}
+
+#[test]
+fn select_next_blocks_returns_empty_when_all_in_flight() {
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // All blocks are in-flight
+    let in_flight: HashSet<u32> = (0..4).map(|i| i * BLOCK_SIZE).collect();
+
+    let blocks = select_next_blocks(&manager, 0, &in_flight, 10);
+
+    assert!(blocks.is_empty(), "All in-flight should return no blocks");
+}
+
+#[test]
+fn select_next_blocks_combines_received_and_in_flight() {
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(65536, 65536, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    // Block 0 received, block 2 in-flight
+    manager.mark_block_received(0, 0).unwrap();
+    let mut in_flight = HashSet::new();
+    in_flight.insert(2 * BLOCK_SIZE);
+
+    let blocks = select_next_blocks(&manager, 0, &in_flight, 10);
+
+    // Should return blocks 1 and 3
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], (BLOCK_SIZE, BLOCK_SIZE), "Block 1");
+    assert_eq!(blocks[1], (3 * BLOCK_SIZE, BLOCK_SIZE), "Block 3");
+}
+
+#[test]
+fn select_next_blocks_single_block_piece() {
+    // Piece smaller than BLOCK_SIZE
+    let hashes = vec![[0u8; 20]; 1];
+    let mut manager = PieceManager::new(5000, 5000, hashes).unwrap();
+
+    manager.start_piece(0).unwrap();
+
+    let blocks = select_next_blocks(&manager, 0, &HashSet::new(), 10);
+
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0], (0, 5000), "Single block should have piece size as length");
+}
+
+#[test]
+fn select_next_blocks_last_piece_smaller() {
+    // Torrent with last piece smaller than standard
+    // 3 pieces: 65536, 65536, 30000
+    let total_length = 65536 + 65536 + 30000;
+    let hashes = vec![[0u8; 20]; 3];
+    let mut manager = PieceManager::new(65536, total_length, hashes).unwrap();
+
+    manager.start_piece(2).unwrap();
+
+    let blocks = select_next_blocks(&manager, 2, &HashSet::new(), 10);
+
+    // 30000 / 16384 = 1.83, so 2 blocks
+    // Block 0: 16384, Block 1: 30000 - 16384 = 13616
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], (0, BLOCK_SIZE));
+    assert_eq!(blocks[1], (BLOCK_SIZE, 13616));
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -2553,6 +2926,8 @@ The pieces module combines the error types and helpers.
 
 <<random tiebreaker>>
 
+<<block selection>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2581,6 +2956,8 @@ mod tests {
     <<rarest first selection tests>>
 
     <<random tiebreaker tests>>
+
+    <<block selection tests>>
 }
 @
 
