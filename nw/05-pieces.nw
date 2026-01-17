@@ -2240,6 +2240,263 @@ fn select_rarest_single_piece() {
 }
 @
 
+\subsection{Random Tiebreaker for Equally-Rare Pieces}
+
+The rarest-first algorithm returns pieces sorted by availability count, but what
+happens when multiple pieces have the same availability? The current implementation
+uses piece index as a tiebreaker---lower indices come first. This deterministic
+behavior is valuable for testing but problematic in production.
+
+Consider a swarm where three pieces (indices 5, 12, and 27) all have availability
+count 1. With deterministic tiebreaking, every leecher in the swarm will request
+piece 5 first. This creates a ``herding'' effect:
+
+\begin{itemize}
+\item All leechers compete for the same piece from the same rare source
+\item The peer holding piece 5 becomes overloaded with requests
+\item Pieces 12 and 27 remain unreplicated even though they're equally rare
+\item The swarm's overall replication is slower than it could be
+\end{itemize}
+
+The solution is to randomly select among pieces with equal availability. If we
+need a piece and three candidates have the minimum availability count, we pick
+one uniformly at random. This distributes load across rare piece holders and
+accelerates replication of all rare pieces.
+
+The [[select_piece_with_tiebreaker]] function takes an RNG as a parameter. This
+dependency injection pattern enables:
+\begin{itemize}
+\item \textbf{Testability}: Tests can inject a seeded RNG for deterministic assertions
+\item \textbf{Reproducibility}: Debug logging can record the seed to reproduce issues
+\item \textbf{Flexibility}: Different RNG implementations (thread-local, crypto-secure)
+\end{itemize}
+
+<<random tiebreaker>>=
+use rand::Rng;
+use rand::seq::SliceRandom;
+
+/// Selects a single piece from candidates with equal minimum availability.
+///
+/// This function implements random tiebreaking for rarest-first piece selection.
+/// When multiple pieces have the same (lowest) availability count, we randomly
+/// select among them rather than using a deterministic ordering like piece index.
+///
+/// # Why Random Selection Matters
+///
+/// Without randomization, all peers would request the same rare piece, creating
+/// a bottleneck. By randomly selecting among equally-rare pieces, we distribute
+/// load across rare piece holders and accelerate replication of all rare pieces.
+///
+/// # Arguments
+///
+/// * `candidates` - Piece indices with their availability counts, as returned by
+///   collecting pieces we need that a peer has
+/// * `rng` - Random number generator for selection. Accepts any type implementing
+///   [`rand::Rng`], enabling both seeded (for testing) and non-seeded (production)
+///   usage.
+///
+/// # Returns
+///
+/// * `Some(piece_index)` - A randomly selected piece index from those with minimum
+///   availability
+/// * `None` - If the candidates slice is empty
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::pieces::select_piece_with_tiebreaker;
+/// use rand::SeedableRng;
+/// use rand::rngs::StdRng;
+///
+/// // Three pieces with availabilities: piece 5 has 1, pieces 12 and 27 have 1
+/// let candidates = vec![(5u32, 1u32), (12, 1), (27, 1)];
+///
+/// // With a fixed seed, selection is deterministic
+/// let mut rng = StdRng::seed_from_u64(42);
+/// let selected = select_piece_with_tiebreaker(&candidates, &mut rng);
+/// assert!(selected.is_some());
+///
+/// // The result is one of the minimum-availability pieces
+/// let piece = selected.unwrap();
+/// assert!([5, 12, 27].contains(&piece));
+/// ```
+///
+/// # Algorithm
+///
+/// 1. Find the minimum availability count among all candidates
+/// 2. Collect all piece indices with that minimum count
+/// 3. Use the RNG to select uniformly at random from that subset
+///
+/// Time complexity: O(n) where n is the number of candidates.
+/// Space complexity: O(k) where k is the number of pieces with minimum availability.
+pub fn select_piece_with_tiebreaker<R: Rng>(
+    candidates: &[(u32, u32)],
+    rng: &mut R,
+) -> Option<u32> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Find the minimum availability count
+    let min_availability = candidates.iter().map(|(_, count)| *count).min()?;
+
+    // Collect all pieces with the minimum availability
+    let min_pieces: Vec<u32> = candidates
+        .iter()
+        .filter(|(_, count)| *count == min_availability)
+        .map(|(idx, _)| *idx)
+        .collect();
+
+    // Randomly select one from the minimum-availability set
+    min_pieces.choose(rng).copied()
+}
+@
+
+\subsubsection{Random Tiebreaker Tests}
+
+We test the tiebreaker with two complementary strategies:
+
+\begin{enumerate}
+\item \textbf{Deterministic tests with fixed seed}: Using a seeded RNG, we verify
+  that the function produces consistent results and correctly identifies the
+  minimum-availability pieces.
+\item \textbf{Statistical tests with random RNG}: Over many iterations, we verify
+  that the selection distributes across all eligible pieces, not just one.
+\end{enumerate}
+
+<<random tiebreaker tests>>=
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+#[test]
+fn tiebreaker_returns_none_for_empty_candidates() {
+    let mut rng = StdRng::seed_from_u64(0);
+    let candidates: Vec<(u32, u32)> = vec![];
+
+    assert_eq!(select_piece_with_tiebreaker(&candidates, &mut rng), None);
+}
+
+#[test]
+fn tiebreaker_returns_single_piece_when_one_candidate() {
+    let mut rng = StdRng::seed_from_u64(42);
+    let candidates = vec![(7u32, 3u32)];
+
+    assert_eq!(select_piece_with_tiebreaker(&candidates, &mut rng), Some(7));
+}
+
+#[test]
+fn tiebreaker_selects_minimum_availability_piece() {
+    let mut rng = StdRng::seed_from_u64(12345);
+
+    // Piece 10 has availability 2 (minimum), others have higher
+    let candidates = vec![
+        (5u32, 5u32),   // availability 5
+        (10, 2),        // availability 2 (minimum)
+        (15, 4),        // availability 4
+        (20, 3),        // availability 3
+    ];
+
+    // Should always select piece 10 since it's the only one with min availability
+    let selected = select_piece_with_tiebreaker(&candidates, &mut rng);
+    assert_eq!(selected, Some(10));
+}
+
+#[test]
+fn tiebreaker_with_fixed_seed_is_deterministic() {
+    // Three pieces all with availability 1
+    let candidates = vec![(5u32, 1u32), (12, 1), (27, 1)];
+
+    // Run multiple times with the same seed
+    let mut results = Vec::new();
+    for _ in 0..5 {
+        let mut rng = StdRng::seed_from_u64(42);
+        results.push(select_piece_with_tiebreaker(&candidates, &mut rng));
+    }
+
+    // All results should be identical (deterministic)
+    assert!(results.windows(2).all(|w| w[0] == w[1]),
+            "Expected deterministic results with same seed, got {:?}", results);
+}
+
+#[test]
+fn tiebreaker_result_is_from_minimum_set() {
+    // Pieces 2, 7, 15 have availability 2 (minimum)
+    // Pieces 1, 5 have availability 5
+    let candidates = vec![
+        (1u32, 5u32),
+        (2, 2),
+        (5, 5),
+        (7, 2),
+        (15, 2),
+    ];
+
+    // Run multiple times to check we always get a piece from the minimum set
+    for seed in 0..100 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let selected = select_piece_with_tiebreaker(&candidates, &mut rng).unwrap();
+        assert!([2, 7, 15].contains(&selected),
+                "Selected {} which is not in minimum availability set", selected);
+    }
+}
+
+#[test]
+fn tiebreaker_distributes_across_equal_pieces_over_many_runs() {
+    // Four pieces all with availability 1
+    let candidates = vec![(10u32, 1u32), (20, 1), (30, 1), (40, 1)];
+
+    // Count selections over many iterations with different seeds
+    let mut counts = std::collections::HashMap::new();
+    for seed in 0..1000 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let selected = select_piece_with_tiebreaker(&candidates, &mut rng).unwrap();
+        *counts.entry(selected).or_insert(0) += 1;
+    }
+
+    // All four pieces should be selected at least once
+    assert_eq!(counts.len(), 4, "Expected all 4 pieces to be selected at least once");
+
+    // Each piece should be selected roughly 25% of the time (250 +/- margin)
+    // With 1000 trials and 4 choices, expected ~250 each
+    // Using a lenient margin to avoid flaky tests
+    for (piece, count) in &counts {
+        assert!(*count > 100 && *count < 400,
+                "Piece {} selected {} times, expected roughly 250", piece, count);
+    }
+}
+
+#[test]
+fn tiebreaker_handles_all_same_availability() {
+    let mut rng = StdRng::seed_from_u64(7777);
+
+    // All pieces have the same availability
+    let candidates = vec![
+        (0u32, 3u32),
+        (1, 3),
+        (2, 3),
+    ];
+
+    let selected = select_piece_with_tiebreaker(&candidates, &mut rng);
+    assert!(selected.is_some());
+    assert!([0, 1, 2].contains(&selected.unwrap()));
+}
+
+#[test]
+fn tiebreaker_handles_large_availability_counts() {
+    let mut rng = StdRng::seed_from_u64(555);
+
+    let candidates = vec![
+        (0u32, 1000u32),
+        (1, 999),        // minimum
+        (2, 1000),
+        (3, 999),        // minimum
+    ];
+
+    // Should select from pieces with availability 999
+    let selected = select_piece_with_tiebreaker(&candidates, &mut rng).unwrap();
+    assert!([1, 3].contains(&selected));
+}
+@
+
 \subsection{Module Assembly}
 
 The pieces module combines the error types and helpers.
@@ -2294,6 +2551,8 @@ The pieces module combines the error types and helpers.
 
 <<rarest first selection>>
 
+<<random tiebreaker>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2320,6 +2579,8 @@ mod tests {
     <<piece availability tests>>
 
     <<rarest first selection tests>>
+
+    <<random tiebreaker tests>>
 }
 @
 
