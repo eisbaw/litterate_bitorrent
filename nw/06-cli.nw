@@ -169,11 +169,108 @@ We provide two parsing methods:
   making it suitable for testing error cases.
 \end{itemize}
 
+\subsection{Logging Initialization}
+
+Observability is essential for debugging protocol issues and understanding
+download progress. We use the [[tracing]] ecosystem, which provides structured
+logging with levels, spans, and fields. The [[tracing-subscriber]] crate
+configures how tracing events are formatted and filtered.
+
+Our logging strategy is:
+
+\begin{enumerate}
+\item \textbf{Default to INFO level}: Shows piece completions, peer connections,
+  and progress updates without overwhelming detail.
+
+\item \textbf{DEBUG with --verbose}: Enables detailed protocol logging including
+  block requests, message parsing, and state transitions.
+
+\item \textbf{RUST\_LOG override}: Power users can set fine-grained filtering
+  via the environment variable, e.g., [[RUST\_LOG=literate\_bittorrent::pieces=debug]].
+
+\item \textbf{Output to stderr}: Standard output is reserved for potential
+  machine-readable output (JSON status, pipe to other tools). Logs go to stderr.
+\end{enumerate}
+
+<<cli logging>>=
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+/// Initialize the logging subsystem.
+///
+/// This configures tracing-subscriber with:
+/// - Human-readable output with timestamps
+/// - Default level INFO (or DEBUG when verbose=true)
+/// - RUST_LOG environment variable support for fine-grained control
+/// - Output to stderr (stdout reserved for machine-readable output)
+///
+/// # Arguments
+///
+/// * `verbose` - When true, sets the default log level to DEBUG
+///
+/// # Environment Variables
+///
+/// * `RUST_LOG` - If set, overrides the default filter. See tracing_subscriber
+///   documentation for filter syntax. Invalid values fall back to the default.
+///
+/// # Example
+///
+/// ```no_run
+/// use literate_bittorrent::cli::init_logging;
+///
+/// // Normal usage: INFO level
+/// init_logging(false);
+///
+/// // Verbose mode: DEBUG level
+/// init_logging(true);
+/// ```
+pub fn init_logging(verbose: bool) {
+    // Determine the default log level based on verbose flag
+    let default_level = if verbose { "debug" } else { "info" };
+
+    // Build the filter, respecting RUST_LOG if set.
+    // If RUST_LOG is set but invalid, we fall back to the default.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    // Configure the formatter layer:
+    // - Timestamps for correlating events
+    // - Colored output when terminal supports it
+    // - Hierarchical span display for context
+    // - Output to stderr (not stdout)
+    let fmt_layer = fmt::layer()
+        .with_target(true)
+        .with_level(true)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_writer(std::io::stderr);
+
+    // Build and install the subscriber
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .init();
+}
+@
+
+The [[EnvFilter::try\_from\_default\_env()]] call reads the [[RUST\_LOG]]
+environment variable. If it's not set or contains invalid syntax, we fall back
+to our default filter. This ensures the application never crashes due to a
+misconfigured environment variable---a common frustration for users.
+
+The formatter is configured for human readability: timestamps help correlate
+events during debugging, targets (module paths) help identify where messages
+originated, and the hierarchical span display shows the context chain.
+
 \subsection{Module Structure}
 
-The CLI module is intentionally simple, exporting just the [[Args]] structure
-and its methods. The main program will use [[Args::parse\_args()]] to get
-configuration, then pass the relevant fields to the download logic.
+The CLI module exports the [[Args]] structure for argument parsing and the
+[[init\_logging]] function for logging setup. The main program will:
+
+\begin{enumerate}
+\item Call [[Args::parse\_args()]] to get configuration
+\item Call [[init\_logging(args.verbose)]] to initialize logging
+\item Pass the relevant fields to the download logic
+\end{enumerate}
 
 <<cli.rs>>=
 // GENERATED CODE - DO NOT EDIT
@@ -184,22 +281,26 @@ configuration, then pass the relevant fields to the download logic.
 //!
 //! This module defines the CLI using clap's derive macros, providing
 //! automatic argument parsing, validation, and help text generation.
+//! It also provides logging initialization via tracing-subscriber.
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use literate_bittorrent::cli::Args;
+//! use literate_bittorrent::cli::{Args, init_logging};
 //!
 //! let args = Args::parse_args();
+//! init_logging(args.verbose);
+//!
 //! println!("Torrent: {:?}", args.torrent);
 //! println!("Output: {:?}", args.output);
 //! println!("Port: {}", args.port);
-//! println!("Verbose: {}", args.verbose);
 //! ```
 
 <<cli args>>
 
 <<cli parse>>
+
+<<cli logging>>
 
 <<cli tests>>
 @
@@ -541,6 +642,134 @@ mod tests {
         let debug_str = format!("{:?}", args);
         assert!(debug_str.contains("Args"));
         assert!(debug_str.contains("file.torrent"));
+    }
+}
+
+// Note: Testing init_logging directly is challenging because tracing_subscriber
+// can only be initialized once per process. The tests below validate the filter
+// construction logic in isolation.
+#[cfg(test)]
+mod logging_tests {
+    use tracing_subscriber::EnvFilter;
+    use std::env;
+
+    // Helper to build a filter the same way init_logging does
+    fn build_filter_for_verbose(verbose: bool) -> EnvFilter {
+        let default_level = if verbose { "debug" } else { "info" };
+        EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(default_level))
+    }
+
+    #[test]
+    fn default_filter_is_info() {
+        // Temporarily clear RUST_LOG to test default behavior
+        let original = env::var("RUST_LOG").ok();
+        env::remove_var("RUST_LOG");
+
+        let filter = build_filter_for_verbose(false);
+        // The filter should be created successfully (not crash)
+        let filter_str = format!("{}", filter);
+        // EnvFilter displays its directives; "info" should be present
+        assert!(
+            filter_str.contains("info"),
+            "Default filter should contain 'info': {}",
+            filter_str
+        );
+
+        // Restore original RUST_LOG if it existed
+        if let Some(val) = original {
+            env::set_var("RUST_LOG", val);
+        }
+    }
+
+    #[test]
+    fn verbose_filter_is_debug() {
+        // Temporarily clear RUST_LOG to test default behavior
+        let original = env::var("RUST_LOG").ok();
+        env::remove_var("RUST_LOG");
+
+        let filter = build_filter_for_verbose(true);
+        let filter_str = format!("{}", filter);
+        assert!(
+            filter_str.contains("debug"),
+            "Verbose filter should contain 'debug': {}",
+            filter_str
+        );
+
+        // Restore original RUST_LOG if it existed
+        if let Some(val) = original {
+            env::set_var("RUST_LOG", val);
+        }
+    }
+
+    #[test]
+    fn invalid_rust_log_does_not_crash() {
+        // Set an invalid RUST_LOG value
+        let original = env::var("RUST_LOG").ok();
+        env::set_var("RUST_LOG", "this-is-not-valid[[[");
+
+        // This should not panic - it should fall back to default
+        let filter = build_filter_for_verbose(false);
+        let filter_str = format!("{}", filter);
+        // Should have fallen back to "info" (the default for non-verbose)
+        assert!(
+            filter_str.contains("info"),
+            "Invalid RUST_LOG should fall back to default: {}",
+            filter_str
+        );
+
+        // Restore original RUST_LOG
+        if let Some(val) = original {
+            env::set_var("RUST_LOG", val);
+        } else {
+            env::remove_var("RUST_LOG");
+        }
+    }
+
+    #[test]
+    fn valid_rust_log_is_respected() {
+        // Set a valid RUST_LOG value
+        let original = env::var("RUST_LOG").ok();
+        env::set_var("RUST_LOG", "warn");
+
+        let filter = build_filter_for_verbose(false);
+        let filter_str = format!("{}", filter);
+        // Should use the RUST_LOG value, not the default
+        assert!(
+            filter_str.contains("warn"),
+            "Valid RUST_LOG should be respected: {}",
+            filter_str
+        );
+
+        // Restore original RUST_LOG
+        if let Some(val) = original {
+            env::set_var("RUST_LOG", val);
+        } else {
+            env::remove_var("RUST_LOG");
+        }
+    }
+
+    #[test]
+    fn rust_log_overrides_verbose() {
+        // RUST_LOG should take precedence over verbose flag
+        let original = env::var("RUST_LOG").ok();
+        env::set_var("RUST_LOG", "error");
+
+        let filter = build_filter_for_verbose(true); // verbose=true, but RUST_LOG=error
+        let filter_str = format!("{}", filter);
+        // Should use RUST_LOG value "error", not "debug" from verbose flag
+        assert!(
+            filter_str.contains("error"),
+            "RUST_LOG should override verbose flag: {}",
+            filter_str
+        );
+
+        // Restore original RUST_LOG
+        if let Some(val) = original {
+            env::set_var("RUST_LOG", val);
+        } else {
+            env::remove_var("RUST_LOG");
+        }
     }
 }
 @
