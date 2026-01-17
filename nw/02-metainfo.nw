@@ -206,14 +206,573 @@ will add parsing functions that construct [[Metainfo]] from bencoded data.
 //! A metainfo file contains the tracker URL, file information, and piece hashes
 //! needed to download and verify a torrent.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use crate::bencode::{decode, BencodeError, BencodeValue};
 
 <<file info struct>>
 
 <<metainfo struct>>
 
 <<metainfo errors>>
+
+<<helper functions>>
+
+<<parse pieces>>
+
+<<parse single file>>
+
+<<parse function>>
+
+<<metainfo tests>>
 @
 
 The module is structured to be imported as [[use literate\_bittorrent::metainfo]],
 exposing [[Metainfo]], [[FileInfo]], and [[MetainfoError]] as the public interface.
+
+\subsection{Helper Functions for BencodeValue Extraction}
+
+Parsing metainfo requires extracting specific types from [[BencodeValue]]. Rather than
+repeating match expressions throughout the parsing code, we define helper functions
+that perform type-checked extraction with clear error messages.
+
+These helpers follow a common pattern: given a dictionary and a key, extract the
+value and verify it has the expected type. If the key is missing or the value has
+the wrong type, return an appropriate error.
+
+<<helper functions>>=
+/// Extracts a dictionary from a BencodeValue, returning an error if not a Dict.
+fn get_dict(value: &BencodeValue) -> Result<&BTreeMap<Vec<u8>, BencodeValue>, MetainfoError> {
+    match value {
+        BencodeValue::Dict(d) => Ok(d),
+        _ => Err(MetainfoError::MissingField("expected dictionary")),
+    }
+}
+
+/// Extracts a byte string from a dictionary by key.
+fn get_bytes<'a>(
+    dict: &'a BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<&'a [u8], MetainfoError> {
+    match dict.get(key.as_bytes()) {
+        Some(BencodeValue::Bytes(b)) => Ok(b),
+        Some(_) => Err(MetainfoError::MissingField(key)), // wrong type
+        None => Err(MetainfoError::MissingField(key)),
+    }
+}
+
+/// Extracts a UTF-8 string from a dictionary by key.
+fn get_string(
+    dict: &BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<String, MetainfoError> {
+    let bytes = get_bytes(dict, key)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| MetainfoError::MissingField(key))
+}
+
+/// Extracts an integer from a dictionary by key.
+fn get_int(
+    dict: &BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<i64, MetainfoError> {
+    match dict.get(key.as_bytes()) {
+        Some(BencodeValue::Integer(n)) => Ok(*n),
+        Some(_) => Err(MetainfoError::MissingField(key)), // wrong type
+        None => Err(MetainfoError::MissingField(key)),
+    }
+}
+
+/// Extracts a nested dictionary from a dictionary by key.
+fn get_dict_field<'a>(
+    dict: &'a BTreeMap<Vec<u8>, BencodeValue>,
+    key: &'static str,
+) -> Result<&'a BTreeMap<Vec<u8>, BencodeValue>, MetainfoError> {
+    match dict.get(key.as_bytes()) {
+        Some(BencodeValue::Dict(d)) => Ok(d),
+        Some(_) => Err(MetainfoError::MissingField(key)), // wrong type
+        None => Err(MetainfoError::MissingField(key)),
+    }
+}
+@
+
+Each function returns a [[MetainfoError]] rather than a generic error because these
+are specifically designed for metainfo parsing. The error messages are intentionally
+simple---in production code, you might want more detailed type mismatch messages.
+
+\subsection{Parsing Piece Hashes}
+
+The ``pieces'' field in a torrent contains the concatenation of all piece SHA1 hashes.
+Each SHA1 hash is exactly 20 bytes, so the total length must be a multiple of 20.
+We validate this constraint and split the bytes into a vector of fixed-size arrays.
+
+<<parse pieces>>=
+/// Parses the pieces byte string into a vector of 20-byte SHA1 hashes.
+///
+/// The pieces field is a concatenation of SHA1 hashes, one per piece.
+/// This function validates that the length is a multiple of 20 and splits
+/// the bytes into individual hash arrays.
+///
+/// # Errors
+///
+/// Returns `InvalidPieceHashes` if the length is not a multiple of 20.
+fn parse_pieces(pieces_bytes: &[u8]) -> Result<Vec<[u8; 20]>, MetainfoError> {
+    if pieces_bytes.len() % 20 != 0 {
+        return Err(MetainfoError::InvalidPieceHashes(format!(
+            "pieces length {} is not a multiple of 20",
+            pieces_bytes.len()
+        )));
+    }
+
+    let num_pieces = pieces_bytes.len() / 20;
+    let mut hashes = Vec::with_capacity(num_pieces);
+
+    for chunk in pieces_bytes.chunks_exact(20) {
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(chunk);
+        hashes.push(hash);
+    }
+
+    Ok(hashes)
+}
+@
+
+Using [[chunks\_exact]] ensures we get exactly 20-byte slices with no remainder.
+The capacity pre-allocation avoids reallocations as we build the vector.
+
+\subsection{Parsing Single-File Torrents}
+
+A single-file torrent has a simple info dictionary: just a ``name'' and ``length''.
+The name becomes both the torrent name and the filename, and the length is the
+total content size.
+
+<<parse single file>>=
+/// Parses file information for a single-file torrent.
+///
+/// Single-file torrents have `length` directly in the info dict rather than
+/// a `files` array. The `name` field is used as the filename.
+///
+/// Returns a tuple of (FileInfo, total_length) where total_length equals
+/// the single file's length.
+fn parse_single_file(
+    info_dict: &BTreeMap<Vec<u8>, BencodeValue>,
+    name: &str,
+) -> Result<(Vec<FileInfo>, u64), MetainfoError> {
+    let length = get_int(info_dict, "length")?;
+
+    if length < 0 {
+        return Err(MetainfoError::MissingField("length"));
+    }
+
+    let length = length as u64;
+    let file_info = FileInfo {
+        length,
+        path: PathBuf::from(name),
+    };
+
+    Ok((vec![file_info], length))
+}
+@
+
+The function returns both the file list (a single-element vector) and the total
+length. For single-file torrents, these are effectively the same, but returning
+both maintains consistency with how we'll handle multi-file torrents.
+
+\subsection{The Main Parse Function}
+
+The [[parse]] function is the main entry point for parsing metainfo files. It
+coordinates all the pieces: decoding the bencode, extracting fields, and
+constructing the [[Metainfo]] struct.
+
+<<parse function>>=
+/// Parses raw bytes into a Metainfo structure.
+///
+/// This is the main entry point for parsing .torrent files. The input should
+/// be the complete contents of a .torrent file (bencoded dictionary).
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The input is not valid bencode
+/// - Required fields are missing (announce, info, name, piece length, pieces)
+/// - The pieces length is not a multiple of 20
+/// - The piece length is invalid (zero or negative)
+/// - Single-file torrent is missing `length` field
+///
+/// # Example
+///
+/// ```ignore
+/// let torrent_bytes = std::fs::read("example.torrent")?;
+/// let metainfo = parse(&torrent_bytes)?;
+/// println!("Tracker: {}", metainfo.announce);
+/// ```
+pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
+    // Decode the bencoded data
+    let value = decode(data).map_err(|e| match e {
+        BencodeError::UnexpectedEof => MetainfoError::MissingField("valid bencode"),
+        _ => MetainfoError::MissingField("valid bencode"),
+    })?;
+
+    // The top level must be a dictionary
+    let root = get_dict(&value)?;
+
+    // Extract announce URL
+    let announce = get_string(root, "announce")?;
+
+    // Extract the info dictionary
+    let info_dict = get_dict_field(root, "info")?;
+
+    // Extract name from info dict
+    let name = get_string(info_dict, "name")?;
+
+    // Extract piece length
+    let piece_length_i64 = get_int(info_dict, "piece length")?;
+    if piece_length_i64 <= 0 {
+        return Err(MetainfoError::InvalidPieceLength(format!(
+            "piece length must be positive, got {}",
+            piece_length_i64
+        )));
+    }
+    if piece_length_i64 > u32::MAX as i64 {
+        return Err(MetainfoError::InvalidPieceLength(format!(
+            "piece length {} exceeds maximum",
+            piece_length_i64
+        )));
+    }
+    let piece_length = piece_length_i64 as u32;
+
+    // Extract and parse pieces
+    let pieces_bytes = get_bytes(info_dict, "pieces")?;
+    let piece_hashes = parse_pieces(pieces_bytes)?;
+
+    // Determine if this is single-file or multi-file format
+    // Single-file has "length" in info dict; multi-file has "files" array
+    let (files, total_length) = if info_dict.contains_key(b"length".as_ref()) {
+        parse_single_file(info_dict, &name)?
+    } else {
+        // Multi-file format not yet implemented (task 0106)
+        return Err(MetainfoError::MissingField("length (multi-file not supported)"));
+    };
+
+    // Note: info_hash computation is a separate task (0110)
+    // For now, use a placeholder
+    let info_hash = [0u8; 20];
+
+    Ok(Metainfo {
+        announce,
+        info_hash,
+        piece_length,
+        piece_hashes,
+        total_length,
+        files,
+        name,
+    })
+}
+@
+
+The parse function is careful about error handling. Each extraction step can fail,
+and we propagate errors with descriptive messages. The bencode decoding error is
+mapped to a [[MissingField]] error since the specific bencode error details are
+less relevant at this level.
+
+The info\_hash computation is deliberately left as a placeholder. Computing it
+requires re-encoding the info dictionary or tracking byte offsets during parsing,
+which adds complexity. Task 0110 will handle this separately.
+
+\subsection{Tests}
+
+We test the parsing with hand-crafted minimal torrent data. This gives us precise
+control over the test input and lets us verify each edge case.
+
+<<metainfo tests>>=
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to create a minimal valid single-file torrent in bencode format.
+    ///
+    /// The structure is:
+    /// ```text
+    /// d
+    ///   8:announce <url>
+    ///   4:info d
+    ///     6:length <bytes>
+    ///     4:name <filename>
+    ///     12:piece length <bytes per piece>
+    ///     6:pieces <20 * N bytes of hashes>
+    ///   e
+    /// e
+    /// ```
+    fn make_single_file_torrent(
+        announce: &str,
+        name: &str,
+        length: i64,
+        piece_length: i64,
+        pieces: &[u8],
+    ) -> Vec<u8> {
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(length));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(name.as_bytes().to_vec()));
+        info.insert(
+            b"piece length".to_vec(),
+            BencodeValue::Integer(piece_length),
+        );
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(announce.as_bytes().to_vec()),
+        );
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        encode(&BencodeValue::Dict(root))
+    }
+
+    #[test]
+    fn parse_minimal_single_file_torrent() {
+        // Create a minimal torrent with one piece
+        let pieces = [0u8; 20]; // One fake piece hash
+        let torrent = make_single_file_torrent(
+            "http://tracker.example.com/announce",
+            "test.txt",
+            1024,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse valid torrent");
+
+        assert_eq!(metainfo.announce, "http://tracker.example.com/announce");
+        assert_eq!(metainfo.name, "test.txt");
+        assert_eq!(metainfo.piece_length, 16384);
+        assert_eq!(metainfo.piece_hashes.len(), 1);
+        assert_eq!(metainfo.piece_hashes[0], [0u8; 20]);
+        assert_eq!(metainfo.total_length, 1024);
+        assert_eq!(metainfo.files.len(), 1);
+        assert_eq!(metainfo.files[0].length, 1024);
+        assert_eq!(metainfo.files[0].path, PathBuf::from("test.txt"));
+        // info_hash is placeholder for now
+        assert_eq!(metainfo.info_hash, [0u8; 20]);
+    }
+
+    #[test]
+    fn parse_torrent_with_multiple_pieces() {
+        // Create torrent with 3 pieces
+        let pieces = [0u8; 60]; // Three fake piece hashes
+        let torrent = make_single_file_torrent(
+            "http://example.com/announce",
+            "bigfile.bin",
+            1_000_000,
+            262144,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+
+        assert_eq!(metainfo.piece_hashes.len(), 3);
+        assert_eq!(metainfo.piece_length, 262144);
+    }
+
+    #[test]
+    fn reject_invalid_pieces_length() {
+        // 25 bytes is not a multiple of 20
+        let pieces = [0u8; 25];
+        let torrent = make_single_file_torrent(
+            "http://example.com/announce",
+            "test.txt",
+            1024,
+            16384,
+            &pieces,
+        );
+
+        let result = parse(&torrent);
+        assert!(matches!(result, Err(MetainfoError::InvalidPieceHashes(_))));
+
+        if let Err(MetainfoError::InvalidPieceHashes(msg)) = result {
+            assert!(msg.contains("not a multiple of 20"), "msg: {}", msg);
+        }
+    }
+
+    #[test]
+    fn reject_zero_piece_length() {
+        let pieces = [0u8; 20];
+        let torrent = make_single_file_torrent(
+            "http://example.com/announce",
+            "test.txt",
+            1024,
+            0, // Invalid: zero piece length
+            &pieces,
+        );
+
+        let result = parse(&torrent);
+        assert!(matches!(result, Err(MetainfoError::InvalidPieceLength(_))));
+    }
+
+    #[test]
+    fn reject_negative_piece_length() {
+        let pieces = [0u8; 20];
+        let torrent = make_single_file_torrent(
+            "http://example.com/announce",
+            "test.txt",
+            1024,
+            -100, // Invalid: negative piece length
+            &pieces,
+        );
+
+        let result = parse(&torrent);
+        assert!(matches!(result, Err(MetainfoError::InvalidPieceLength(_))));
+    }
+
+    #[test]
+    fn reject_missing_announce() {
+        use crate::bencode::encode;
+
+        // Torrent without announce field
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+        // No announce field!
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::MissingField("announce"))));
+    }
+
+    #[test]
+    fn reject_missing_info() {
+        use crate::bencode::encode;
+
+        // Torrent without info dict
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(b"http://example.com".to_vec()),
+        );
+        // No info field!
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::MissingField("info"))));
+    }
+
+    #[test]
+    fn reject_missing_name() {
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        // No name field!
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(b"http://example.com".to_vec()),
+        );
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::MissingField("name"))));
+    }
+
+    #[test]
+    fn reject_missing_pieces() {
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        // No pieces field!
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(b"http://example.com".to_vec()),
+        );
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(result, Err(MetainfoError::MissingField("pieces"))));
+    }
+
+    #[test]
+    fn reject_missing_piece_length() {
+        use crate::bencode::encode;
+
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        // No piece length field!
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(b"http://example.com".to_vec()),
+        );
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let result = parse(&torrent);
+
+        assert!(matches!(
+            result,
+            Err(MetainfoError::MissingField("piece length"))
+        ));
+    }
+
+    #[test]
+    fn reject_empty_bencode() {
+        let result = parse(b"");
+        assert!(matches!(result, Err(MetainfoError::MissingField(_))));
+    }
+
+    #[test]
+    fn reject_non_dict_root() {
+        // Root is a list, not a dict
+        let result = parse(b"le");
+        assert!(matches!(result, Err(MetainfoError::MissingField(_))));
+    }
+
+    #[test]
+    fn parse_pieces_empty() {
+        // Empty pieces array is valid (though unusual)
+        let result = parse_pieces(&[]);
+        assert_eq!(result.unwrap(), Vec::<[u8; 20]>::new());
+    }
+
+    #[test]
+    fn parse_pieces_multiple() {
+        let mut pieces = [0u8; 40];
+        pieces[0] = 1; // First hash starts with 1
+        pieces[20] = 2; // Second hash starts with 2
+
+        let result = parse_pieces(&pieces).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0][0], 1);
+        assert_eq!(result[1][0], 2);
+    }
+}
+@
+
+The tests use a helper function [[make\_single\_file\_torrent]] to construct valid
+bencoded data. This approach is cleaner than writing raw bencode bytes and less
+error-prone. We test both the happy path and various error conditions to ensure
+robust error handling.
