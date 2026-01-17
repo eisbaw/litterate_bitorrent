@@ -115,6 +115,31 @@ The [[PeerRequestQueue]] struct implements this bounded queue. Each request
 is wrapped in [[TimestampedRequest]] to record when it was sent, enabling
 timeout detection. The queue operates in FIFO order for fairness.
 
+\subsubsection{Request Timeout Detection}
+
+Peers sometimes become unresponsive: they may crash, lose network connectivity,
+or simply deprioritize our requests. Without timeout detection, we would wait
+indefinitely for responses that never come, stalling the download.
+
+The PRD specifies a 30-second timeout ([[REQUEST_TIMEOUT_SECS]]). Requests
+pending longer than this are considered timed out and should be re-requested
+from another peer. The [[check_timeouts]] method provides convenient access
+to this list.
+
+\textbf{Design choice: detection vs removal.} Timed-out requests are \emph{not}
+automatically removed from the queue. This separation is intentional:
+
+\begin{enumerate}
+\item The caller first identifies timed-out requests via [[check_timeouts]].
+\item The caller re-requests those blocks from another peer.
+\item Only after the new request is queued does the caller remove the old one.
+\end{enumerate}
+
+This ordering prevents a race condition where a block is neither in-flight nor
+queued for re-request. By keeping the timed-out request in the queue until a
+replacement is scheduled, we maintain the invariant that every needed block is
+tracked somewhere.
+
 <<peer request queue>>=
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -131,6 +156,18 @@ use crate::pieces::BlockRequest;
 /// The BitTorrent Economics Paper suggests 10 requests as a reasonable
 /// default. Some clients use up to 16 for high-latency connections.
 pub const DEFAULT_MAX_REQUESTS_PER_PEER: usize = 16;
+
+/// Default timeout for block requests in seconds.
+///
+/// Requests pending longer than this should be cancelled and re-requested
+/// from another peer. The 30-second value comes from the PRD specification
+/// and represents a balance between:
+/// - Giving slow peers enough time to respond
+/// - Not waiting too long on unresponsive peers
+///
+/// See [`PeerRequestQueue::check_timeouts`] for the convenience method
+/// that uses this default.
+pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// A request with timestamp for timeout detection.
 ///
@@ -320,6 +357,64 @@ impl PeerRequestQueue {
             .filter(|r| r.sent_at.elapsed() > timeout)
             .cloned()
             .collect()
+    }
+
+    /// Returns requests that have timed out using the default timeout.
+    ///
+    /// This is a convenience wrapper around [`timed_out`](Self::timed_out)
+    /// using [`REQUEST_TIMEOUT_SECS`] (30 seconds) as the threshold.
+    ///
+    /// # Design Note
+    ///
+    /// Timed-out requests are *not* removed from the queue. This is
+    /// intentional: the caller should first re-request the block from
+    /// another peer, then remove the timed-out request. This prevents
+    /// a race where the block is neither in-flight nor re-requested.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::PeerRequestQueue;
+    /// use literate_bittorrent::pieces::BlockRequest;
+    ///
+    /// let mut queue = PeerRequestQueue::new(10);
+    /// queue.push(BlockRequest { piece_index: 0, offset: 0, length: 16384 });
+    ///
+    /// // Immediately after push, nothing should be timed out
+    /// let timed_out = queue.check_timeouts();
+    /// assert!(timed_out.is_empty());
+    /// ```
+    pub fn check_timeouts(&self) -> Vec<TimestampedRequest> {
+        self.timed_out(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+    }
+
+    /// Returns requests that have timed out using a custom timeout.
+    ///
+    /// This is useful for:
+    /// - Testing with shorter timeouts
+    /// - Applying stricter timeouts to slow peers
+    /// - Implementing adaptive timeout strategies
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Duration after which a request is considered timed out
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use literate_bittorrent::client::PeerRequestQueue;
+    /// use literate_bittorrent::pieces::BlockRequest;
+    ///
+    /// let mut queue = PeerRequestQueue::new(10);
+    /// queue.push(BlockRequest { piece_index: 0, offset: 0, length: 16384 });
+    ///
+    /// // With zero duration, everything is timed out
+    /// let timed_out = queue.check_timeouts_with(Duration::ZERO);
+    /// assert!(!timed_out.is_empty());
+    /// ```
+    pub fn check_timeouts_with(&self, timeout: Duration) -> Vec<TimestampedRequest> {
+        self.timed_out(timeout)
     }
 
     /// Clears all pending requests, returning them.
@@ -6066,6 +6161,68 @@ mod peer_request_queue_tests {
         // With very long timeout, nothing is timed out
         let timed_out = queue.timed_out(Duration::from_secs(3600));
         assert_eq!(timed_out.len(), 0);
+    }
+
+    #[test]
+    fn request_timeout_constant_is_30_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn check_timeouts_returns_empty_for_fresh_requests() {
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+
+        // Immediately after push, nothing should be timed out
+        // (30 seconds haven't passed)
+        let timed_out = queue.check_timeouts();
+        assert!(timed_out.is_empty());
+    }
+
+    #[test]
+    fn check_timeouts_with_zero_duration_returns_all() {
+        use std::time::Duration;
+
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+
+        // With zero duration, everything is timed out
+        let timed_out = queue.check_timeouts_with(Duration::ZERO);
+        assert!(!timed_out.is_empty());
+        assert_eq!(timed_out.len(), 1);
+    }
+
+    #[test]
+    fn check_timeouts_leaves_requests_in_queue() {
+        use std::time::Duration;
+
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+
+        // Check timeouts (returns the timed-out requests)
+        let timed_out = queue.check_timeouts_with(Duration::ZERO);
+        assert_eq!(timed_out.len(), 1);
+
+        // Request should still be in queue (caller's responsibility to remove)
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn check_timeouts_with_custom_duration() {
+        use std::time::Duration;
+
+        let mut queue = PeerRequestQueue::new(10);
+        queue.push(make_request(0, 0));
+        queue.push(make_request(0, 16384));
+        queue.push(make_request(1, 0));
+
+        // With very long timeout, nothing is timed out
+        let timed_out = queue.check_timeouts_with(Duration::from_secs(3600));
+        assert!(timed_out.is_empty());
+
+        // With zero timeout, all three are timed out
+        let timed_out = queue.check_timeouts_with(Duration::ZERO);
+        assert_eq!(timed_out.len(), 3);
     }
 }
 @
