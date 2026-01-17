@@ -675,6 +675,63 @@ mod tests {
         assert_eq!(slices[0].length, 64);
     }
 
+    #[test]
+    fn map_piece_100kb_files_64kb_pieces() {
+        // AC#6: 3 files of 100KB each, piece_length 64KB
+        // Verify piece 1 spans files 0 and 1
+        //
+        // File layout (100KB = 102400 bytes, 64KB = 65536 bytes):
+        //   File 0: bytes 0-102399
+        //   File 1: bytes 102400-204799
+        //   File 2: bytes 204800-307199
+        //   Total: 307200 bytes
+        //
+        // Piece 1: bytes 65536-131071 (65536 bytes)
+        //   - File 0: overlap 65536-102399 = 36864 bytes at offset 65536
+        //   - File 1: overlap 102400-131071 = 28672 bytes at offset 0
+        const KB: u64 = 1024;
+        let files = vec![
+            FileInfo { length: 100 * KB, path: PathBuf::from("file0.bin") },
+            FileInfo { length: 100 * KB, path: PathBuf::from("file1.bin") },
+            FileInfo { length: 100 * KB, path: PathBuf::from("file2.bin") },
+        ];
+        let total_length = 300 * KB;
+        let piece_length = 64 * KB as u32;
+
+        let slices = map_piece_to_files(1, piece_length, total_length, &files);
+
+        assert_eq!(slices.len(), 2, "piece 1 should span exactly two files");
+
+        // First slice: end of file 0
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 65536); // 64KB into file 0
+        assert_eq!(slices[0].length, 36864);      // 100KB - 64KB = 36KB = 36864 bytes
+
+        // Second slice: beginning of file 1
+        assert_eq!(slices[1].file_index, 1);
+        assert_eq!(slices[1].file_offset, 0);
+        assert_eq!(slices[1].length, 28672);      // 64KB - 36KB = 28KB = 28672 bytes
+    }
+
+    #[test]
+    fn map_piece_single_file_returns_single_slice() {
+        // AC#7: piece fully within single file returns single FileSlice
+        // This is a specific test for the acceptance criteria, even though
+        // similar tests exist above.
+        let files = vec![FileInfo {
+            length: 1_000_000,
+            path: PathBuf::from("large.bin"),
+        }];
+
+        // Piece 5 is entirely within the single file
+        let slices = map_piece_to_files(5, 65536, 1_000_000, &files);
+
+        assert_eq!(slices.len(), 1, "single file torrent should return single slice");
+        assert_eq!(slices[0].file_index, 0);
+        assert_eq!(slices[0].file_offset, 5 * 65536);
+        assert_eq!(slices[0].length, 65536);
+    }
+
     // ========================================
     // Write Piece Tests
     // ========================================
