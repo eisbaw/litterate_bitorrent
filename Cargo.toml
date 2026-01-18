@@ -34,6 +34,13 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# JSON serialization for structured logging
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Timestamp formatting
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
 [dev-dependencies]
 # Property-based testing
 proptest = "1"

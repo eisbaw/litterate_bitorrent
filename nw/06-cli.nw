@@ -96,6 +96,15 @@ pub struct Args {
     /// If not specified, upload speed is unlimited.
     #[arg(long, value_name = "RATE", value_parser = parse_rate_limit)]
     pub max_upload_rate: Option<u64>,
+
+    /// Enable JSON logging mode for machine-readable output
+    ///
+    /// When enabled, emits JSON objects to stderr instead of human-readable
+    /// progress messages. Useful for monitoring long-running downloads and
+    /// integration with external tools. JSON includes fields like timestamp,
+    /// pieces completed, download speed, and peer count.
+    #[arg(long)]
+    pub json_log: bool,
 }
 @
 
@@ -125,6 +134,10 @@ each field:
 \item[max\_upload\_rate] An optional rate limit for upload speed. Similar to
   [[max\_download\_rate]], this prevents the client from consuming all available
   upload bandwidth, which can cause latency issues for other applications.
+
+\item[json\_log] A boolean flag that enables JSON logging mode. When set,
+  progress messages are emitted as JSON objects to stderr instead of
+  human-readable text. This is useful for integration with monitoring tools.
 \end{description}
 
 \subsection{Rate Limit Parsing}
@@ -1881,6 +1894,7 @@ mod validation_tests {
             verbose: false,
             max_download_rate: None,
             max_upload_rate: None,
+            json_log: false,
         }
     }
 

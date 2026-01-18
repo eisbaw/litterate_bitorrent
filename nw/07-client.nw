@@ -2352,6 +2352,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<event loop tests>>
 
+<<progress event tests>>
+
 <<event loop integration tests>>
 
 <<re-announce tests>>
@@ -8655,6 +8657,12 @@ pub struct EventLoopContext<'a> {
     ///
     /// Used to calculate total elapsed time and average speed for completion message.
     pub download_start_time: std::time::Instant,
+
+    /// Whether to emit JSON progress events instead of human-readable output.
+    ///
+    /// When enabled, progress updates are emitted as JSON objects to stderr,
+    /// suitable for machine consumption by monitoring tools.
+    pub json_log: bool,
 }
 @
 
@@ -9801,6 +9809,86 @@ We show pieces completed, percentage, download speed, and estimated time remaini
 The progress is printed to stderr (via tracing at INFO level) every 2 seconds.
 
 <<event loop>>=
+use serde::Serialize;
+use chrono::Utc;
+
+/// A progress event emitted when JSON logging is enabled.
+///
+/// This struct represents a single progress update containing all metrics
+/// useful for monitoring a download. When `--json-log` is enabled, these
+/// events are serialized to JSON and written to stderr every 2 seconds.
+///
+/// # Example JSON Output
+///
+/// ```json
+/// {
+///   "timestamp": "2024-01-18T12:34:56Z",
+///   "event_type": "progress",
+///   "pieces_done": 42,
+///   "pieces_total": 100,
+///   "percentage": 42.0,
+///   "download_speed_bps": 1048576,
+///   "upload_speed_bps": 0,
+///   "peer_count": 5
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressEvent {
+    /// ISO 8601 timestamp when this event was generated.
+    pub timestamp: String,
+
+    /// Type of event (always "progress" for progress events).
+    pub event_type: String,
+
+    /// Number of pieces that have been downloaded and verified.
+    pub pieces_done: u32,
+
+    /// Total number of pieces in the torrent.
+    pub pieces_total: u32,
+
+    /// Download progress as a percentage (0.0 to 100.0).
+    pub percentage: f64,
+
+    /// Current download speed in bytes per second.
+    pub download_speed_bps: u64,
+
+    /// Current upload speed in bytes per second (currently always 0).
+    pub upload_speed_bps: u64,
+
+    /// Number of currently connected peers.
+    pub peer_count: usize,
+}
+
+impl ProgressEvent {
+    /// Creates a new progress event with the given metrics.
+    pub fn new(
+        pieces_done: u32,
+        pieces_total: u32,
+        percentage: f64,
+        download_speed_bps: u64,
+        peer_count: usize,
+    ) -> Self {
+        Self {
+            timestamp: Utc::now().to_rfc3339(),
+            event_type: "progress".to_string(),
+            pieces_done,
+            pieces_total,
+            percentage,
+            download_speed_bps,
+            upload_speed_bps: 0, // Not tracking upload yet
+            peer_count,
+        }
+    }
+
+    /// Serializes this event to a JSON string.
+    ///
+    /// Returns an error if serialization fails (which should never happen
+    /// for this simple struct).
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
 /// Handles the progress display timer event.
 ///
 /// Displays download progress including:
@@ -9808,6 +9896,9 @@ The progress is printed to stderr (via tracing at INFO level) every 2 seconds.
 /// - Percentage complete (e.g., "42.0%")
 /// - Download speed in human-readable format (e.g., "1.5 MB/s")
 /// - Estimated time remaining
+///
+/// When `json_log` is enabled in the context, emits JSON to stderr instead
+/// of human-readable text. This allows monitoring tools to parse progress.
 ///
 /// Speed is calculated from bytes downloaded since the last progress display,
 /// which gives a more responsive speed indication than average speed.
@@ -9838,6 +9929,23 @@ fn handle_progress_display(ctx: &mut EventLoopContext<'_>) {
         100.0
     };
 
+    // JSON logging mode: emit structured event to stderr
+    if ctx.json_log {
+        let peer_count = ctx.connection_manager.active_count();
+        let event = ProgressEvent::new(
+            verified as u32,
+            total as u32,
+            percent,
+            speed_bytes_per_sec as u64,
+            peer_count,
+        );
+        if let Ok(json) = event.to_json() {
+            eprintln!("{}", json);
+        }
+        return;
+    }
+
+    // Human-readable output mode (default)
     // Estimate time remaining based on current speed
     let remaining_bytes = total_bytes.saturating_sub(current_bytes);
     let eta = if speed_bytes_per_sec > 0.0 {
@@ -10362,6 +10470,108 @@ mod event_loop_tests {
         let eta = format_duration(20000.0);
         assert!(eta.contains("h"));
         assert!(!eta.contains("d")); // Less than a day
+    }
+}
+@
+
+\subsection{Progress Event JSON Serialization Tests}
+
+We test the [[ProgressEvent]] struct to ensure it produces valid JSON with all
+required fields. This is critical for integration with monitoring tools.
+
+<<progress event tests>>=
+#[cfg(test)]
+mod progress_event_tests {
+    use super::*;
+
+    #[test]
+    fn progress_event_serializes_to_valid_json() {
+        let event = ProgressEvent::new(
+            42,    // pieces_done
+            100,   // pieces_total
+            42.0,  // percentage
+            1048576, // download_speed_bps (1 MB/s)
+            5,     // peer_count
+        );
+
+        let json = event.to_json().expect("serialization should not fail");
+
+        // Verify it's valid JSON by parsing it back
+        let parsed: serde_json::Value = serde_json::from_str(&json)
+            .expect("output should be valid JSON");
+
+        // Verify all required fields are present
+        assert!(parsed.get("timestamp").is_some(), "missing timestamp field");
+        assert!(parsed.get("event_type").is_some(), "missing event_type field");
+        assert!(parsed.get("pieces_done").is_some(), "missing pieces_done field");
+        assert!(parsed.get("pieces_total").is_some(), "missing pieces_total field");
+        assert!(parsed.get("percentage").is_some(), "missing percentage field");
+        assert!(parsed.get("download_speed_bps").is_some(), "missing download_speed_bps field");
+        assert!(parsed.get("upload_speed_bps").is_some(), "missing upload_speed_bps field");
+        assert!(parsed.get("peer_count").is_some(), "missing peer_count field");
+    }
+
+    #[test]
+    fn progress_event_has_correct_field_values() {
+        let event = ProgressEvent::new(50, 100, 50.0, 2097152, 10);
+        let json = event.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["event_type"], "progress");
+        assert_eq!(parsed["pieces_done"], 50);
+        assert_eq!(parsed["pieces_total"], 100);
+        assert_eq!(parsed["percentage"], 50.0);
+        assert_eq!(parsed["download_speed_bps"], 2097152);
+        assert_eq!(parsed["upload_speed_bps"], 0);
+        assert_eq!(parsed["peer_count"], 10);
+    }
+
+    #[test]
+    fn progress_event_timestamp_is_iso8601() {
+        let event = ProgressEvent::new(0, 100, 0.0, 0, 0);
+        let json = event.to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let timestamp = parsed["timestamp"].as_str().unwrap();
+
+        // ISO 8601 format should contain date separator and time separator
+        assert!(timestamp.contains("T"), "timestamp should be ISO 8601 format");
+        // Should end with Z or timezone offset
+        assert!(
+            timestamp.ends_with('Z') || timestamp.contains('+') || timestamp.contains("-"),
+            "timestamp should have timezone info"
+        );
+    }
+
+    #[test]
+    fn progress_event_handles_zero_values() {
+        let event = ProgressEvent::new(0, 0, 0.0, 0, 0);
+        let json = event.to_json().expect("zero values should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["pieces_done"], 0);
+        assert_eq!(parsed["pieces_total"], 0);
+        assert_eq!(parsed["percentage"], 0.0);
+        assert_eq!(parsed["download_speed_bps"], 0);
+        assert_eq!(parsed["peer_count"], 0);
+    }
+
+    #[test]
+    fn progress_event_handles_large_values() {
+        // 4 billion pieces, 10 GB/s download speed
+        let event = ProgressEvent::new(
+            u32::MAX,
+            u32::MAX,
+            100.0,
+            10 * 1024 * 1024 * 1024, // 10 GB/s
+            1000,
+        );
+        let json = event.to_json().expect("large values should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["pieces_done"], u32::MAX);
+        assert_eq!(parsed["pieces_total"], u32::MAX);
+        assert_eq!(parsed["download_speed_bps"], 10 * 1024 * 1024 * 1024_u64);
     }
 }
 @

@@ -490,6 +490,7 @@ async fn run_download(args: &Args) -> Result<(), ClientRunError> {
         last_progress_bytes: &mut last_progress_bytes,
         last_progress_time: &mut last_progress_time,
         download_start_time,
+        json_log: args.json_log,
     };
 
     // Step 9: Run the event loop

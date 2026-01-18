@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-18 09:47'
-updated_date: '2026-01-18 11:02'
+updated_date: '2026-01-18 11:06'
 labels:
   - reliability
   - performance
@@ -33,26 +33,9 @@ Add detection and removal of connections that haven't transmitted useful data fo
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented connection health monitoring for stale peer detection.
-
-**Changes:**
-- Added `last_useful_activity` field to `PeerConnection` struct to track when a peer last provided useful data
-- Added `mark_useful_activity()` method to update this timestamp
-- Added `PEER_STALE_TIMEOUT_SECS` (180s) and `STALE_PEER_CHECK_INTERVAL_SECS` (30s) constants
-- Added `StalePeerCheck` event to `EventLoopEvent` enum
-- Updated message handlers to call `mark_useful_activity()` on:
-  - `Message::Unchoke` - allows requesting data
-  - `Message::Have` - piece availability update
-  - `Message::Bitfield` - initial peer state
-  - `Message::Piece` - actual block data
-- Added `handle_stale_peer_check()` function that runs every 30 seconds
-- Added unit tests for the new functionality
-
-**Key insight:** The distinction between "idle" and "stale" is important:
-- Idle timeout (existing): no messages at all, including keep-alives (dead connection)
-- Stale timeout (new): no useful data, but may be sending keep-alives (alive but useless)
-
-Peers that only send keep-alives consume connection slots without contributing to download progress. This change detects and disconnects them to free slots for more productive peers.
-
-**Files modified:** `nw/07-client.nw`
+Added stale peer detection (180s timeout, 30s check interval):
+- last_useful_activity tracking on Unchoke/Have/Bitfield/Piece
+- handle_stale_peer_check() disconnects stale peers
+- Integrated into event loop with StalePeerCheck event
+Note: AC#6 partial - behavioral test requires complex mocking
 <!-- SECTION:NOTES:END -->
