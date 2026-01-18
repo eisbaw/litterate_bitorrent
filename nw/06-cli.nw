@@ -939,6 +939,23 @@ fn format_disk_error(error: &crate::disk::DiskError) -> String {
                 path.display(), offset, source, suggestion
             )
         }
+        DiskError::ReadError { path, offset, source } => {
+            let suggestion = if source.kind() == std::io::ErrorKind::NotFound {
+                "The file may have been deleted or moved."
+            } else if source.kind() == std::io::ErrorKind::PermissionDenied {
+                "Check that you have read permission for this file."
+            } else {
+                "The file may be corrupt or inaccessible."
+            };
+            format!(
+                "Error: Could not read from file '{}' at position {}.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 {}",
+                path.display(), offset, source, suggestion
+            )
+        }
     }
 }
 @

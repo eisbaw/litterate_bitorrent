@@ -294,9 +294,10 @@ in context, or extract the implementation to compile and run.
 
 \section{The Main Program}
 
-We begin with the entry point. For now, this is a minimal hello-world to verify
-the tangle pipeline works correctly. As we develop each subsystem, we will
-expand this into a complete client.
+The entry point ties together all the components we've built: CLI parsing,
+torrent file loading, tracker announces, peer connections, and the event loop.
+The main function orchestrates these in sequence, handling errors gracefully
+and providing feedback to the user.
 
 <<main.rs>>=
 // GENERATED CODE - DO NOT EDIT
@@ -306,15 +307,418 @@ expand this into a complete client.
 //! Literate BitTorrent Client binary.
 //!
 //! This is the entry point for the command-line BitTorrent client.
+//! It coordinates: CLI parsing, torrent loading, tracker announces,
+//! peer connections, and the download event loop.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use literate_bittorrent::cli::{
+    Args, ClientRunError, init_logging, validate_args, format_user_error,
+};
+use literate_bittorrent::client::{
+    EventLoopAction, EventLoopContext, PeerConnectionManager, PeerRequestQueue,
+    ShutdownController, connect_with_timeout, generate_peer_id, install_signal_handler,
+    perform_graceful_shutdown, perform_handshake, run_event_loop, send_completed_announce,
+};
+use literate_bittorrent::messages::Handshake;
+use literate_bittorrent::disk::create_output_files;
+use literate_bittorrent::metainfo::{self, FileInfo, Metainfo};
+use literate_bittorrent::pieces::{InProgressPiece, PieceAvailability, PieceManager};
+use literate_bittorrent::tracker::{announce, AnnounceResult, TrackerEvent, TrackerRequest};
+
+/// Maximum number of concurrent peer connections.
+const MAX_PEER_CONNECTIONS: usize = 50;
+
+/// Default tracker re-announce interval if tracker doesn't specify one.
+#[allow(dead_code)]
+const DEFAULT_TRACKER_INTERVAL: u64 = 1800; // 30 minutes
 
 fn main() {
-    println!("Literate BitTorrent Client");
-    println!("A pedagogical implementation");
+    // Build the tokio runtime
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    // Run the async main and handle the result
+    let exit_code = runtime.block_on(async_main());
+    std::process::exit(exit_code);
+}
+
+async fn async_main() -> i32 {
+    // Parse CLI arguments
+    let args = Args::parse_args();
+
+    // Initialize logging based on verbose flag
+    init_logging(args.verbose);
+
+    // Validate arguments
+    let validation = match validate_args(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return 1;
+        }
+    };
+
+    // Print any warnings
+    for warning in &validation.warnings {
+        eprintln!("{}", warning);
+    }
+
+    // Run the download
+    match run_download(&args).await {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{}", format_user_error(&e));
+            1
+        }
+    }
+}
+
+/// Runs the complete download process.
+async fn run_download(args: &Args) -> Result<(), ClientRunError> {
+    // Step 1: Load and parse torrent file
+    tracing::info!(path = %args.torrent.display(), "loading torrent file");
+    let torrent_data = std::fs::read(&args.torrent)?;
+    let metainfo = metainfo::parse(&torrent_data)?;
+
+    print_torrent_info(&metainfo);
+
+    // Step 2: Setup shutdown handling
+    let shutdown = Arc::new(ShutdownController::new());
+    install_signal_handler(shutdown.clone());
+
+    // Step 3: Create output directory and files
+    tracing::info!(dir = %args.output.display(), "creating output files");
+    let files = get_file_list(&metainfo);
+    create_output_files(&args.output, &files)?;
+
+    // Step 4: Generate peer ID and initialize piece manager
+    let peer_id = generate_peer_id();
+    let num_pieces = metainfo.piece_hashes.len() as u32;
+    let mut piece_manager = PieceManager::new(
+        metainfo.piece_length,
+        metainfo.total_length,
+        metainfo.piece_hashes.clone(),
+    )?;
+
+    // Step 5: Check for resume (pre-existing verified pieces)
+    let verified_before = check_resume(&args.output, &files, &metainfo, &mut piece_manager);
+    if verified_before > 0 {
+        tracing::info!(
+            pieces = verified_before,
+            total = num_pieces,
+            "resuming download with {} pieces already verified",
+            verified_before
+        );
+    }
+
+    // Check if already complete
+    if piece_manager.is_complete() {
+        println!("Download already complete!");
+        return Ok(());
+    }
+
+    // Step 6: Announce to tracker
+    tracing::info!(tracker = %metainfo.announce, "announcing to tracker");
+    let announce_result = initial_announce(&metainfo, &peer_id, args.port, &piece_manager).await?;
+
+    println!(
+        "Tracker returned {} peers (interval: {}s)",
+        announce_result.peers.len(),
+        announce_result.interval
+    );
+
+    if announce_result.peers.is_empty() {
+        eprintln!("Warning: No peers available. Download may not progress.");
+    }
+
+    // Step 7: Initialize connection manager and add peers to available pool
+    let mut connection_manager = PeerConnectionManager::new(
+        peer_id,
+        metainfo.info_hash,
+        num_pieces as usize,
+        MAX_PEER_CONNECTIONS,
+    );
+    connection_manager.add_peers(announce_result.peers.clone());
+
+    // Connect to initial batch of peers
+    tracing::info!("connecting to peers...");
+    let connected = connect_initial_peers(
+        &mut connection_manager,
+        &metainfo.info_hash,
+        &peer_id,
+        num_pieces as usize,
+    ).await;
+    tracing::info!(connected = connected, "initial peer connections established");
+
+    if connected == 0 && announce_result.peers.is_empty() {
+        eprintln!("Warning: No peers available. Download may not progress.");
+    } else if connected == 0 {
+        eprintln!("Warning: Could not connect to any peers. Download may not progress.");
+    }
+
+    // Step 8: Setup event loop context
+    let mut availability = PieceAvailability::new(num_pieces as usize);
+    let mut request_queues: HashMap<std::net::SocketAddr, PeerRequestQueue> = HashMap::new();
+    let mut in_progress_pieces: HashMap<u32, InProgressPiece> = HashMap::new();
+    let mut download_complete = false;
+    let mut re_announce_failures: u32 = 0;
+    let mut last_progress_bytes: u64 = piece_manager.bytes_verified();
+    let mut last_progress_time = std::time::Instant::now();
+    let download_start_time = std::time::Instant::now();
+    let tracker_interval = announce_result.interval.max(60); // At least 60 seconds
+
+    let mut ctx = EventLoopContext {
+        connection_manager: &mut connection_manager,
+        piece_manager: &mut piece_manager,
+        availability: &mut availability,
+        shutdown: &shutdown,
+        request_queues: &mut request_queues,
+        in_progress_pieces: &mut in_progress_pieces,
+        piece_hashes: &metainfo.piece_hashes,
+        num_pieces,
+        our_peer_id: peer_id,
+        tracker_interval,
+        download_complete: &mut download_complete,
+        metainfo: &metainfo,
+        info_hash: metainfo.info_hash,
+        port: args.port,
+        re_announce_failures: &mut re_announce_failures,
+        last_progress_bytes: &mut last_progress_bytes,
+        last_progress_time: &mut last_progress_time,
+        download_start_time,
+    };
+
+    // Step 9: Run the event loop
+    println!("Starting download...");
+    let action = run_event_loop(&mut ctx).await;
+
+    // Step 10: Handle the result
+    match action {
+        EventLoopAction::Complete => {
+            println!("Download complete!");
+
+            // Send completed announce to tracker
+            let _ = send_completed_announce(
+                &metainfo.announce,
+                &metainfo.info_hash,
+                &peer_id,
+                args.port,
+                0, // uploaded
+                metainfo.total_length,
+            ).await;
+
+            Ok(())
+        }
+        EventLoopAction::ShutdownRequested => {
+            println!("Shutdown requested, performing graceful shutdown...");
+            let exit_code = perform_graceful_shutdown(
+                &metainfo,
+                &peer_id,
+                args.port,
+                0, // uploaded
+                piece_manager.bytes_verified(),
+            ).await;
+
+            if exit_code == 0 {
+                Ok(())
+            } else {
+                // Return an I/O error to indicate interrupted
+                Err(ClientRunError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "download interrupted by user",
+                )))
+            }
+        }
+        EventLoopAction::Error(e) => {
+            eprintln!("Event loop error: {}", e);
+            Err(ClientRunError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e,
+            )))
+        }
+        EventLoopAction::Continue => {
+            // Should not happen - event loop should not return Continue
+            unreachable!("Event loop returned Continue unexpectedly")
+        }
+    }
+}
+
+/// Prints information about the torrent being downloaded.
+fn print_torrent_info(metainfo: &Metainfo) {
+    println!("Torrent: {}", metainfo.name);
+    println!("  Size: {} ({} pieces)", format_bytes(metainfo.total_length), metainfo.piece_hashes.len());
+    println!("  Piece size: {}", format_bytes(metainfo.piece_length as u64));
+    println!("  Tracker: {}", metainfo.announce);
+}
+
+/// Formats a byte count as a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+
+/// Gets the list of files from the metainfo.
+fn get_file_list(metainfo: &Metainfo) -> Vec<FileInfo> {
+    if metainfo.files.is_empty() {
+        // Single-file torrent
+        vec![FileInfo {
+            length: metainfo.total_length,
+            path: std::path::PathBuf::from(&metainfo.name),
+        }]
+    } else {
+        // Multi-file torrent
+        metainfo.files.clone()
+    }
+}
+
+/// Performs the initial tracker announce with the Started event.
+async fn initial_announce(
+    metainfo: &Metainfo,
+    peer_id: &[u8; 20],
+    port: u16,
+    piece_manager: &PieceManager,
+) -> Result<AnnounceResult, ClientRunError> {
+    let bytes_verified = piece_manager.bytes_verified();
+    let left = metainfo.total_length.saturating_sub(bytes_verified);
+
+    let request = TrackerRequest {
+        info_hash: metainfo.info_hash,
+        peer_id: *peer_id,
+        port,
+        uploaded: 0,
+        downloaded: bytes_verified,
+        left,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    announce(metainfo, request).await.map_err(ClientRunError::from)
+}
+
+/// Checks for existing files and verifies pieces for resume support.
+///
+/// Returns the number of pieces that were already verified.
+fn check_resume(
+    output_dir: &std::path::Path,
+    files: &[FileInfo],
+    metainfo: &Metainfo,
+    piece_manager: &mut PieceManager,
+) -> usize {
+    use literate_bittorrent::disk::read_piece;
+    use literate_bittorrent::pieces::verify_piece;
+
+    let mut verified_count = 0;
+    let num_pieces = metainfo.piece_hashes.len();
+
+    // Check if the output files exist
+    let first_file_path = output_dir.join(&files[0].path);
+    if !first_file_path.exists() {
+        return 0;
+    }
+
+    tracing::info!("checking for resumable pieces...");
+
+    for piece_index in 0..num_pieces {
+        // Try to read the piece from disk
+        let piece_data = match read_piece(
+            piece_index as u32,
+            metainfo.piece_length,
+            metainfo.total_length,
+            output_dir,
+            files,
+        ) {
+            Ok(data) => data,
+            Err(_) => continue, // Piece not readable, skip
+        };
+
+        // Verify the piece hash
+        let expected_hash = &metainfo.piece_hashes[piece_index];
+        if verify_piece(piece_index as u32, &piece_data, expected_hash).is_ok() {
+            // Mark as verified in the piece manager
+            if piece_manager.mark_verified(piece_index as u32).is_ok() {
+                verified_count += 1;
+            }
+        }
+    }
+
+    verified_count
+}
+
+/// Connect to an initial batch of peers from the available pool.
+///
+/// This function pops peers from the available queue, attempts to connect
+/// and perform handshakes, and registers successful connections.
+///
+/// Returns the number of peers successfully connected.
+async fn connect_initial_peers(
+    connection_manager: &mut PeerConnectionManager,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    _num_pieces: usize,
+) -> usize {
+    const MAX_INITIAL_CONNECTIONS: usize = 10;
+    const MAX_ATTEMPTS: usize = 20;
+
+    let our_handshake = Handshake::new(*info_hash, *peer_id);
+    let mut connected = 0;
+    let mut attempts = 0;
+
+    while connected < MAX_INITIAL_CONNECTIONS && attempts < MAX_ATTEMPTS {
+        let addr = match connection_manager.pop_available() {
+            Some(a) => a,
+            None => break, // No more peers available
+        };
+        attempts += 1;
+
+        tracing::debug!(peer = %addr, "attempting connection");
+
+        // Try to connect
+        let mut stream = match connect_with_timeout(addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(peer = %addr, error = %e, "connection failed");
+                continue;
+            }
+        };
+
+        // Perform handshake
+        let peer_handshake = match perform_handshake(&mut stream, &our_handshake, info_hash).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(peer = %addr, error = %e, "handshake failed");
+                continue;
+            }
+        };
+
+        // Register the connection
+        if let Err(e) = connection_manager.register_connection(stream, addr, &peer_handshake) {
+            tracing::debug!(peer = %addr, error = %e, "failed to register connection");
+            continue;
+        }
+
+        tracing::info!(peer = %addr, "connected to peer");
+        connected += 1;
+    }
+
+    connected
 }
 @
 
-This minimal program serves as a smoke test: if [[notangle]] can extract it
-and [[rustc]] can compile it, our literate programming toolchain is working.
+The main program follows a clear sequence: parse arguments, load the torrent,
+announce to the tracker, connect to peers, and run the download event loop.
+Error handling uses the [[ClientRunError]] type to provide user-friendly
+messages for all failure modes.
 
 \section{Library Structure}
 

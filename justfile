@@ -120,3 +120,16 @@ view:
 # Run the client with a torrent file
 run torrent:
     cargo run -- {{torrent}}
+
+# Download: run the client with ubuntu torrent for manual testing
+# Creates a ./downloads directory for output
+# Usage: just download
+download: tangle build
+    @mkdir -p downloads
+    cargo run -- tests/fixtures/ubuntu.torrent -o ./downloads -v
+
+# Download with custom output directory
+# Usage: just download-to /path/to/output
+download-to output: tangle build
+    @mkdir -p {{output}}
+    cargo run -- tests/fixtures/ubuntu.torrent -o {{output}} -v

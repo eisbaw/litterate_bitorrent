@@ -303,6 +303,8 @@ The disk module combines the error types and file creation logic.
 
 <<write piece>>
 
+<<read piece>>
+
 <<disk tests>>
 @
 
@@ -1566,4 +1568,119 @@ Note that we don't call [[sync\_data]] or [[sync\_all]] after each write. While
 this means data might be lost on a crash, it significantly improves performance.
 For a production client, you might periodically sync to disk or sync after
 writing each piece, depending on your durability requirements.
+
+\subsection{Reading Pieces for Resume}
+
+When resuming an interrupted download, we need to check which pieces were already
+written to disk and verify their hashes. The [[read\_piece]] function reads a
+piece from the output files, handling the case where a piece spans multiple files.
+
+We add a read error variant to [[DiskError]].
+
+<<disk write error>>=
+
+    /// Failed to read data from a file.
+    ///
+    /// This can happen if:
+    /// - File does not exist or was deleted
+    /// - Permission denied
+    /// - File is shorter than expected
+    #[error("failed to read from {path} at offset {offset}: {source}")]
+    ReadError {
+        /// The file path we were reading from.
+        path: PathBuf,
+        /// The byte offset where the read failed.
+        offset: u64,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+@
+
+<<read piece>>=
+use std::io::Read;
+
+/// Reads piece data from the output files.
+///
+/// This function is used for resume support: when restarting a download,
+/// we read pieces from disk and verify their hashes to determine which
+/// pieces were already downloaded correctly.
+///
+/// # Arguments
+///
+/// * `piece_index` - Index of the piece to read
+/// * `piece_length` - Standard piece length from metainfo
+/// * `total_length` - Total size of all files combined
+/// * `output_dir` - Base directory where files are stored
+/// * `files` - List of files from the torrent's metainfo
+///
+/// # Returns
+///
+/// The piece data as a byte vector.
+///
+/// # Errors
+///
+/// Returns `DiskError::ReadError` if:
+/// - A file cannot be opened for reading
+/// - Seeking to the correct offset fails
+/// - Reading the data fails
+///
+/// # Example
+///
+/// ```ignore
+/// // Read piece 5 for verification
+/// let data = read_piece(5, 262144, 1_000_000, output_dir, &files)?;
+/// if verify_piece(5, &data, &expected_hash).is_ok() {
+///     // Piece is valid, mark as complete
+/// }
+/// ```
+pub fn read_piece(
+    piece_index: u32,
+    piece_length: u32,
+    total_length: u64,
+    output_dir: &Path,
+    files: &[FileInfo],
+) -> Result<Vec<u8>, DiskError> {
+    let slices = map_piece_to_files(piece_index, piece_length, total_length, files);
+
+    // Calculate total piece size
+    let piece_size: u64 = slices.iter().map(|s| s.length).sum();
+    let mut data = vec![0u8; piece_size as usize];
+    let mut data_offset: usize = 0;
+
+    for slice in slices {
+        let file_info = &files[slice.file_index];
+        let full_path = output_dir.join(&file_info.path);
+
+        // Open file for reading
+        let mut file = std::fs::File::open(&full_path)
+            .map_err(|e| DiskError::ReadError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        // Seek to the correct position
+        file.seek(SeekFrom::Start(slice.file_offset))
+            .map_err(|e| DiskError::SeekError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        // Read the data into the buffer
+        let slice_len = slice.length as usize;
+        file.read_exact(&mut data[data_offset..data_offset + slice_len])
+            .map_err(|e| DiskError::ReadError {
+                path: full_path.clone(),
+                offset: slice.file_offset,
+                source: e,
+            })?;
+
+        data_offset += slice_len;
+    }
+
+    Ok(data)
+}
+@
 

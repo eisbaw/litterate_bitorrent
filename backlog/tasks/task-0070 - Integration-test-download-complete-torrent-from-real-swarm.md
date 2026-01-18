@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:30'
-updated_date: '2026-01-18 03:39'
+updated_date: '2026-01-18 03:41'
 labels:
   - phase-6
   - integration-test
@@ -51,31 +51,11 @@ End-to-end integration test that downloads a real torrent from a public swarm. T
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Summary
-Implemented integration test that downloads a complete piece from a real BitTorrent swarm.
-
-## What was done
-- Created tests/download_integration.rs with test_download_piece_from_swarm()
-- Test connects to Ubuntu torrent tracker, gets peer list
-- Connects to peer, performs handshake, receives bitfield/unchoke
-- Downloads all blocks for one complete piece (256 KiB)
-- Verifies SHA1 hash matches torrent metadata
-- Writes piece to disk via tempfile
-- Verifies disk content matches downloaded data
-
-## Test features
-- 5-minute overall timeout
-- Tries up to 15 peers for reliability
+Added tests/download_integration.rs - Phase 6 exit criteria test:
+- Downloads complete piece from real Ubuntu swarm
+- Verifies SHA1 hash against torrent metadata
+- Writes to disk and verifies content
+- 5-minute timeout, tries up to 15 peers
 - Uses tempfile for automatic cleanup
-- Documents test torrent in header comments
-- Marked with #[ignore] for network requirement
-
-## Files changed
-- tests/download_integration.rs (new)
-
-## Verification
-- just tangle: pass
-- just lint: pass
-- just test: pass (895 tests)
-- just e2e: pass (downloads piece 4734 from Ubuntu swarm)
+- Marked #[ignore], run with just e2e
 <!-- SECTION:NOTES:END -->
