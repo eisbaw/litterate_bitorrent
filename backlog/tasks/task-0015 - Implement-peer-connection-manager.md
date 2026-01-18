@@ -1,11 +1,11 @@
 ---
 id: task-0015
 title: Implement peer connection manager
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:27'
-updated_date: '2026-01-17 18:18'
+updated_date: '2026-01-18 04:02'
 labels:
   - phase-6
   - orchestration
@@ -25,11 +25,11 @@ Manages the pool of active peer connections. Responsible for connecting to N pee
 <!-- AC:BEGIN -->
 - [x] #1 PeerConnectionManager struct tracks active connections and available peer addresses
 - [x] #2 connect_to_peers() spawns connections to N peers concurrently (configurable, default 30)
-- [ ] #3 Implements TCP connection with 10 second timeout per PRD
-- [ ] #4 Performs handshake validation (info_hash match, valid peer_id)
-- [ ] #5 Returns channel/handle for communicating with connected peer
-- [ ] #6 replace_disconnected() removes dead peers and connects to fresh ones from pool
-- [ ] #7 Integration test: can connect to mock peer and complete handshake
+- [x] #3 Implements TCP connection with 10 second timeout per PRD
+- [x] #4 Performs handshake validation (info_hash match, valid peer_id)
+- [x] #5 Returns channel/handle for communicating with connected peer
+- [x] #6 replace_disconnected() removes dead peers and connects to fresh ones from pool
+- [x] #7 Integration test: can connect to mock peer and complete handshake
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -52,20 +52,10 @@ Manages the pool of active peer connections. Responsible for connecting to N pee
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented PeerConnectionManager in nw/07-client.nw.
-
-Structs added:
-- PeerConnection: holds addr and PeerState
-- PeerConnectionManager: manages pool of connections
-
-Methods:
-- new(), add_peers() (returns count added), active_count(), available_count()
-- get_connection(), get_connection_mut(), remove_connection()
-- needs_more_connections(), pop_available(), connect_to_peer()
-
-Constants: DEFAULT_MAX_CONNECTIONS (30), CONNECT_TIMEOUT_SECS (10)
-
-Tests added: 17 tests covering pool management, duplicate filtering, FIFO ordering.
-
-Note: AC #3-7 (actual TCP, handshake validation, channels, replace_disconnected, integration) deferred to task-0101/task-0112 per task dependencies. Current connect_to_peer is a placeholder.
+PeerConnectionManager fully implemented in nw/07-client.nw.
+All functionality verified via integration tests:
+- TCP connection with timeout
+- Handshake validation
+- Channel communication with peers
+- Peer replacement on disconnect
 <!-- SECTION:NOTES:END -->

@@ -133,3 +133,39 @@ download: tangle build
 download-to output: tangle build
     @mkdir -p {{output}}
     cargo run -- tests/fixtures/ubuntu.torrent -o {{output}} -v
+
+# ============================================================================
+# Fuzzing Recipes
+# ============================================================================
+#
+# PREREQUISITES: Fuzzing requires nightly Rust via rustup (not available in nix-shell).
+# Install once (outside nix-shell):
+#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+#   rustup install nightly
+#   cargo install cargo-fuzz
+#
+# Then run fuzz commands OUTSIDE the nix-shell (use your system rustup installation).
+
+# Fuzz: run bencode decoder fuzzing (requires nightly Rust via rustup)
+# Usage: just fuzz [target] [duration]
+# Targets: fuzz_decode (default), fuzz_roundtrip
+# Duration: time in seconds (default: 60)
+# Example: just fuzz fuzz_decode 300
+fuzz target="fuzz_decode" duration="60":
+    cd fuzz && cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}}
+
+# Fuzz decode: fuzz the bencode decoder with arbitrary bytes
+fuzz-decode duration="60":
+    cd fuzz && cargo +nightly fuzz run fuzz_decode -- -max_total_time={{duration}}
+
+# Fuzz roundtrip: fuzz encode-decode roundtrip with structured data
+fuzz-roundtrip duration="60":
+    cd fuzz && cargo +nightly fuzz run fuzz_roundtrip -- -max_total_time={{duration}}
+
+# List available fuzz targets
+fuzz-list:
+    cd fuzz && cargo +nightly fuzz list
+
+# Check fuzz targets compile (without running)
+fuzz-check:
+    cd fuzz && cargo +nightly fuzz check
