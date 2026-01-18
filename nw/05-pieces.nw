@@ -4321,7 +4321,7 @@ use std::time::Duration;
 /// Configuration for the request scheduler.
 ///
 /// These parameters control the scheduler's behavior regarding request
-/// pipelining and timeout handling.
+/// pipelining, timeout handling, and endgame mode.
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     /// Maximum concurrent requests per peer.
@@ -4342,6 +4342,18 @@ pub struct SchedulerConfig {
     ///
     /// Default: 30 seconds
     pub request_timeout: Duration,
+
+    /// Piece count threshold for activating endgame mode.
+    ///
+    /// When the number of remaining pieces (Missing or Failed) drops to
+    /// or below this threshold, endgame mode activates. In endgame mode,
+    /// blocks can be requested from multiple peers simultaneously, with
+    /// cancel messages sent when duplicates arrive.
+    ///
+    /// A value of 0 disables endgame mode entirely.
+    ///
+    /// Default: 5
+    pub endgame_threshold: u32,
 }
 
 impl Default for SchedulerConfig {
@@ -4349,6 +4361,7 @@ impl Default for SchedulerConfig {
         SchedulerConfig {
             pipeline_limit: 10,
             request_timeout: Duration::from_secs(30),
+            endgame_threshold: 5,
         }
     }
 }
@@ -4363,6 +4376,14 @@ impl SchedulerConfig {
     /// Creates a new configuration with custom timeout.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
+        self
+    }
+
+    /// Creates a new configuration with custom endgame threshold.
+    ///
+    /// Set to 0 to disable endgame mode entirely.
+    pub fn with_endgame_threshold(mut self, threshold: u32) -> Self {
+        self.endgame_threshold = threshold;
         self
     }
 }
@@ -4503,6 +4524,16 @@ pub struct RequestScheduler {
 
     /// Scheduler configuration.
     config: SchedulerConfig,
+
+    /// Endgame mode duplicate request tracking.
+    ///
+    /// In endgame mode, the same block may be requested from multiple peers.
+    /// This map tracks all peers who have been sent a request for each block,
+    /// enabling us to send cancel messages when a block arrives.
+    ///
+    /// The key is (piece_index, offset), and the value is a list of peers
+    /// who have outstanding requests for that block.
+    endgame_requests: HashMap<BlockKey, Vec<PeerId>>,
 }
 
 impl RequestScheduler {
@@ -4525,6 +4556,7 @@ impl RequestScheduler {
             pending: HashMap::new(),
             peer_request_counts: HashMap::new(),
             config,
+            endgame_requests: HashMap::new(),
         }
     }
 
@@ -4561,6 +4593,43 @@ impl RequestScheduler {
         self.pending.get(&key).map_or(false, |p| p.state == RequestState::InFlight)
     }
 
+    /// Checks if endgame mode should be active based on piece manager state.
+    ///
+    /// Endgame mode activates when the number of remaining pieces (those that
+    /// still need downloading) drops to or below the configured threshold.
+    /// This includes pieces in Missing or Failed state.
+    ///
+    /// # Arguments
+    ///
+    /// * `manager` - The piece manager to check for remaining piece count
+    ///
+    /// # Returns
+    ///
+    /// `true` if endgame mode should be active, `false` otherwise.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::{RequestScheduler, SchedulerConfig, PieceManager};
+    ///
+    /// let config = SchedulerConfig::default().with_endgame_threshold(5);
+    /// let scheduler = RequestScheduler::new(config);
+    ///
+    /// // 10 pieces, all Missing - not in endgame (10 > 5)
+    /// let hashes = vec![[0u8; 20]; 10];
+    /// let manager = PieceManager::new(16384, 163840, hashes).unwrap();
+    /// assert!(!scheduler.is_endgame_mode(&manager));
+    /// ```
+    pub fn is_endgame_mode(&self, manager: &PieceManager) -> bool {
+        let threshold = self.config.endgame_threshold;
+        if threshold == 0 {
+            // Endgame mode disabled
+            return false;
+        }
+        let remaining = manager.pending_count() as u32;
+        remaining <= threshold && remaining > 0
+    }
+
     /// Registers a new block request.
     ///
     /// The request is added to the pending set and the peer's request count
@@ -4588,6 +4657,156 @@ impl RequestScheduler {
         self.pending.insert(key, PendingRequest::new(request));
         *self.peer_request_counts.entry(peer).or_insert(0) += 1;
         true
+    }
+
+    /// Registers a duplicate block request in endgame mode.
+    ///
+    /// Unlike [[register_request]], this method allows requesting the same
+    /// block from multiple peers. It tracks all peers who have been sent
+    /// a request for the block, enabling cancel message generation when
+    /// the block arrives.
+    ///
+    /// The caller should verify that:
+    /// 1. Endgame mode is active (via [[is_endgame_mode]])
+    /// 2. The peer has available pipeline slots
+    /// 3. This peer hasn't already been sent this request
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The block request to register
+    ///
+    /// # Returns
+    ///
+    /// `true` if the request was registered for this peer, `false` if this
+    /// peer already has a pending request for this block.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::pieces::{RequestScheduler, SchedulerConfig, BlockRequest, BLOCK_SIZE};
+    ///
+    /// let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    /// let peer_a = *b"-RS0001-aaaaaaaaaaaa";
+    /// let peer_b = *b"-RS0001-bbbbbbbbbbbb";
+    ///
+    /// // In endgame mode, same block can be requested from multiple peers
+    /// let req_a = BlockRequest::new(0, 0, BLOCK_SIZE, peer_a);
+    /// let req_b = BlockRequest::new(0, 0, BLOCK_SIZE, peer_b);
+    ///
+    /// assert!(scheduler.register_endgame_request(req_a));
+    /// assert!(scheduler.register_endgame_request(req_b)); // Same block, different peer
+    /// assert!(!scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a))); // Same peer rejected
+    /// ```
+    pub fn register_endgame_request(&mut self, request: BlockRequest) -> bool {
+        let key = BlockKey::new(request.piece_index, request.offset);
+        let peer = request.peer;
+
+        // Check if this specific peer already has a request for this block
+        if let Some(peers) = self.endgame_requests.get(&key) {
+            if peers.contains(&peer) {
+                return false;
+            }
+        }
+
+        // If this is the first request for this block, also register normally
+        self.pending
+            .entry(key)
+            .or_insert_with(|| PendingRequest::new(request));
+
+        // Track this peer in endgame requests
+        self.endgame_requests
+            .entry(key)
+            .or_default()
+            .push(peer);
+
+        // Increment peer's request count
+        *self.peer_request_counts.entry(peer).or_insert(0) += 1;
+        true
+    }
+
+    /// Returns the list of peers with duplicate requests for a block.
+    ///
+    /// This is used during endgame mode to identify which peers need
+    /// cancel messages when a block is received from one peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index of the block
+    /// * `offset` - The byte offset of the block
+    ///
+    /// # Returns
+    ///
+    /// A list of peer IDs that have outstanding requests for this block,
+    /// or an empty list if the block has no endgame duplicates.
+    pub fn get_endgame_peers(&self, piece_index: u32, offset: u32) -> Vec<PeerId> {
+        let key = BlockKey::new(piece_index, offset);
+        self.endgame_requests.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// Completes a block request and returns peers needing cancel messages.
+    ///
+    /// This is the endgame-aware version of request completion. When a block
+    /// is received, this method:
+    /// 1. Removes the block from pending tracking
+    /// 2. Returns the list of other peers who have outstanding requests
+    ///    for this block (excluding the peer who sent the data)
+    ///
+    /// The caller should send cancel messages to all returned peers.
+    ///
+    /// # Arguments
+    ///
+    /// * `piece_index` - The piece index of the completed block
+    /// * `offset` - The byte offset of the completed block
+    /// * `from_peer` - The peer who sent the block data
+    ///
+    /// # Returns
+    ///
+    /// A tuple of:
+    /// - The completed request (if found)
+    /// - A vector of peers who need cancel messages (may be empty)
+    pub fn complete_endgame_request(
+        &mut self,
+        piece_index: u32,
+        offset: u32,
+        from_peer: &PeerId,
+    ) -> (Option<PendingRequest>, Vec<PeerId>) {
+        let key = BlockKey::new(piece_index, offset);
+
+        // Get list of peers to cancel (excluding the sender)
+        let cancel_peers: Vec<PeerId> = self
+            .endgame_requests
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p != from_peer)
+            .collect();
+
+        // Decrement request counts for cancelled peers
+        for peer in &cancel_peers {
+            if let Some(count) = self.peer_request_counts.get_mut(peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_request_counts.remove(peer);
+                }
+            }
+        }
+
+        // Remove from pending and complete normally
+        let completed = if let Some(mut pending) = self.pending.remove(&key) {
+            // Decrement sender's count
+            if let Some(count) = self.peer_request_counts.get_mut(from_peer) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.peer_request_counts.remove(from_peer);
+                }
+            }
+            pending.state = RequestState::Completed;
+            Some(pending)
+        } else {
+            None
+        };
+
+        (completed, cancel_peers)
     }
 
     /// Marks a block request as completed (data received).
@@ -5142,6 +5361,205 @@ fn scheduler_timed_out_can_be_reassigned() {
     assert_eq!(scheduler.pending_count(), 1);
     assert_eq!(scheduler.peer_request_count(&peer_b), 1);
     assert!(scheduler.is_block_pending(0, 0));
+}
+@
+
+\subsection{Endgame Mode Tests}
+
+These tests verify the endgame mode functionality: activation threshold,
+duplicate request tracking, and cancellation on block receipt.
+
+<<endgame mode tests>>=
+#[test]
+fn endgame_mode_activates_at_threshold() {
+    // AC #1 and AC #6: is_endgame_mode() returns true when remaining pieces below threshold
+    let config = SchedulerConfig::default().with_endgame_threshold(5);
+    let scheduler = RequestScheduler::new(config);
+
+    // Create a manager with 10 pieces
+    let hashes = vec![[0u8; 20]; 10];
+    let mut manager = PieceManager::new(16384, 163840, hashes).unwrap();
+
+    // All pieces missing (10) - not in endgame mode (10 > 5)
+    assert!(!scheduler.is_endgame_mode(&manager));
+
+    // Mark 5 pieces as verified, leaving 5 pending - now in endgame (5 <= 5)
+    for i in 0..5 {
+        manager.mark_verified(i).unwrap();
+    }
+    assert!(scheduler.is_endgame_mode(&manager));
+
+    // Mark 1 more, leaving 4 pending - still in endgame (4 <= 5)
+    manager.mark_verified(5).unwrap();
+    assert!(scheduler.is_endgame_mode(&manager));
+
+    // Mark all remaining - no pieces pending, not in endgame (0 remaining)
+    for i in 6..10 {
+        manager.mark_verified(i).unwrap();
+    }
+    assert!(!scheduler.is_endgame_mode(&manager));
+}
+
+#[test]
+fn endgame_mode_disabled_when_threshold_zero() {
+    // AC #5: Threshold is configurable, zero disables endgame
+    let config = SchedulerConfig::default().with_endgame_threshold(0);
+    let scheduler = RequestScheduler::new(config);
+
+    // Even with only 1 piece remaining, endgame is disabled
+    let hashes = vec![[0u8; 20]; 2];
+    let mut manager = PieceManager::new(16384, 32768, hashes).unwrap();
+    manager.mark_verified(0).unwrap(); // 1 piece remaining
+
+    assert!(!scheduler.is_endgame_mode(&manager));
+}
+
+#[test]
+fn endgame_config_builder() {
+    // AC #5: Threshold is configurable
+    let config = SchedulerConfig::default()
+        .with_endgame_threshold(10);
+    assert_eq!(config.endgame_threshold, 10);
+
+    let config2 = SchedulerConfig::default()
+        .with_endgame_threshold(0);
+    assert_eq!(config2.endgame_threshold, 0);
+}
+
+#[test]
+fn endgame_register_allows_duplicate_requests() {
+    // AC #2 and AC #7: In endgame mode, same block can be requested from multiple peers
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+    let peer_c: PeerId = *b"-RS0001-cccccccccccc";
+
+    // First request from peer A
+    let req_a = BlockRequest::new(0, 0, BLOCK_SIZE, peer_a);
+    assert!(scheduler.register_endgame_request(req_a));
+
+    // Same block from peer B - allowed in endgame
+    let req_b = BlockRequest::new(0, 0, BLOCK_SIZE, peer_b);
+    assert!(scheduler.register_endgame_request(req_b));
+
+    // Same block from peer C - also allowed
+    let req_c = BlockRequest::new(0, 0, BLOCK_SIZE, peer_c);
+    assert!(scheduler.register_endgame_request(req_c));
+
+    // But same peer requesting same block again - rejected
+    let req_a2 = BlockRequest::new(0, 0, BLOCK_SIZE, peer_a);
+    assert!(!scheduler.register_endgame_request(req_a2));
+
+    // Verify all three peers are tracked
+    let peers = scheduler.get_endgame_peers(0, 0);
+    assert_eq!(peers.len(), 3);
+    assert!(peers.contains(&peer_a));
+    assert!(peers.contains(&peer_b));
+    assert!(peers.contains(&peer_c));
+}
+
+#[test]
+fn endgame_tracks_duplicate_requests() {
+    // AC #3: Track duplicate requests across peers
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+
+    // Register requests for two different blocks, each from multiple peers
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_b));
+
+    scheduler.register_endgame_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_a));
+    scheduler.register_endgame_request(BlockRequest::new(0, BLOCK_SIZE, BLOCK_SIZE, peer_b));
+
+    // Block 0 has both peers
+    let peers_0 = scheduler.get_endgame_peers(0, 0);
+    assert_eq!(peers_0.len(), 2);
+
+    // Block 1 has both peers
+    let peers_1 = scheduler.get_endgame_peers(0, BLOCK_SIZE);
+    assert_eq!(peers_1.len(), 2);
+
+    // Non-requested block has no peers
+    let peers_none = scheduler.get_endgame_peers(999, 0);
+    assert!(peers_none.is_empty());
+}
+
+#[test]
+fn endgame_complete_returns_cancel_targets() {
+    // AC #4 and AC #8: On block receipt, cancel duplicates from other peers
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+    let peer_c: PeerId = *b"-RS0001-cccccccccccc";
+
+    // Request same block from all three peers
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_b));
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_c));
+
+    // Block arrives from peer B
+    let (completed, cancel_peers) = scheduler.complete_endgame_request(0, 0, &peer_b);
+
+    // Request should be marked complete
+    assert!(completed.is_some());
+    assert_eq!(completed.unwrap().state, RequestState::Completed);
+
+    // Should return peer A and C for cancellation (not peer B who sent it)
+    assert_eq!(cancel_peers.len(), 2);
+    assert!(cancel_peers.contains(&peer_a));
+    assert!(cancel_peers.contains(&peer_c));
+    assert!(!cancel_peers.contains(&peer_b));
+
+    // Endgame tracking should be cleared for this block
+    let remaining_peers = scheduler.get_endgame_peers(0, 0);
+    assert!(remaining_peers.is_empty());
+}
+
+#[test]
+fn endgame_complete_updates_peer_counts() {
+    // Verify peer request counts are properly decremented
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+    let peer_b: PeerId = *b"-RS0001-bbbbbbbbbbbb";
+
+    // Register endgame requests
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_b));
+
+    assert_eq!(scheduler.peer_request_count(&peer_a), 1);
+    assert_eq!(scheduler.peer_request_count(&peer_b), 1);
+
+    // Complete from peer A - both counts should decrement
+    let (_completed, cancel_peers) = scheduler.complete_endgame_request(0, 0, &peer_a);
+
+    assert_eq!(cancel_peers.len(), 1);
+    assert!(cancel_peers.contains(&peer_b));
+
+    // Both peers should have count 0 now
+    assert_eq!(scheduler.peer_request_count(&peer_a), 0);
+    assert_eq!(scheduler.peer_request_count(&peer_b), 0);
+}
+
+#[test]
+fn endgame_no_cancel_when_single_peer() {
+    // When block was only requested from one peer, no cancellations needed
+    let mut scheduler = RequestScheduler::new(SchedulerConfig::default());
+    let peer_a: PeerId = *b"-RS0001-aaaaaaaaaaaa";
+
+    scheduler.register_endgame_request(BlockRequest::new(0, 0, BLOCK_SIZE, peer_a));
+
+    let (completed, cancel_peers) = scheduler.complete_endgame_request(0, 0, &peer_a);
+
+    assert!(completed.is_some());
+    assert!(cancel_peers.is_empty()); // No other peers to cancel
+}
+
+#[test]
+fn endgame_threshold_default_is_five() {
+    // Verify default threshold matches AC requirements
+    let config = SchedulerConfig::default();
+    assert_eq!(config.endgame_threshold, 5);
 }
 @
 
@@ -5714,27 +6132,44 @@ For a typical download, endgame mode lasts only a few seconds and dramatically
 improves perceived completion time. The user sees the download ``sprint to the
 finish'' rather than crawling at the speed of the slowest peer.
 
-\subsubsection{Implementation Status}
+\subsubsection{Implementation}
 
-Our current implementation does \emph{not} include endgame mode. The scheduler
-enforces strict duplicate avoidance: once a block is requested from one peer,
-it cannot be requested from another until the first request times out (30
-seconds by default).
+Our implementation includes endgame mode, activated when few pieces remain.
+The [[RequestScheduler]] provides the following endgame-specific functionality:
 
-Endgame mode is documented here as an important optimization that production
-clients implement. Adding it would require:
+\begin{description}
+\item[is\_endgame\_mode()] Checks if the remaining piece count has dropped to
+  or below the configured threshold (default 5 pieces). Returns [[true]] when
+  endgame mode should be active.
+
+\item[register\_endgame\_request()] Registers a block request that may duplicate
+  an existing request to another peer. Unlike [[register\_request]], this method
+  allows the same block to be requested from multiple peers simultaneously.
+
+\item[get\_endgame\_peers()] Returns the list of peers who have been sent
+  requests for a specific block. Used to identify cancellation targets.
+
+\item[complete\_endgame\_request()] Completes a block and returns the list of
+  other peers who need cancel messages. The caller sends [[Cancel]] messages
+  to these peers to avoid wasting their upload bandwidth.
+\end{description}
+
+The endgame threshold is configurable via [[SchedulerConfig::endgame\_threshold]].
+Set to 0 to disable endgame mode entirely.
+
+\paragraph{Usage Pattern}
+
+When downloading, the caller should:
 
 \begin{enumerate}
-\item A flag in [[RequestScheduler]] to indicate endgame mode is active
-\item Modification of [[is_block_pending]] to return which peer(s) have pending
-  requests, not just whether any request is pending
-\item Logic to detect when endgame mode should be entered
-\item Cancel message generation when duplicate blocks arrive
+\item Check [[is\_endgame\_mode]] before registering requests
+\item In endgame mode, use [[register\_endgame\_request]] to allow duplicates
+\item On block receipt, use [[complete\_endgame\_request]] to get cancel targets
+\item Send [[Cancel]] messages to all returned peers
 \end{enumerate}
 
-For a teaching implementation, the added complexity may not be worth the
-benefit. Downloads still complete correctly; they simply don't have the
-final-sprint optimization.
+This implementation adds minimal complexity while providing the ``sprint to
+finish'' optimization that dramatically improves end-of-download performance.
 
 \subsection{Strategy Tradeoffs and Swarm Health}
 
@@ -5857,10 +6292,10 @@ A healthy BitTorrent swarm exhibits these properties:
 \end{enumerate}
 
 Our implementation contributes to swarm health by following the canonical
-strategies: rarest-first piece selection, fair request distribution, and
-timeout-based reassignment. While we omit some optimizations (endgame mode,
-dynamic pipeline adjustment, bad peer detection), the core algorithms ensure
-we're a good citizen in any swarm we join.
+strategies: rarest-first piece selection, fair request distribution,
+timeout-based reassignment, and endgame mode for fast completion. While we
+omit some optimizations (dynamic pipeline adjustment, bad peer detection),
+the core algorithms ensure we're a good citizen in any swarm we join.
 
 \subsection{Module Assembly}
 
@@ -5964,6 +6399,8 @@ mod tests {
     <<request scheduler tests>>
 
     <<request scheduler timeout tests>>
+
+    <<endgame mode tests>>
 
     <<strategy integration tests>>
 }
