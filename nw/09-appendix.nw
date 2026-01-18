@@ -570,6 +570,59 @@ in this document provides a solid foundation for all of them.
 \end{description}
 
 
+\section{Safety Properties}
+\label{sec:safety}
+
+This crate is written entirely in safe Rust. No \texttt{unsafe} blocks appear in
+the literate sources (\texttt{nw/*.nw}) or generated code (\texttt{src/*.rs}).
+This property can be verified by searching for the \texttt{unsafe} keyword:
+
+\begin{verbatim}
+grep -r "unsafe" nw/*.nw src/*.rs
+\end{verbatim}
+
+\subsection{Rationale}
+
+The PRD for this project specifies ``no unsafe unless justified.'' For a
+pedagogical BitTorrent client, safety is more valuable than the marginal
+performance gains that unsafe code might provide. Every algorithm in this
+implementation uses safe abstractions:
+
+\begin{itemize}
+\item \textbf{Bencode parsing}: Uses iterators and slice operations, never raw pointer arithmetic
+\item \textbf{Network I/O}: Tokio's safe async abstractions handle all socket operations
+\item \textbf{SHA1 hashing}: The \texttt{sha1} crate provides a safe API
+\item \textbf{Bit manipulation}: The \texttt{bitvec} crate wraps any unsafe internals
+\item \textbf{Byte buffers}: The \texttt{bytes} crate provides safe views into memory
+\end{itemize}
+
+\subsection{Dependencies and Unsafe}
+
+While this crate contains no unsafe code, several dependencies necessarily use
+unsafe internally for performance or FFI requirements:
+
+\begin{description}
+\item[libc] FFI bindings to the C standard library, required for OS interactions
+\item[ring] Cryptographic operations for TLS (via rustls), uses carefully audited unsafe
+\item[tokio/mio] Async runtime requires unsafe for syscall integration
+\item[bytes] High-performance byte buffers use unsafe for zero-copy operations
+\end{description}
+
+These dependencies are:
+\begin{enumerate}
+\item \textbf{Necessary}: Each provides functionality that cannot be implemented
+  in safe Rust (FFI, syscalls, hardware crypto instructions)
+\item \textbf{Well-audited}: All are widely used crates with extensive testing
+  and security review
+\item \textbf{Minimal}: We use \texttt{reqwest} with \texttt{rustls-tls} instead
+  of OpenSSL to reduce the unsafe surface area
+\end{enumerate}
+
+Tools like \texttt{cargo-geiger} can provide detailed unsafe statistics for the
+full dependency tree. The choice of rustls over OpenSSL specifically reduces
+the amount of C code (and thus potential memory safety issues) in the TLS stack.
+
+
 \section{References}
 \label{sec:references}
 

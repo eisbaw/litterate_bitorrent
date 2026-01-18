@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:31'
-updated_date: '2026-01-18 01:56'
+updated_date: '2026-01-18 01:59'
 labels:
   - phase-3
   - protocol
@@ -50,22 +50,11 @@ Verify that all message types survive serialization and parsing without data los
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive round-trip tests to nw/04-messages.nw for all message types.
-
-## Changes
-- Created new noweb chunk <<message round-trip tests>> with 32 individual test functions
-- Added prose section explaining the round-trip testing strategy
-- Tests cover all acceptance criteria:
-  - Bitfield: 0, 1, 8, 100, 1000 pieces (plus partial patterns)
-  - Have: piece_index=0 and u32::MAX (plus typical values)
-  - Request/Cancel: begin=0, piece boundaries (BLOCK_SIZE multiples), max values
-  - Piece: empty data, BLOCK_SIZE data, data > BLOCK_SIZE, plus pattern verification
-
-## Test Summary
-- 35 round-trip tests total (including 3 existing tests)
-- Helper function assert_round_trip() for DRY test code
-- All tests pass: just tangle, just lint, just test all succeed
-
-## Files Modified
-- nw/04-messages.nw: Added ~400 lines of tests and prose
+Added comprehensive round-trip tests:
+- 32 tests covering all message types
+- Bitfield: 0, 1, 8, 100, 1000 pieces
+- Have: piece_index=0 and u32::MAX
+- Request/Cancel: begin=0 and piece boundaries
+- Piece: empty, BLOCK_SIZE, larger data
+- All 845 tests pass
 <!-- SECTION:NOTES:END -->
