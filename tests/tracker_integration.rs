@@ -47,6 +47,7 @@ fn create_announce_request(metainfo: &Metainfo) -> TrackerRequest {
         left: metainfo.total_length,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     }
 }
 
@@ -244,6 +245,7 @@ async fn test_tracker_manager_fallback_to_secondary() {
         left: modified_metainfo.total_length,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     };
 
     // Attempt announce - should fail on tier 0, succeed on tier 1
@@ -309,6 +311,7 @@ async fn test_tracker_manager_remembers_successful_tracker() {
         left: modified_metainfo.total_length,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     };
 
     println!("\nFirst announce (should try tier 0, fail, then tier 1)...");
@@ -326,6 +329,7 @@ async fn test_tracker_manager_remembers_successful_tracker() {
         left: modified_metainfo.total_length - 1000,
         event: None,
         compact: true,
+        numwant: Some(200),
     };
 
     println!("\nSecond announce (should try tier 1 first now)...");

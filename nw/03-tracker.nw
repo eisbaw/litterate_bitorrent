@@ -496,6 +496,12 @@ pub struct TrackerRequest {
     /// Most modern trackers only support compact format, so this should
     /// typically be `true`.
     pub compact: bool,
+
+    /// Number of peers requested from the tracker.
+    ///
+    /// If None, the tracker uses its default (typically 50).
+    /// Common values are 50-200 for faster peer discovery.
+    pub numwant: Option<u32>,
 }
 @
 
@@ -576,6 +582,7 @@ fn tracker_request_construction() {
         left: 1_000_000,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: None,
     };
 
     assert_eq!(request.info_hash, [0x12u8; 20]);
@@ -599,6 +606,7 @@ fn tracker_request_without_event() {
         left: 0,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     assert!(request.event.is_none());
@@ -615,6 +623,7 @@ fn tracker_request_implements_debug() {
         left: 100,
         event: None,
         compact: false,
+        numwant: None,
     };
 
     let debug = format!("{:?}", request);
@@ -633,6 +642,7 @@ fn tracker_request_implements_clone() {
         left: 5000,
         event: Some(TrackerEvent::Completed),
         compact: true,
+        numwant: Some(100),
     };
 
     let cloned = original.clone();
@@ -659,6 +669,7 @@ fn tracker_request_large_values() {
         left: u64::MAX,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     // Verify the struct can hold maximum values
@@ -685,6 +696,7 @@ fn tracker_request_realistic_initial_announce() {
         left: torrent_size,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     };
 
     assert_eq!(request.left, torrent_size);
@@ -1190,6 +1202,12 @@ pub fn build_announce_url(announce_url: &str, request: &TrackerRequest) -> Strin
         url.push_str("&compact=1");
     }
 
+    // Number of peers requested
+    if let Some(numwant) = request.numwant {
+        url.push_str("&numwant=");
+        url.push_str(&numwant.to_string());
+    }
+
     url
 }
 @
@@ -1223,6 +1241,7 @@ fn build_announce_url_basic() {
         left: 1000,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1250,6 +1269,7 @@ fn build_announce_url_with_existing_query_params() {
         left: 0,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url(
@@ -1276,6 +1296,7 @@ fn build_announce_url_without_event() {
         left: 50000,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1298,6 +1319,7 @@ fn build_announce_url_without_compact() {
         left: 1000,
         event: None,
         compact: false,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1317,6 +1339,7 @@ fn build_announce_url_stopped_event() {
         left: 0,
         event: Some(TrackerEvent::Stopped),
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1334,6 +1357,7 @@ fn build_announce_url_completed_event() {
         left: 0,
         event: Some(TrackerEvent::Completed),
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1358,6 +1382,7 @@ fn build_announce_url_encodes_info_hash_correctly() {
         left: 0,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1389,6 +1414,7 @@ fn build_announce_url_large_values() {
         left: u64::MAX,
         event: None,
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -1411,6 +1437,7 @@ fn build_announce_url_known_output() {
         left: 12345,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: None,
     };
 
     let url = build_announce_url("http://t.co/a", &request);
@@ -3937,6 +3964,7 @@ fn announce_function_exists_with_correct_signature() {
         left: 1000,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     };
 
     // Verify the return type matches expectations by checking the Future output type

@@ -89,6 +89,7 @@ fn create_announce_request(metainfo: &Metainfo, peer_id: [u8; 20]) -> TrackerReq
         left: metainfo.total_length,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     }
 }
 
