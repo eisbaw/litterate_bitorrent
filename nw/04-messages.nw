@@ -6,8 +6,134 @@
 After obtaining a list of peers from the tracker, our client must communicate
 with them using the BitTorrent peer wire protocol. This protocol operates over
 TCP and enables peers to negotiate which pieces they have, request blocks, and
-transfer data. Before implementing the message types themselves, we define
-error types that capture all the ways peer communication can fail.
+transfer data.
+
+This chapter covers the complete peer wire protocol: the initial handshake,
+message framing, all nine message types, and the choking/interested state
+machine that governs data flow between peers.
+
+\subsection{Protocol Overview}
+
+The peer wire protocol has two distinct phases:
+
+\begin{enumerate}
+\item \textbf{Handshake}: A fixed 68-byte exchange that identifies both the
+  torrent and the peers. The handshake has no length prefix---it is the only
+  message in the protocol with a fixed, known size.
+
+\item \textbf{Message exchange}: After the handshake, all communication uses
+  length-prefixed messages. Each message begins with a 4-byte big-endian length,
+  optionally followed by a message ID and payload.
+\end{enumerate}
+
+\subsubsection{Message Framing}
+
+All messages after the handshake use a simple framing scheme:
+
+\begin{verbatim}
++----------------+------+-----------------+
+| length (4 bytes) | id   |    payload      |
++----------------+------+-----------------+
+|   big-endian   | 1 B  | variable length |
++----------------+------+-----------------+
+\end{verbatim}
+
+The \texttt{length} field is a 4-byte big-endian unsigned integer indicating
+how many bytes follow the length field itself. This count includes the message
+ID byte (if present) and the payload.
+
+\begin{itemize}
+\item \textbf{Keep-alive}: length = 0. No ID byte, no payload. Just four zero
+  bytes: \texttt{0x00 0x00 0x00 0x00}.
+
+\item \textbf{Messages without payload}: length = 1. One ID byte, no payload.
+  Example: Choke is \texttt{0x00 0x00 0x00 0x01 0x00}.
+
+\item \textbf{Messages with payload}: length = 1 + payload\_size. The ID byte
+  plus the payload bytes.
+\end{itemize}
+
+This framing allows the receiver to:
+\begin{enumerate}
+\item Read exactly 4 bytes to get the length
+\item Allocate a buffer of that size
+\item Read exactly that many bytes to get the complete message
+\item Parse the message based on its ID
+\end{enumerate}
+
+\subsubsection{The Choking/Interested State Machine}
+
+BitTorrent uses a four-state model to control data flow between any two peers.
+Each peer maintains two pieces of state about the connection:
+
+\begin{description}
+\item[am\_choking] Whether \emph{we} are choking the remote peer (refusing to
+  send data to them)
+\item[am\_interested] Whether \emph{we} are interested in data the remote peer has
+\item[peer\_choking] Whether the \emph{remote peer} is choking us
+\item[peer\_interested] Whether the \emph{remote peer} is interested in our data
+\end{description}
+
+The state machine looks like this (from the perspective of requesting data):
+
+\begin{verbatim}
+                          REMOTE PEER'S STATE
+                    +-------------+-------------+
+                    |   Choking   | Not Choking |
+    +---------------+-------------+-------------+
+    | Not Interested|   IDLE      |    IDLE     |
+OUR +---------------+-------------+-------------+
+    |   Interested  |   WAITING   |  CAN REQUEST|
+    +---------------+-------------+-------------+
+
+    Data can flow ONLY in the CAN REQUEST state:
+    - We are interested (we want their pieces)
+    - They are not choking us (they allow requests)
+\end{verbatim}
+
+\textbf{Critical rule}: Data transfer can only occur when both conditions are met:
+\begin{enumerate}
+\item The requester has expressed interest (sent \texttt{Interested})
+\item The sender has unchoked the requester (sent \texttt{Unchoke})
+\end{enumerate}
+
+A peer should send \texttt{Interested} when it discovers the remote peer has
+pieces it needs. A peer should send \texttt{NotInterested} when it no longer
+needs any pieces the remote has.
+
+The choking decision is typically based on:
+\begin{itemize}
+\item Upload bandwidth management (limit number of unchoked peers)
+\item Reciprocity (prefer peers who upload to us)
+\item Optimistic unchoking (periodically unchoke random peers to discover
+  faster sources)
+\end{itemize}
+
+\subsubsection{Message Types Summary}
+
+The protocol defines nine message types:
+
+\begin{center}
+\begin{tabular}{|c|l|l|p{6cm}|}
+\hline
+\textbf{ID} & \textbf{Name} & \textbf{Payload} & \textbf{Purpose} \\
+\hline
+-- & keep-alive & (none) & Prevent timeout; sent every 2 minutes \\
+0 & choke & (none) & Stop fulfilling requests from remote peer \\
+1 & unchoke & (none) & Start fulfilling requests from remote peer \\
+2 & interested & (none) & We want pieces the remote peer has \\
+3 & not interested & (none) & We don't need pieces from remote peer \\
+4 & have & piece index (4B) & Announce we completed a piece \\
+5 & bitfield & bitfield & Announce all pieces we have (after handshake) \\
+6 & request & idx, begin, len (12B) & Request a block of data \\
+7 & piece & idx, begin, data & Deliver a block of data \\
+8 & cancel & idx, begin, len (12B) & Cancel a pending request \\
+\hline
+\end{tabular}
+\end{center}
+
+Before implementing these message types, we define error types that capture
+all the ways peer communication can fail.
 
 \subsection{Peer Protocol Error Types}
 
@@ -456,17 +582,26 @@ the message framing---it establishes identity before the protocol proper begins.
 
 \subsubsection{Handshake Wire Format}
 
-The handshake consists of five fields, transmitted in order:
+The handshake consists of five fields, transmitted in order with no length
+prefix. This is the only fixed-size message in the protocol:
 
 \begin{verbatim}
-+--------+---------------------+----------+-----------+---------+
-| pstrlen|       pstr          | reserved | info_hash | peer_id |
-+--------+---------------------+----------+-----------+---------+
-| 1 byte |      19 bytes       | 8 bytes  | 20 bytes  | 20 bytes|
-+--------+---------------------+----------+-----------+---------+
-| = 19   | "BitTorrent protocol"| zeros   | SHA1 hash | client  |
-+--------+---------------------+----------+-----------+---------+
-                        Total: 68 bytes
+Byte offsets:
+     0        1                   20       28        48        68
+     +--------+-------------------+--------+---------+---------+
+     | pstrlen|       pstr        |reserved|info_hash| peer_id |
+     +--------+-------------------+--------+---------+---------+
+     | 1 byte |     19 bytes      | 8 bytes| 20 bytes| 20 bytes|
+     +--------+-------------------+--------+---------+---------+
+     |  0x13  |"BitTorrent protocol"| zeros | SHA1    | client  |
+     +--------+-------------------+--------+---------+---------+
+
+     Field breakdown:
+     [0]      pstrlen  = 19 (0x13)
+     [1-19]   pstr     = "BitTorrent protocol"
+     [20-27]  reserved = 8 zero bytes (extensions set bits here)
+     [28-47]  info_hash = SHA1(bencoded info dict)
+     [48-67]  peer_id  = 20-byte client identifier
 \end{verbatim}
 
 \begin{description}
@@ -1409,6 +1544,126 @@ Each message (except keep-alive) has a one-byte type identifier followed by a
 payload whose structure depends on the message type. The BitTorrent protocol
 defines nine message types with IDs 0--8, plus a special keep-alive message
 that has no ID (it's just a zero-length message).
+
+\subsubsection{Detailed Message Wire Formats}
+
+Each message type has a specific wire format. Here we document the exact byte
+layout for every message defined in BEP 3.
+
+\paragraph{Keep-alive (no ID)} Prevents connection timeout. Send at least once
+every 2 minutes.
+
+\begin{verbatim}
++---+---+---+---+
+| 0 | 0 | 0 | 0 |  (4 bytes total)
++---+---+---+---+
+ length = 0
+\end{verbatim}
+
+\paragraph{Choke (ID 0)} Tells remote peer we will not send them data.
+
+\begin{verbatim}
++---+---+---+---+---+
+| 0 | 0 | 0 | 1 | 0 |  (5 bytes total)
++---+---+---+---+---+
+ length = 1    id=0
+\end{verbatim}
+
+\paragraph{Unchoke (ID 1)} Tells remote peer we will now send them data.
+
+\begin{verbatim}
++---+---+---+---+---+
+| 0 | 0 | 0 | 1 | 1 |  (5 bytes total)
++---+---+---+---+---+
+ length = 1    id=1
+\end{verbatim}
+
+\paragraph{Interested (ID 2)} Tells remote peer we want pieces they have.
+
+\begin{verbatim}
++---+---+---+---+---+
+| 0 | 0 | 0 | 1 | 2 |  (5 bytes total)
++---+---+---+---+---+
+ length = 1    id=2
+\end{verbatim}
+
+\paragraph{Not Interested (ID 3)} Tells remote peer we don't want their pieces.
+
+\begin{verbatim}
++---+---+---+---+---+
+| 0 | 0 | 0 | 1 | 3 |  (5 bytes total)
++---+---+---+---+---+
+ length = 1    id=3
+\end{verbatim}
+
+\paragraph{Have (ID 4)} Announces completion of a piece.
+
+\begin{verbatim}
++---+---+---+---+---+---+---+---+---+
+| 0 | 0 | 0 | 5 | 4 |  piece index  |  (9 bytes total)
++---+---+---+---+---+---+---+---+---+
+ length = 5    id=4  4 bytes, BE u32
+\end{verbatim}
+
+\paragraph{Bitfield (ID 5)} Sent immediately after handshake, before any other
+message. Announces all pieces the peer has.
+
+\begin{verbatim}
++-------+---+-----------------------+
+| len   | 5 |      bitfield         |  (5 + n bytes total)
++-------+---+-----------------------+
+ 4 bytes id=5 ceil(num_pieces/8) bytes
+
+Bitfield encoding (for 10 pieces):
+  Byte 0: | P0 | P1 | P2 | P3 | P4 | P5 | P6 | P7 |
+  Byte 1: | P8 | P9 |  0 |  0 |  0 |  0 |  0 |  0 |
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                     spare bits must be zero
+\end{verbatim}
+
+\paragraph{Request (ID 6)} Requests a block of data from a piece.
+
+\begin{verbatim}
++---+---+---+---+---+-------+-------+-------+
+| 0 | 0 | 0 |13 | 6 | index | begin |length |  (17 bytes total)
++---+---+---+---+---+-------+-------+-------+
+ length = 13   id=6  4 bytes 4 bytes 4 bytes
+                     piece   offset  block
+                     index   in piece size
+
+Typical values:
+  - index: 0 to num_pieces-1
+  - begin: 0, 16384, 32768, ... (multiples of block size)
+  - length: 16384 (standard block size) or smaller for last block
+\end{verbatim}
+
+\paragraph{Piece (ID 7)} Delivers block data in response to a Request.
+
+\begin{verbatim}
++-------+---+-------+-------+------------------+
+|  len  | 7 | index | begin |      data        |  (13 + n bytes total)
++-------+---+-------+-------+------------------+
+ 4 bytes id=7 4 bytes 4 bytes  n bytes (block)
+              piece   offset
+              index   in piece
+
+length = 9 + data.len()
+\end{verbatim}
+
+This is the only message that transfers actual file content.
+
+\paragraph{Cancel (ID 8)} Cancels a previously sent Request. Same format as
+Request.
+
+\begin{verbatim}
++---+---+---+---+---+-------+-------+-------+
+| 0 | 0 | 0 |13 | 8 | index | begin |length |  (17 bytes total)
++---+---+---+---+---+-------+-------+-------+
+ length = 13   id=8  4 bytes 4 bytes 4 bytes
+
+Used in endgame mode when requesting same block from multiple peers.
+Once received from one peer, cancel requests to others.
+\end{verbatim}
 
 \subsubsection{Message ID Constants}
 

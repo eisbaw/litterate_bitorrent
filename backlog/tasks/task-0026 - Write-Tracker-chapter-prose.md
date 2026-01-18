@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 00:01'
+updated_date: '2026-01-18 00:05'
 labels: []
 dependencies: []
 ---
@@ -40,13 +40,10 @@ The tracker is the discovery mechanism - how peers find each other. This chapter
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive prose to nw/03-tracker.nw explaining the HTTP tracker protocol:
-
-- Added "The Tracker's Role in BitTorrent" subsection explaining the tracker as a rendezvous point and the announce/response/connect flow
-- Added "The Announce Request/Response Cycle: A Walkthrough" with concrete example showing URL construction, HTTP request, bencoded response, and peer data parsing
-- Enhanced "Compact Peer List Parsing (BEP-23)" with detailed byte-level diagrams showing the 6-byte-per-peer format, concrete decoding examples, network byte order explanation, and comparison with deprecated dictionary format
-- Added "Announce Intervals and the Re-Announce Cycle" covering timing parameters (interval, min interval), state machine diagram, interval changes, and failure recovery
-- Added "Limitations of Tracker-Based Discovery" discussing single point of failure, privacy concerns, scalability limits, legal vulnerability, and motivating DHT as an alternative
-
-All changes verified with just tangle (code extracted successfully), just build (compiles without errors), just weave (generates 646-page PDF), and tracker tests (75 tests pass).
+Added comprehensive Tracker chapter prose:
+- Tracker role with announce/response/connect flow
+- Request/response walkthrough with concrete examples
+- BEP-23 compact peer format byte-level diagram
+- Announce intervals and re-announce state machine
+- Limitations section covering SPOF, privacy, scalability
 <!-- SECTION:NOTES:END -->
