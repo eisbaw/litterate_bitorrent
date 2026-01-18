@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:32'
-updated_date: '2026-01-18 02:11'
+updated_date: '2026-01-18 02:14'
 labels:
   - tracker
   - parsing
@@ -53,31 +53,11 @@ Some trackers do not support compact format and return peers as a list of dictio
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented parse_dictionary_peers() function in nw/03-tracker.nw for parsing the BEP-3 non-compact peer list format.
-
-## Changes
-- Added new section "Dictionary Peer List Parsing (BEP-3 Original Format)" explaining:
-  - Why the format exists (fallback for non-BEP-23 trackers, IPv6 support)
-  - Dictionary format structure (ip string, port integer, optional peer id)
-  - Example bencode showing format
-- Implemented parse_dictionary_peers() function that:
-  - Takes BencodeValue (expected to be a List)
-  - Iterates through list extracting ip and port from each dictionary
-  - Uses std::net::IpAddr::parse() for both IPv4 and IPv6 support
-  - Returns descriptive errors with peer index for debugging
-  - Ignores optional peer_id field
-- Added 17 comprehensive unit tests covering:
-  - Basic 2-peer parsing
-  - Empty list handling
-  - Missing ip/port field errors
-  - peer_id ignored correctly
-  - IPv4 and IPv6 address parsing
-  - Invalid IP address detection
-  - Port range validation (0-65535)
-  - Type validation for inputs
-
-## Testing
-- just tangle: PASS
-- just lint: PASS  
-- just test: PASS (89 tracker tests including 17 new dictionary peer tests)
+Implemented non-compact peer list parsing:
+- parse_dictionary_peers() takes BencodeValue list
+- Parses ip (string) and port (integer) from each dict
+- Supports IPv4 and IPv6 via std::net
+- Ignores optional peer id
+- Returns descriptive errors with peer index
+- Added 17 comprehensive unit tests
 <!-- SECTION:NOTES:END -->

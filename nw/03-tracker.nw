@@ -201,6 +201,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<dictionary peer parsing>>
 
+<<unified peer extraction>>
+
 <<announce result struct>>
 
 <<announce function>>
@@ -228,6 +230,8 @@ mod tests {
     <<compact peer parsing tests>>
 
     <<dictionary peer parsing tests>>
+
+    <<unified peer extraction tests>>
 
     <<announce result tests>>
 
@@ -2453,6 +2457,92 @@ from each dictionary. Notable design choices:
   are always ASCII, but this handles edge cases gracefully.
 \end{itemize}
 
+\subsection{Unified Peer Extraction}
+
+With both compact and dictionary peer parsers implemented, we need a unified
+interface that auto-detects the format and delegates to the appropriate parser.
+This simplifies the caller's code: pass in the raw \texttt{peers} field from a
+tracker response, and receive a list of socket addresses regardless of the
+underlying format.
+
+The detection strategy is straightforward:
+\begin{itemize}
+\item If \texttt{peers} is a byte string (\texttt{BencodeValue::Bytes}), it's the
+  compact format from BEP-23.
+\item If \texttt{peers} is a list (\texttt{BencodeValue::List}), it's the
+  dictionary format from BEP-3.
+\item Any other type (integer, dictionary at top level) is an error---the tracker
+  returned malformed data.
+\end{itemize}
+
+This function becomes the primary interface for peer extraction. The underlying
+parsers remain public for cases where the caller already knows the format, but
+most code should use \texttt{extract\_peers} for its automatic format handling.
+
+<<unified peer extraction>>=
+/// Extract peers from a tracker response's peers field with automatic format detection.
+///
+/// This is the primary interface for peer extraction. It examines the
+/// `BencodeValue` and delegates to the appropriate parser:
+/// - `Bytes` -> compact format (BEP-23)
+/// - `List` -> dictionary format (BEP-3)
+/// - Other types -> error
+///
+/// # Arguments
+///
+/// * `peers_value` - The `peers` field from a tracker response
+///
+/// # Returns
+///
+/// On success, returns a vector of socket addresses. The vector may be empty
+/// if no peers were provided.
+///
+/// # Errors
+///
+/// Returns [`TrackerError::TrackerInvalidResponse`] if:
+/// - The input is neither bytes nor a list
+/// - The underlying parser fails (invalid compact data or malformed dictionaries)
+///
+/// # Example
+///
+/// ```ignore
+/// let response_dict = decode(&tracker_body)?;
+/// let peers_field = response_dict.get(b"peers").unwrap();
+/// let peers = extract_peers(peers_field)?;
+/// for peer in peers {
+///     println!("Discovered peer: {}", peer);
+/// }
+/// ```
+pub fn extract_peers(peers_value: &BencodeValue) -> Result<Vec<SocketAddr>, TrackerError> {
+    match peers_value {
+        BencodeValue::Bytes(data) => {
+            // Compact format: raw bytes, 6 bytes per peer
+            parse_compact_peers(data)
+        }
+        BencodeValue::List(_) => {
+            // Dictionary format: list of peer dictionaries
+            parse_dictionary_peers(peers_value)
+        }
+        _ => {
+            // Unexpected type: not a valid peers field
+            Err(TrackerError::TrackerInvalidResponse(
+                "peers field has unexpected type: expected bytes (compact) or list (dictionary)".to_string(),
+            ))
+        }
+    }
+}
+@
+
+The implementation is deliberately simple. By matching on the top-level type,
+we avoid any ambiguity about which parser to invoke. The compact parser operates
+directly on the byte slice, while the dictionary parser receives the full
+\texttt{BencodeValue} since it needs to iterate through the list structure.
+
+Note that we don't attempt to ``recover'' from malformed data by trying the
+other format. If a tracker returns bytes, we parse as compact; if it fails,
+we report the compact parser's error. This predictable behavior makes debugging
+easier than heuristic format guessing.
+
 \subsubsection{Response Parsing Tests}
 
 We test the response parser with various scenarios to ensure correct behavior
@@ -3298,6 +3388,178 @@ These tests verify:
 \item Wrong input types (not a list, items not dicts) are caught.
 \item Error messages include the peer index for debugging.
 \item Edge cases for minimum and maximum port values.
+\end{enumerate}
+
+\subsubsection{Unified Peer Extraction Tests}
+
+We test the unified \texttt{extract\_peers} function to verify it correctly
+detects the format and delegates to the appropriate parser. The tests focus on
+format detection rather than parsing correctness, which is already covered by
+the individual parser tests.
+
+<<unified peer extraction tests>>=
+#[test]
+fn extract_peers_detects_compact_format() {
+    // Compact format: bytes representing 192.168.1.1:6881
+    let compact_data = vec![0xC0, 0xA8, 0x01, 0x01, 0x1A, 0xE1];
+    let peers_value = BencodeValue::Bytes(compact_data);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_ok(), "Should detect and parse compact format: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "192.168.1.1:6881");
+}
+
+#[test]
+fn extract_peers_detects_dictionary_format() {
+    use std::collections::BTreeMap;
+
+    // Dictionary format: list with one peer dictionary
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"10.0.0.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(8080));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_ok(), "Should detect and parse dictionary format: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "10.0.0.1:8080");
+}
+
+#[test]
+fn extract_peers_rejects_integer_type() {
+    // Integer is not a valid peers field type
+    let peers_value = BencodeValue::Integer(42);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_err(), "Integer should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("unexpected type"),
+                "Error should mention unexpected type: {}",
+                msg
+            );
+            assert!(
+                msg.contains("bytes") || msg.contains("compact"),
+                "Error should mention expected format: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn extract_peers_rejects_top_level_dict() {
+    use std::collections::BTreeMap;
+
+    // A dictionary at the top level is not valid
+    // (dictionaries are only valid as list items)
+    let peers_value = BencodeValue::Dict(BTreeMap::new());
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_err(), "Top-level dict should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("unexpected type"),
+                "Error should mention unexpected type: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn extract_peers_empty_bytes_returns_empty_vec() {
+    // Empty compact format is valid (no peers)
+    let peers_value = BencodeValue::Bytes(vec![]);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_ok(), "Empty bytes should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert!(peers.is_empty(), "Should return empty vec for empty bytes");
+}
+
+#[test]
+fn extract_peers_empty_list_returns_empty_vec() {
+    // Empty dictionary format is valid (no peers)
+    let peers_value = BencodeValue::List(vec![]);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_ok(), "Empty list should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert!(peers.is_empty(), "Should return empty vec for empty list");
+}
+
+#[test]
+fn extract_peers_propagates_compact_error() {
+    // Invalid compact data (7 bytes, not divisible by 6)
+    let compact_data = vec![0xC0, 0xA8, 0x01, 0x01, 0x1A, 0xE1, 0xFF];
+    let peers_value = BencodeValue::Bytes(compact_data);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_err(), "Invalid compact data should fail");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("not divisible by 6"),
+                "Should propagate compact parser error: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn extract_peers_propagates_dictionary_error() {
+    use std::collections::BTreeMap;
+
+    // Invalid dictionary: missing port
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"10.0.0.1".to_vec()));
+    // No port field
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = extract_peers(&peers_value);
+    assert!(result.is_err(), "Missing port should fail");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("port"),
+                "Should propagate dictionary parser error: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+@
+
+These tests verify:
+\begin{enumerate}
+\item Compact format (bytes) is correctly detected and parsed.
+\item Dictionary format (list) is correctly detected and parsed.
+\item Integer type produces a descriptive error.
+\item Top-level dictionary produces an error (dictionaries are only valid inside
+  the list).
+\item Empty bytes and empty list both return empty vectors (valid edge cases).
+\item Errors from the underlying parsers are propagated correctly.
 \end{enumerate}
 
 \subsection{The Complete Announce Function}
