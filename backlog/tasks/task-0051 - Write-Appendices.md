@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:29'
-updated_date: '2026-01-18 01:03'
+updated_date: '2026-01-18 01:07'
 labels: []
 dependencies: []
 ---
@@ -38,34 +38,10 @@ The appendices provide reference material that supports but does not interrupt t
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Expanded nw/09-appendix.nw from a minimal 17-line file to a comprehensive 615-line appendix containing:
-
-## BEP Reference (Section A)
-- Core Protocol BEPs: BEP 3, 20, 23, 10 with descriptions
-- Tracker Protocol BEPs: BEP 7, 15, 48
-- Peer Protocol Extensions: BEP 5, 6, 9, 11, 29
-- Metainfo Extensions: BEP 12, 17, 19, 27, 47
-
-## Test Vectors (Section B)
-- Bencode examples for integers, byte strings, lists, dictionaries
-- Hex representations and decoded values
-- Invalid encoding examples (negative zero, leading zeros, etc.)
-- Info hash examples for known public torrents (Big Buck Bunny, Ubuntu ISO)
-- Verification procedure and common mistakes
-
-## Future Work (Section C)
-- DHT: Kademlia algorithm, implementation requirements, benefits
-- uTP: LEDBAT congestion control, network friendliness
-- PEX: Peer exchange protocol details
-- Magnet Links: URI format, download flow
-- Other extensions: BEP 6, 14, 40, 24
-- Recommended extension order for further development
-
-## Additional Sections
-- Glossary: 25 BitTorrent-specific terms defined
-- References: Primary (BEP URLs) and secondary sources (wiki, papers)
-
-Build verification:
-- just tangle: Success
-- just weave: Success (687-page PDF generated)
+Added comprehensive appendices:
+- BEP reference with core, tracker, and peer extensions
+- Test vectors with bencode examples and info hashes
+- Future work section covering DHT, uTP, PEX, magnet links
+- Glossary with 25 BitTorrent terms
+- Fixed BEP number errors per MPED review
 <!-- SECTION:NOTES:END -->

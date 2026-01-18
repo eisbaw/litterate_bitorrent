@@ -96,7 +96,8 @@ To understand BitTorrent, you need to grasp four fundamental concepts:
 
 \begin{description}
 \item[Pieces] Files are divided into fixed-size chunks called \emph{pieces},
-  typically 256 KB to 4 MB each. Each piece is identified by its SHA1 hash,
+  typically 256 KB to 4 MB each. Each piece is identified by its SHA1 hash
+  (Secure Hash Algorithm 1, a cryptographic hash producing a 20-byte fingerprint),
   which serves both as verification (ensuring data integrity) and as a unique
   identifier (so peers can request specific pieces).
 
