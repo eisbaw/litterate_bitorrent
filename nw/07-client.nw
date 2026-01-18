@@ -9040,6 +9040,11 @@ async fn handle_peer_message(
                     debug!(peer = %addr, "sent interested after have");
                 }
             }
+            // Trigger block requests if peer is not choking us
+            // This ensures we start downloading when we learn about new pieces
+            if !conn.state.peer_choking {
+                trigger_block_requests_for_peer(addr, ctx).await;
+            }
         }
 
         Message::Bitfield(bits) => {
@@ -9059,6 +9064,11 @@ async fn handle_peer_message(
                             conn.mark_sent();
                             debug!(peer = %addr, "sent interested after bitfield");
                         }
+                    }
+                    // Trigger block requests if peer is not choking us
+                    // This ensures we start downloading when we learn about available pieces
+                    if !conn.state.peer_choking {
+                        trigger_block_requests_for_peer(addr, ctx).await;
                     }
                 }
                 Err(e) => {
@@ -9081,6 +9091,12 @@ async fn handle_peer_message(
         }
 
         Message::Piece { index, begin, data } => {
+            // Remove this request from the rate-limiting queue
+            // This must be done BEFORE handle_incoming_piece so the queue has space
+            if let Some(queue) = ctx.request_queues.get_mut(&addr) {
+                queue.remove(index, begin);
+            }
+
             // Get or create in-progress piece
             let in_progress = ctx.in_progress_pieces.entry(index).or_insert_with(|| {
                 let piece_size = ctx.piece_manager
@@ -9115,6 +9131,11 @@ async fn handle_peer_message(
 
             match result {
                 PieceHandleResult::BlockStored => {
+                    // Also update PieceManager's block tracking for select_next_block
+                    let block_index = (begin / crate::pieces::BLOCK_SIZE) as usize;
+                    if let Err(e) = ctx.piece_manager.mark_block_received(index, block_index) {
+                        warn!(piece = index, block = block_index, error = %e, "failed to mark block received");
+                    }
                     // Continue downloading - request more blocks if queue has space
                     trigger_block_requests_for_peer(addr, ctx).await;
                 }
@@ -10050,7 +10071,7 @@ async fn trigger_block_requests_for_peer(
     let conn = match ctx.connection_manager.get_connection_mut(&addr) {
         Some(c) => c,
         None => {
-            debug!(peer = %addr, "connection gone, skipping block requests");
+            trace!(peer = %addr, "connection gone, skipping block requests");
             return;
         }
     };
@@ -10089,6 +10110,8 @@ async fn trigger_block_requests_for_peer(
                 break;
             }
             conn.mark_sent();
+            // Track the request so we can match incoming blocks
+            conn.state.pending_requests.push_back(request.clone());
             trace!(
                 peer = %addr,
                 piece = request.piece_index,
