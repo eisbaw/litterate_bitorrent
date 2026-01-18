@@ -491,6 +491,8 @@ async fn run_download(args: &Args) -> Result<(), ClientRunError> {
         last_progress_time: &mut last_progress_time,
         download_start_time,
         json_log: args.json_log,
+        output_dir: &args.output,
+        files: &files,
     };
 
     // Step 9: Run the event loop
@@ -602,6 +604,7 @@ async fn initial_announce(
         left,
         event: Some(TrackerEvent::Started),
         compact: true,
+        numwant: Some(200),
     };
 
     announce(metainfo, request).await.map_err(ClientRunError::from)
@@ -659,7 +662,9 @@ fn check_resume(
 /// Connect to an initial batch of peers from the available pool.
 ///
 /// This function pops peers from the available queue, attempts to connect
-/// and perform handshakes, and registers successful connections.
+/// and perform handshakes **in parallel**, and registers successful connections.
+/// Parallel connections dramatically improve startup time when some peers are
+/// unreachable (each timeout doesn't block other connection attempts).
 ///
 /// Returns the number of peers successfully connected.
 async fn connect_initial_peers(
@@ -668,48 +673,87 @@ async fn connect_initial_peers(
     peer_id: &[u8; 20],
     _num_pieces: usize,
 ) -> usize {
-    const MAX_INITIAL_CONNECTIONS: usize = 10;
-    const MAX_ATTEMPTS: usize = 20;
+    use tokio::task::JoinSet;
+    use tokio::net::TcpStream;
 
-    let our_handshake = Handshake::new(*info_hash, *peer_id);
+    const MAX_INITIAL_CONNECTIONS: usize = 30;
+    const PARALLEL_BATCH_SIZE: usize = 20;
+
+    let info_hash = *info_hash;
+    let peer_id = *peer_id;
     let mut connected = 0;
-    let mut attempts = 0;
 
-    while connected < MAX_INITIAL_CONNECTIONS && attempts < MAX_ATTEMPTS {
-        let addr = match connection_manager.pop_available() {
-            Some(a) => a,
-            None => break, // No more peers available
-        };
-        attempts += 1;
-
-        tracing::debug!(peer = %addr, "attempting connection");
-
-        // Try to connect
-        let mut stream = match connect_with_timeout(addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::debug!(peer = %addr, error = %e, "connection failed");
-                continue;
+    // Keep trying batches until we have enough connections or run out of peers
+    while connected < MAX_INITIAL_CONNECTIONS {
+        // Pop a batch of peers to try in parallel
+        let mut peers_to_try = Vec::with_capacity(PARALLEL_BATCH_SIZE);
+        while peers_to_try.len() < PARALLEL_BATCH_SIZE {
+            match connection_manager.pop_available() {
+                Some(addr) => peers_to_try.push(addr),
+                None => break,
             }
-        };
-
-        // Perform handshake
-        let peer_handshake = match perform_handshake(&mut stream, &our_handshake, info_hash).await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::debug!(peer = %addr, error = %e, "handshake failed");
-                continue;
-            }
-        };
-
-        // Register the connection
-        if let Err(e) = connection_manager.register_connection(stream, addr, &peer_handshake) {
-            tracing::debug!(peer = %addr, error = %e, "failed to register connection");
-            continue;
         }
 
-        tracing::info!(peer = %addr, "connected to peer");
-        connected += 1;
+        if peers_to_try.is_empty() {
+            break; // No more peers available
+        }
+
+        tracing::debug!(batch_size = peers_to_try.len(), "starting parallel connection batch");
+
+        // Spawn connection attempts in parallel
+        let mut join_set: JoinSet<Option<(std::net::SocketAddr, TcpStream, Handshake)>> = JoinSet::new();
+
+        for addr in peers_to_try {
+            join_set.spawn(async move {
+                // Try to connect
+                let mut stream = match connect_with_timeout(addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(peer = %addr, error = %e, "connection failed");
+                        return None;
+                    }
+                };
+
+                // Perform handshake
+                let our_handshake = Handshake::new(info_hash, peer_id);
+                let peer_handshake = match perform_handshake(&mut stream, &our_handshake, &info_hash).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::debug!(peer = %addr, error = %e, "handshake failed");
+                        return None;
+                    }
+                };
+
+                tracing::info!(peer = %addr, "connected to peer");
+                Some((addr, stream, peer_handshake))
+            });
+        }
+
+        // Collect results as they complete
+        while let Some(result) = join_set.join_next().await {
+            if connected >= MAX_INITIAL_CONNECTIONS {
+                break; // We have enough connections
+            }
+
+            match result {
+                Ok(Some((addr, stream, peer_handshake))) => {
+                    // Register the connection
+                    if let Err(e) = connection_manager.register_connection(stream, addr, &peer_handshake) {
+                        tracing::debug!(peer = %addr, error = %e, "failed to register connection");
+                        continue;
+                    }
+                    connected += 1;
+                }
+                Ok(None) => {
+                    // Connection or handshake failed, already logged
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "connection task panicked");
+                }
+            }
+        }
+
+        tracing::debug!(connected = connected, "batch complete");
     }
 
     connected
