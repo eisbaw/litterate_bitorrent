@@ -73,9 +73,12 @@ fmt:
 fmt-fix:
     cargo fmt
 
-# End-to-end tests (placeholder for future implementation)
-e2e:
-    @echo "E2E tests not yet implemented"
+# End-to-end tests: run integration tests that require network access
+# These tests are marked #[ignore] in the source and require explicit invocation
+# Note: Requires network access to contact real BitTorrent trackers
+# Uses --test to run only integration tests (not unit tests or doc-tests)
+e2e: tangle
+    cargo test --test '*' -- --ignored --nocapture
 
 # ============================================================================
 # Workflow Recipes

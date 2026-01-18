@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:34'
-updated_date: '2026-01-18 03:01'
+updated_date: '2026-01-18 03:04'
 labels:
   - phase-5
   - strategy
@@ -51,36 +51,10 @@ Endgame mode activates when few pieces remain. In this mode, blocks are requeste
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented endgame mode for the RequestScheduler.
-
-## Changes
-
-- Added `endgame_threshold` to SchedulerConfig (default 5 pieces)
-- Added `endgame_requests` HashMap to track duplicate block requests across peers
-- Added `is_endgame_mode(&PieceManager)` - returns true when remaining pieces <= threshold
-- Added `register_endgame_request()` - allows same block to be requested from multiple peers
-- Added `get_endgame_peers()` - returns peers with pending requests for a block
-- Added `complete_endgame_request()` - completes a block and returns peers needing cancel messages
-
-## Testing
-
+Implemented endgame mode in RequestScheduler:
+- is_endgame_mode() activates at configurable threshold (default 5)
+- Duplicate request tracking via HashMap<BlockKey, Vec<PeerId>>
+- complete_endgame_request() returns peers for cancel messages
 - 9 unit tests covering all acceptance criteria
-- Doc tests for the new public APIs
-- All 895 existing tests pass
-
-## Usage
-
-```rust
-if scheduler.is_endgame_mode(&manager) {
-    scheduler.register_endgame_request(request);
-} else {
-    scheduler.register_request(request);
-}
-
-// On block receipt:
-let (completed, cancel_peers) = scheduler.complete_endgame_request(piece, offset, &from_peer);
-for peer in cancel_peers {
-    // Send Cancel message to peer
-}
-```
+895 tests pass.
 <!-- SECTION:NOTES:END -->
