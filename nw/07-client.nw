@@ -1102,12 +1102,11 @@ impl PeerState {
     /// Handle a `choke` message from the peer.
     ///
     /// When the peer chokes us, they are indicating they will not respond to
-    /// our block requests. We must:
-    /// 1. Set `peer_choking` to true
-    /// 2. Clear all pending requests (the peer has effectively cancelled them)
+    /// NEW block requests. However, blocks already in flight may still arrive.
+    /// We keep pending_requests intact so these arriving blocks can be matched.
     ///
-    /// The pending requests should be re-queued for other peers or re-requested
-    /// when this peer unchokes us. The caller is responsible for this recovery.
+    /// This sets `peer_choking` to true, preventing new requests via
+    /// `can_request()`, but allows in-flight blocks to be properly stored.
     ///
     /// # Example
     ///
@@ -1117,16 +1116,13 @@ impl PeerState {
     /// let mut state = PeerState::new(100);
     /// state.peer_choking = false; // Simulate having been unchoked
     ///
-    /// // Simulate some pending requests
-    /// // (In production, these would be BlockRequest structs)
-    ///
     /// state.handle_choke();
     /// assert!(state.peer_choking);
-    /// assert!(state.pending_requests.is_empty());
+    /// // Note: pending_requests NOT cleared - blocks in flight still accepted
     /// ```
     pub fn handle_choke(&mut self) {
         self.peer_choking = true;
-        self.pending_requests.clear();
+        // Don't clear pending_requests - blocks in flight should still be accepted
     }
 
     /// Handle an `unchoke` message from the peer.
@@ -1688,28 +1684,27 @@ pub fn handle_incoming_unchoke(conn: &mut PeerConnection) {
 ///
 /// Updates peer state, cancels pending requests, and logs the transition.
 /// Choke messages indicate that the remote peer will no longer respond
-/// to our block requests. Any pending requests must be considered lost.
+/// to our block requests.
 ///
-/// # Request Reassignment
+/// # In-Flight Block Handling
 ///
-/// When a peer chokes us, all pending block requests to that peer are
-/// effectively cancelled. Rather than losing these requests, this function
-/// returns them so the caller can reassign them to other unchoked peers.
-/// This prevents download stalls when peers choke us mid-transfer.
+/// When a peer chokes us, they are signaling they won't respond to NEW
+/// requests. However, blocks that were already requested may still be
+/// in flight and will arrive. We keep pending_requests intact so these
+/// arriving blocks can be properly matched and stored.
 ///
-/// The pending requests are drained from the connection state before
-/// calling `handle_choke()` to ensure they are captured before being
-/// cleared.
+/// This avoids a race condition where:
+/// 1. We send requests, peer starts sending blocks
+/// 2. Peer sends choke (perhaps due to upload slot rotation)
+/// 3. We clear our request queue
+/// 4. Blocks arrive but are rejected as "unexpected"
+///
+/// By keeping pending_requests, blocks in flight are accepted normally.
+/// The requests will be naturally removed as blocks arrive.
 ///
 /// # Arguments
 ///
 /// * `conn` - The peer connection to update
-///
-/// # Returns
-///
-/// A vector of the pending block requests that were cancelled.
-/// These should be returned to the scheduler for reassignment to
-/// other peers who have the same pieces.
 ///
 /// # Example
 ///
@@ -1717,31 +1712,26 @@ pub fn handle_incoming_unchoke(conn: &mut PeerConnection) {
 /// use literate_bittorrent::client::{PeerConnection, handle_incoming_choke};
 ///
 /// fn process_choke(conn: &mut PeerConnection) {
-///     let cancelled = handle_incoming_choke(conn);
-///     // Return cancelled requests to the piece manager for reassignment
-///     for request in cancelled {
-///         // scheduler.return_request(request);
-///     }
+///     handle_incoming_choke(conn);
+///     // Pending requests kept - blocks in flight will still be accepted
 /// }
 /// ```
-pub fn handle_incoming_choke(conn: &mut PeerConnection) -> Vec<BlockRequest> {
+pub fn handle_incoming_choke(conn: &mut PeerConnection) {
     let was_unchoked = !conn.state.peer_choking;
+    let pending_count = conn.state.pending_requests.len();
 
-    // Drain pending requests before handle_choke clears them
-    let cancelled: Vec<BlockRequest> = conn.state.pending_requests.drain(..).collect();
-
-    conn.state.handle_choke();
+    // Set choking state but DON'T clear pending_requests
+    // Blocks already in flight should still be accepted
+    conn.state.peer_choking = true;
 
     if was_unchoked {
         info!(
             peer_id = %format_peer_id(&conn.peer_id),
             addr = %conn.addr,
-            cancelled_requests = cancelled.len(),
-            "peer choked us - requests cancelled"
+            pending_requests = pending_count,
+            "peer choked us - will still accept in-flight blocks"
         );
     }
-
-    cancelled
 }
 @
 
@@ -2814,7 +2804,9 @@ mod tests {
     }
 
     #[test]
-    fn handle_choke_clears_pending_requests() {
+    fn handle_choke_preserves_pending_requests() {
+        // Pending requests are NOT cleared on choke - blocks in flight should still be accepted.
+        // This prevents a race condition where blocks arrive after choke but are rejected.
         use crate::pieces::BlockRequest;
         use std::time::Instant;
 
@@ -2842,7 +2834,8 @@ mod tests {
         assert_eq!(state.pending_requests.len(), 2);
 
         state.handle_choke();
-        assert!(state.pending_requests.is_empty(), "handle_choke should clear pending_requests");
+        // Requests preserved - allows in-flight blocks to still be accepted
+        assert_eq!(state.pending_requests.len(), 2, "handle_choke should preserve pending_requests");
     }
 
     #[test]
@@ -3257,7 +3250,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_incoming_choke_returns_cancelled_requests() {
+    async fn handle_incoming_choke_preserves_pending_requests() {
+        // Pending requests are preserved on choke so blocks in flight can still be accepted.
+        // This fixes a race condition where blocks arrive after choke but before unchoke.
         use crate::pieces::BlockRequest;
         use std::time::Instant;
 
@@ -3292,16 +3287,13 @@ mod tests {
 
         assert_eq!(conn.state.pending_requests.len(), 3);
 
-        let cancelled = handle_incoming_choke(&mut conn);
+        handle_incoming_choke(&mut conn);
 
-        // Should return all cancelled requests
-        assert_eq!(cancelled.len(), 3, "Should return all 3 cancelled requests");
-        assert_eq!(cancelled[0].piece_index, 0);
-        assert_eq!(cancelled[1].piece_index, 1);
-        assert_eq!(cancelled[2].piece_index, 2);
-
-        // pending_requests should now be empty
-        assert!(conn.state.pending_requests.is_empty(), "pending_requests should be empty after choke");
+        // Pending requests should be preserved - allows in-flight blocks to be accepted
+        assert_eq!(conn.state.pending_requests.len(), 3, "pending_requests should be preserved after choke");
+        assert_eq!(conn.state.pending_requests[0].piece_index, 0);
+        assert_eq!(conn.state.pending_requests[1].piece_index, 1);
+        assert_eq!(conn.state.pending_requests[2].piece_index, 2);
     }
 
     #[tokio::test]
@@ -3959,7 +3951,7 @@ The shutdown announce has special requirements compared to regular announces:
 \end{enumerate}
 
 <<shutdown announce>>=
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use crate::tracker::{TrackerRequest, TrackerEvent, build_announce_url, TrackerError};
 
 /// Timeout for shutdown announce, in seconds.
@@ -4029,6 +4021,7 @@ pub async fn send_stopped_announce(
         left: 0, // Not strictly accurate, but trackers don't care for stopped events
         event: Some(TrackerEvent::Stopped),
         compact: true,
+        numwant: None, // Not needed for stopped event
     };
 
     // Build the URL
@@ -4397,6 +4390,7 @@ mod shutdown_announce_tests {
             left: 0,
             event: Some(TrackerEvent::Stopped),
             compact: true,
+            numwant: None,
         };
 
         let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -4600,6 +4594,7 @@ pub async fn send_completed_announce(
         left: 0, // All pieces verified
         event: Some(TrackerEvent::Completed),
         compact: true,
+        numwant: None, // Not needed for completed event
     };
 
     // Build the URL
@@ -4902,6 +4897,7 @@ mod completion_tests {
             left: 0,
             event: Some(TrackerEvent::Completed),
             compact: true,
+            numwant: None,
         };
 
         let url = build_announce_url("http://tracker.example.com/announce", &request);
@@ -5092,8 +5088,9 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 30;
 /// Timeout in seconds for establishing TCP connections.
 ///
 /// If a peer doesn't respond within this time, the connection attempt
-/// fails with `PeerError::Timeout`. The PRD specifies 10 seconds.
-pub const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// fails with `PeerError::Timeout`. 5 seconds is sufficient for most peers
+/// while avoiding long waits for unreachable hosts.
+pub const CONNECT_TIMEOUT_SECS: u64 = 5;
 
 /// Timeout in seconds for completing the BitTorrent handshake exchange.
 ///
@@ -5102,14 +5099,14 @@ pub const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// the connection is considered failed. This timeout covers both sending our
 /// handshake and receiving the peer's response.
 ///
-/// The 10-second timeout matches the connection timeout and is sufficient
+/// The 5-second timeout matches the connection timeout and is sufficient
 /// for peers on high-latency networks while preventing indefinite blocking
 /// on unresponsive or malicious peers.
-pub const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+pub const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
 /// Establishes a TCP connection to a peer with timeout.
 ///
-/// Uses a 10-second timeout to prevent hanging on unresponsive peers.
+/// Uses a 5-second timeout to prevent hanging on unresponsive peers.
 /// The timeout is configurable via the `CONNECT_TIMEOUT_SECS` constant.
 ///
 /// # Why Timeouts Matter
@@ -5123,7 +5120,7 @@ pub const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
 ///
 /// Without a timeout, `TcpStream::connect` could block indefinitely waiting
 /// for a response that never comes. The OS typically has a very long default
-/// timeout (often 2+ minutes). A 10-second timeout is long enough for legitimate
+/// timeout (often 2+ minutes). A 5-second timeout is long enough for legitimate
 /// connections over slow networks but short enough to move on to other peers
 /// when one is unresponsive.
 ///
@@ -6102,7 +6099,7 @@ mod connection_manager_tests {
     #[test]
     fn manager_default_constants() {
         assert_eq!(DEFAULT_MAX_CONNECTIONS, 30);
-        assert_eq!(CONNECT_TIMEOUT_SECS, 10);
+        assert_eq!(CONNECT_TIMEOUT_SECS, 5);  // Reduced from 10 for faster parallel connection setup
     }
 
     // ========================================================================
@@ -6235,8 +6232,8 @@ mod connection_manager_tests {
 
     #[test]
     fn connect_with_timeout_uses_correct_timeout() {
-        // Verify the constant is set correctly as specified in the PRD
-        assert_eq!(CONNECT_TIMEOUT_SECS, 10);
+        // Reduced from 10s to 5s for faster parallel connection setup
+        assert_eq!(CONNECT_TIMEOUT_SECS, 5);
     }
 
     // ========================================================================
@@ -6244,9 +6241,9 @@ mod connection_manager_tests {
     // ========================================================================
 
     #[test]
-    fn handshake_timeout_constant_is_10_seconds() {
-        // Verify the handshake timeout constant is set as specified in the PRD
-        assert_eq!(HANDSHAKE_TIMEOUT_SECS, 10);
+    fn handshake_timeout_constant_is_5_seconds() {
+        // Reduced from 10s to 5s for faster parallel connection setup
+        assert_eq!(HANDSHAKE_TIMEOUT_SECS, 5);
     }
 
     #[test]
@@ -8663,6 +8660,18 @@ pub struct EventLoopContext<'a> {
     /// When enabled, progress updates are emitted as JSON objects to stderr,
     /// suitable for machine consumption by monitoring tools.
     pub json_log: bool,
+
+    /// Output directory for downloaded files.
+    ///
+    /// Verified pieces are written to this directory using the file layout
+    /// specified in `files`.
+    pub output_dir: &'a std::path::Path,
+
+    /// File information for disk writing.
+    ///
+    /// Contains the list of files and their lengths, used by `disk::write_piece`
+    /// to map pieces to the correct file locations.
+    pub files: &'a [crate::metainfo::FileInfo],
 }
 @
 
@@ -8993,15 +9002,8 @@ async fn handle_peer_message(
         }
 
         Message::Choke => {
-            let cancelled = handle_incoming_choke(conn);
-            // Log cancelled requests - they will be available for re-request
-            for req in cancelled {
-                trace!(
-                    piece = req.piece_index,
-                    offset = req.offset,
-                    "cancelled request returned to pool"
-                );
-            }
+            handle_incoming_choke(conn);
+            // Pending requests kept - blocks in flight will still be accepted
         }
 
         Message::Unchoke => {
@@ -9142,13 +9144,46 @@ async fn handle_peer_message(
                 PieceHandleResult::PieceVerified(piece_idx) => {
                     info!(piece = piece_idx, "piece verified!");
 
-                    // Mark piece as verified in piece manager
-                    if let Err(e) = ctx.piece_manager.mark_verified(piece_idx as u32) {
-                        warn!(piece = piece_idx, error = %e, "failed to mark piece verified");
-                    }
+                    // Write verified piece to disk BEFORE removing from in_progress
+                    let write_succeeded = if let Some(in_prog) = ctx.in_progress_pieces.get(&(piece_idx as u32)) {
+                        let piece_data = in_prog.data();
+                        match crate::disk::write_piece(
+                            piece_idx as u32,
+                            piece_data,
+                            ctx.metainfo.piece_length,
+                            ctx.metainfo.total_length,
+                            ctx.output_dir,
+                            ctx.files,
+                        ) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                error!(piece = piece_idx, error = %e, "failed to write piece to disk - will retry");
+                                false
+                            }
+                        }
+                    } else {
+                        // No in-progress data found, can't write
+                        warn!(piece = piece_idx, "verified piece has no in-progress data");
+                        false
+                    };
 
-                    // Remove from in-progress
-                    ctx.in_progress_pieces.remove(&(piece_idx as u32));
+                    if write_succeeded {
+                        // Mark piece as verified in piece manager
+                        if let Err(e) = ctx.piece_manager.mark_verified(piece_idx as u32) {
+                            warn!(piece = piece_idx, error = %e, "failed to mark piece verified");
+                        }
+                        // Remove from in-progress (data has been written to disk)
+                        ctx.in_progress_pieces.remove(&(piece_idx as u32));
+                    } else {
+                        // Write failed - mark as failed so it gets re-downloaded
+                        ctx.in_progress_pieces.remove(&(piece_idx as u32));
+                        if let Err(e) = ctx.piece_manager.mark_failed(piece_idx as u32) {
+                            warn!(piece = piece_idx, error = %e, "failed to mark piece as failed");
+                        }
+                        // Trigger requests to retry this piece
+                        trigger_block_requests_all_peers(ctx).await;
+                        return EventLoopAction::Continue;
+                    }
 
                     // Check if download is complete
                     if ctx.piece_manager.is_complete() {
@@ -9770,6 +9805,7 @@ async fn handle_re_announce(
         left,
         event: None, // Regular re-announce, no special event
         compact: true,
+        numwant: Some(200), // Request more peers on re-announce
     };
 
     // Perform the announce
