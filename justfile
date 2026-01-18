@@ -134,6 +134,15 @@ download-to output: tangle build
     @mkdir -p {{output}}
     cargo run -- tests/fixtures/ubuntu.torrent -o {{output}} -v
 
+# Demo: download Ubuntu ISO using release build
+# Demonstrates the BitTorrent client downloading a real torrent
+# Usage: just demo-ubuntu
+demo-ubuntu: tangle
+    cargo build --release
+    mkdir -p downloads
+    @echo "Downloading Ubuntu 24.04.3 Server ISO (~3.1 GB) to ./downloads"
+    ./target/release/literate-bittorrent tests/fixtures/ubuntu.torrent -o ./downloads
+
 # ============================================================================
 # Fuzzing Recipes
 # ============================================================================

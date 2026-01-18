@@ -6,6 +6,9 @@ doc/
 # Cargo build output
 target/
 
+# Downloaded torrents
+downloads/
+
 # Keep Cargo.lock for reproducibility
 !Cargo.lock
 .cargo/
