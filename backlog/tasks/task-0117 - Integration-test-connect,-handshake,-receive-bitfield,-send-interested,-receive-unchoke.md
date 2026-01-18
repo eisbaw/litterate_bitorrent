@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:40'
-updated_date: '2026-01-18 03:26'
+updated_date: '2026-01-18 03:30'
 labels:
   - phase-3
   - integration-test
@@ -57,33 +57,12 @@ This is the Phase 3 exit criteria test. Verifies the complete peer connection fl
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented peer connection integration test in tests/peer_integration.rs.
-
-## Changes
-- Created new test file tests/peer_integration.rs with:
-  - test_peer_connection_flow: Full integration test that connects to real BitTorrent peers
-  - test_peer_integration_setup: Non-network test to verify fixture loading and module setup
-
-## Test Flow
-1. Loads ubuntu.torrent fixture
-2. Announces to Ubuntu tracker to get peer list
-3. Connects to peers with 10-second timeout
-4. Performs handshake and validates info_hash match
-5. Waits for bitfield or Have messages
-6. Sends Interested message
-7. Waits for Unchoke message (or detects early unchoke)
-
-## Edge Cases Handled
-- Early unchoke: Some peers send Unchoke before we send Interested (optimistic unchoking)
-- No bitfield: Some peers send only Have messages instead of a bitfield
-- Tracker returns no peers: Fails with clear message
-- All peers unreachable: Tries up to 10 peers before failing
-- Timeout: Overall 30-second test timeout with 15-second unchoke wait
-
-## Justfile
-Added `just test-peer-handshake` recipe to run only the peer integration test.
-
-## Testing
-- All unit tests pass (895 tests)
-- E2E tests pass (successfully connects to Ubuntu peer and receives unchoke)
+Added tests/peer_integration.rs with test_peer_connection_flow:
+- Connects to real BitTorrent peers from Ubuntu tracker
+- Completes handshake with info_hash validation
+- Receives bitfield/Have messages
+- Sends Interested message
+- Receives Unchoke (handles optimistic unchoking)
+- 30-second timeout, marked #[ignore]
+- Run with just test-peer-handshake
 <!-- SECTION:NOTES:END -->
