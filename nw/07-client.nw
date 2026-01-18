@@ -4062,6 +4062,7 @@ mod shutdown_announce_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn shutdown_announce_timeout_less_than_normal() {
         // The shutdown timeout should be less than the normal 30-second timeout
         use crate::tracker::TRACKER_TIMEOUT_SECS;
@@ -4084,21 +4085,19 @@ mod shutdown_announce_tests {
     fn send_stopped_announce_function_exists() {
         // Type-check: verify the function has the expected signature
         // We can't call it without a runtime, but we can verify it compiles
-        let _metainfo = make_test_metainfo();
-        let _peer_id = [0u8; 20];
-        let _port: u16 = 6881;
-        let _uploaded: u64 = 0;
-        let _downloaded: u64 = 0;
-
-        // The function should accept these types and return the right type
-        // This is a compile-time check, not a runtime test
-        fn assert_signature(
-            _f: impl Fn(&Metainfo, &[u8; 20], u16, u64, u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), crate::tracker::TrackerError>> + Send>>,
-        ) {}
-
-        // Note: We cannot actually call assert_signature with send_stopped_announce
-        // because async functions have complex return types. This test just verifies
-        // our setup compiles correctly.
+        //
+        // The function should accept these types:
+        // - &Metainfo
+        // - &[u8; 20] (peer_id)
+        // - u16 (port)
+        // - u64 (uploaded)
+        // - u64 (downloaded)
+        //
+        // This is a compile-time check - referencing the function verifies it exists.
+        #[allow(clippy::no_effect, path_statements)]
+        {
+            send_stopped_announce;
+        }
     }
 
     #[test]
@@ -6170,6 +6169,7 @@ mod framed_message_tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn max_message_length_is_reasonable() {
         // The constant should be exactly 2^17 = 131072
         assert_eq!(MAX_MESSAGE_LENGTH, 131072);
@@ -6186,6 +6186,7 @@ mod framed_message_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn max_message_length_is_power_of_two() {
         // 2^17 = 131072
         assert!(MAX_MESSAGE_LENGTH.is_power_of_two());
@@ -6369,6 +6370,7 @@ mod framed_message_writing_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn idle_timeout_greater_than_keep_alive_interval() {
         // The idle timeout must be greater than the keep-alive interval
         // to allow for network jitter and delayed keep-alives.
@@ -8017,7 +8019,9 @@ pub enum EventLoopEvent {
     /// Contains the peer's address and the message. The address is used
     /// to look up the connection state for message processing.
     PeerMessage {
+        /// Socket address of the peer that sent the message.
         addr: SocketAddr,
+        /// The received message or an error if parsing failed.
         message: Result<Message, PeerError>,
     },
 
@@ -8025,7 +8029,9 @@ pub enum EventLoopEvent {
     ///
     /// The connection should be removed and replaced from the peer pool.
     PeerDisconnected {
+        /// Socket address of the disconnected peer.
         addr: SocketAddr,
+        /// Human-readable description of why the connection was lost.
         reason: String,
     },
 
@@ -9596,6 +9602,7 @@ mod event_loop_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn constants_are_reasonable() {
         // Request timeout should be longer than network round-trip
         assert!(REQUEST_TIMEOUT_CHECK_INTERVAL_SECS >= 10);
@@ -9607,6 +9614,7 @@ mod event_loop_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn keep_alive_timing_allows_peer_response() {
         // The idle timeout must be strictly greater than the keep-alive interval.
         // This ensures peers have time to respond with their own keep-alive
@@ -9631,6 +9639,7 @@ mod event_loop_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn progress_display_interval_is_reasonable() {
         // Progress should update frequently enough to be informative
         // but not so often as to spam the output
@@ -9639,6 +9648,7 @@ mod event_loop_tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn choke_interval_is_reasonable() {
         // Choking reevaluation should happen frequently enough to respond
         // to peer interest changes, but not so often as to spam messages.
@@ -9781,6 +9791,7 @@ mod re_announce_tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn max_consecutive_failures_constant_reasonable() {
         // Max failures should cap at a reasonable value
         // With failures=8, multiplier = 2^8 = 256

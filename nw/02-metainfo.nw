@@ -1384,7 +1384,7 @@ mod tests {
         let info_value = BencodeValue::Dict(info);
 
         let mut hasher = Sha1::new();
-        hasher.update(&encode(&info_value));
+        hasher.update(encode(&info_value));
         let expected: [u8; 20] = hasher.finalize().into();
 
         assert_eq!(metainfo.info_hash, expected);

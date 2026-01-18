@@ -61,9 +61,9 @@ check: tangle
 test: tangle
     cargo test
 
-# Lint: run clippy for linting
+# Lint: run clippy for linting (all targets including tests)
 lint: tangle
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 # Format check: verify code formatting
 fmt:

@@ -529,6 +529,7 @@ fn tracker_event_implements_debug() {
 #[test]
 fn tracker_event_implements_clone() {
     let event = TrackerEvent::Completed;
+    #[allow(clippy::clone_on_copy)]
     let cloned = event.clone();
     assert_eq!(event, cloned);
 }

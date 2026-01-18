@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 01:29'
+updated_date: '2026-01-18 01:33'
 labels:
   - errors
   - ux
@@ -35,32 +35,11 @@ Transform internal errors into user-friendly messages. Technical error types are
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented user-friendly error reporting module in nw/06-cli.nw
-
-## Summary
-
-- Added ClientRunError enum that wraps all subsystem errors (metainfo, tracker, disk, pieces, peer, client, I/O)
-- Implemented format_user_error() function that translates technical errors to user-friendly messages
-- Added individual formatters for each error category:
-  - format_torrent_error: suggests re-downloading corrupt torrent files
-  - format_tracker_error: handles HTTP errors, timeout, and displays tracker failure reasons verbatim (AC#3)
-  - format_disk_error: suggests checking permissions for EACCES errors (AC#5)
-  - format_piece_error: identifies which piece failed verification (AC#4)
-  - format_peer_error: explains peer communication issues
-  - format_io_error: generic I/O error handling
-- Added exit_with_error() helper that prints to stderr and exits with code 1 (AC#6, AC#7)
-- Added comprehensive tests for error formatting
-
-## Design Decisions
-
-- Error messages follow three principles: simple language, actionable guidance, relevant details
-- Tracker failure reasons are displayed verbatim since trackers write user-facing messages
-- Permission errors specifically suggest checking file/directory permissions
+Implemented user-friendly error reporting:
+- ClientRunError wraps all subsystem errors
+- format_user_error() provides actionable messages
+- Individual formatters for each error category
 - Network errors suggest checking connectivity
-
-## Testing
-
-- just tangle: PASS
-- just lint: PASS
-- just test: 93 passed, 0 failed
+- Piece errors identify failed piece number
+- All errors exit with code 1 to stderr
 <!-- SECTION:NOTES:END -->

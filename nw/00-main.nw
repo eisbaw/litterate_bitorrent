@@ -303,6 +303,10 @@ expand this into a complete client.
 // Source: nw/00-main.nw
 // Regenerate with: just tangle
 
+//! Literate BitTorrent Client binary.
+//!
+//! This is the entry point for the command-line BitTorrent client.
+
 fn main() {
     println!("Literate BitTorrent Client");
     println!("A pedagogical implementation");

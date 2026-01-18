@@ -3668,10 +3668,10 @@ fn validate_bitfield_1000_pieces() {
     assert!(validate_bitfield(&bitfield, 1000).is_ok());
 
     // Wrong length
-    let err = validate_bitfield(&vec![0x00; 124], 1000).unwrap_err();
+    let err = validate_bitfield(&[0x00; 124], 1000).unwrap_err();
     assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 125, actual: 124 }));
 
-    let err = validate_bitfield(&vec![0x00; 126], 1000).unwrap_err();
+    let err = validate_bitfield(&[0x00; 126], 1000).unwrap_err();
     assert!(matches!(err, PeerError::BitfieldWrongLength { expected: 125, actual: 126 }));
 }
 

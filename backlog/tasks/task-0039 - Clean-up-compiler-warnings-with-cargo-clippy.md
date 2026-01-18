@@ -1,10 +1,11 @@
 ---
 id: task-0039
 title: Clean up compiler warnings with cargo clippy
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-16 21:30'
+updated_date: '2026-01-18 01:33'
 labels:
   - quality
   - clippy
