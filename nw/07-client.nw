@@ -1077,6 +1077,92 @@ The [[active\_peers]] map uses [[SocketAddr]] as the key because a peer is
 uniquely identified by their IP address and port. The [[PeerState]] struct
 tracks the 4-bit state machine that governs data flow with each peer.
 
+\subsubsection{Peer Connection State Machine}
+
+Each peer connection follows a lifecycle from connection establishment through
+active data exchange to eventual disconnection. The state machine below shows
+the major states and transitions:
+
+\begin{verbatim}
+    +------------------+
+    |   DISCONNECTED   |
+    +------------------+
+            |
+            | connect()
+            v
+    +------------------+
+    |   CONNECTING     |  <-- TCP connection in progress
+    +------------------+
+            |
+            | timeout -------> [disconnect]
+            | success
+            v
+    +------------------+
+    |   HANDSHAKING    |  <-- Exchange 68-byte handshakes
+    +------------------+
+            |
+            | invalid handshake --> [disconnect]
+            | info_hash mismatch -> [disconnect]
+            | success
+            v
+    +------------------+
+    |   CONNECTED      |  <-- Initial state: both sides choking
+    +------------------+
+            |
+            | receive Bitfield (optional, sent once)
+            | receive/send Have, Interested, Choke, Unchoke
+            v
+    +------------------+
+    |   EXCHANGING     |  <-- Active data transfer possible
+    +------------------+
+            |
+            | error/timeout/shutdown --> [disconnect]
+            v
+    +------------------+
+    |   DISCONNECTED   |
+    +------------------+
+\end{verbatim}
+
+Within the EXCHANGING state, the 4-bit choke/interest state machine determines
+what operations are permitted:
+
+\begin{verbatim}
+  Our State         Their State        Result
+  ---------         -----------        ------
+  am_choking=T      peer_choking=T     No data flow (initial)
+  am_interested=T   peer_choking=F     We can request blocks
+  am_choking=F      peer_interested=T  They can request blocks
+\end{verbatim}
+
+The state transitions are triggered by protocol messages:
+
+\begin{verbatim}
+  Message Received    State Change
+  ----------------    ------------
+  Choke               peer_choking := true; clear pending_requests
+  Unchoke             peer_choking := false; can now request
+  Interested          peer_interested := true
+  Not Interested      peer_interested := false
+  Have(idx)           bitfield[idx] := true
+  Bitfield(bits)      bitfield := bits
+\end{verbatim}
+
+When sending messages, we update our own state accordingly:
+
+\begin{verbatim}
+  Message Sent        State Change
+  ------------        ------------
+  Choke               am_choking := true
+  Unchoke             am_choking := false
+  Interested          am_interested := true
+  Not Interested      am_interested := false
+\end{verbatim}
+
+The [[can\_request()]] method encapsulates the condition for requesting blocks:
+we must be interested ([[am\_interested = true]]) and the peer must not be
+choking us ([[peer\_choking = false]]). Symmetrically, the peer can request
+from us when [[peer\_interested = true]] and [[am\_choking = false]].
+
 \subsection{Message Handlers}
 
 When the client receives protocol messages from a peer, it must update the
@@ -3335,6 +3421,51 @@ unnotified (no [[event=stopped]] announce), potentially corrupt partial download
 and leave peer connections hanging. Instead, we intercept the SIGINT signal and
 initiate a coordinated shutdown sequence.
 
+\subsubsection{Shutdown Sequence Diagram}
+
+The following diagram shows the interaction between components during shutdown:
+
+\begin{verbatim}
+  User          Signal Handler      Event Loop       Tracker         Peers
+   |                  |                  |               |              |
+   | Ctrl+C           |                  |               |              |
+   |----------------->|                  |               |              |
+   |                  | set shutdown     |               |              |
+   |                  | flag (atomic)    |               |              |
+   |                  |----------------->|               |              |
+   |                  |                  |               |              |
+   |                  |      detect flag |               |              |
+   |                  |      in select!  |               |              |
+   |                  |                  |               |              |
+   |                  |                  | event=stopped |              |
+   |                  |                  |-------------->|              |
+   |                  |                  |               |              |
+   |                  |                  |     (5s timeout, best-effort)|
+   |                  |                  |<--------------|              |
+   |                  |                  |               |              |
+   |                  |                  | close connections            |
+   |                  |                  |----------------------------->|
+   |                  |                  |               |              |
+   |                  |                  | return ShutdownRequested     |
+   |                  |                  |               |              |
+   | exit(0)          |                  |               |              |
+   |<-----------------|------------------|               |              |
+\end{verbatim}
+
+If the user presses Ctrl+C a second time before shutdown completes:
+
+\begin{verbatim}
+  User          Signal Handler
+   |                  |
+   | Ctrl+C (2nd)     |
+   |----------------->|
+   |                  | count >= 2?
+   |                  | yes -> exit(130)
+   |                  |
+   | IMMEDIATE EXIT   |
+   |<-----------------|
+\end{verbatim}
+
 The shutdown sequence involves several steps:
 
 \begin{enumerate}
@@ -3359,6 +3490,11 @@ The shutdown sequence involves several steps:
   time, we exit immediately with code 130 (the standard Unix exit code for
   SIGINT termination: 128 + signal number 2).
 \end{enumerate}
+
+The stopped announce uses a shorter timeout (5 seconds) than regular announces
+(30 seconds) because the user is waiting. If the tracker is unreachable, we
+proceed with shutdown anyway---the best-effort nature means we try to be a good
+citizen but don't block indefinitely on an unresponsive tracker.
 
 \subsubsection{The ShutdownController}
 
@@ -4058,14 +4194,81 @@ tracker with an [[event=completed]] announce. This signals our transition from
 client does not implement seeding per the project's non-goals, correctly sending
 the completed event is important for tracker statistics and swarm health metrics.
 
-The completion detection logic is triggered after each piece is verified. When
-the last piece is marked as verified, the piece manager's [[is\_complete()]]
-method returns true, and we:
+\subsubsection{Completion Detection Flow}
 
+The completion detection follows a cascade through the event loop:
+
+\begin{verbatim}
+  +------------------+
+  | Receive Piece    |
+  | message from     |
+  | peer             |
+  +------------------+
+          |
+          v
+  +------------------+
+  | Store block in   |
+  | InProgressPiece  |
+  +------------------+
+          |
+          | Is piece complete?
+          |
+     +----+----+
+     | No      | Yes
+     v         v
+  [continue]  +------------------+
+              | Verify piece     |
+              | SHA-1 hash       |
+              +------------------+
+                      |
+                 +----+----+
+                 | Fail    | Pass
+                 v         v
+          [mark failed]  +------------------+
+          [re-download]  | Mark piece       |
+                         | verified in      |
+                         | PieceManager     |
+                         +------------------+
+                                 |
+                                 | Is download complete?
+                                 | (all pieces verified)
+                            +----+----+
+                            | No      | Yes
+                            v         v
+                      [continue]  +------------------+
+                                  | Set download_    |
+                                  | complete flag    |
+                                  +------------------+
+                                          |
+                                          v
+                                  +------------------+
+                                  | Send tracker     |
+                                  | event=completed  |
+                                  | (best effort)    |
+                                  +------------------+
+                                          |
+                                          v
+                                  +------------------+
+                                  | Event loop exits |
+                                  | with Complete    |
+                                  +------------------+
+\end{verbatim}
+
+The key invariant is that [[PieceManager::is\_complete()]] returns true if and
+only if all pieces have been verified. This is checked in the event loop after
+every successful piece verification:
+
+\begin{verbatim}
+if ctx.piece_manager.is_complete() {
+    *ctx.download_complete = true;
+    return EventLoopAction::Complete;
+}
+\end{verbatim}
+
+The [[download\_complete]] flag serves two purposes:
 \begin{enumerate}
-\item Log the completion with total download time and average speed.
-\item Send a tracker announce with [[event=completed]].
-\item Set an internal flag to prevent further piece requests.
+\item It is checked at the start of each event loop iteration for early exit.
+\item It prevents the completion announce from being sent multiple times.
 \end{enumerate}
 
 The completion announce follows the same best-effort pattern as the stopped
@@ -7698,6 +7901,80 @@ The [[tokio::select!]] macro provides the mechanism to await multiple futures
 concurrently, completing when any one of them is ready. This creates an event-driven
 architecture where the loop responds to whichever event occurs first.
 
+\subsubsection{Understanding Async/Await in the Event Loop}
+
+Rust's async/await provides cooperative concurrency without threads. When a future
+yields (e.g., waiting for network I/O), the runtime can execute other tasks. The
+[[tokio::select!]] macro extends this to multiple futures, racing them against
+each other:
+
+\begin{verbatim}
+tokio::select! {
+    result = peer_read() => handle_peer_message(result),
+    _ = timer.tick() => handle_timeout(),
+    _ = shutdown_signal => break,
+}
+\end{verbatim}
+
+This pattern is fundamentally different from threading. In a threaded model, each
+peer would have its own thread, with synchronization primitives protecting shared
+state. In our async model, there is \emph{one logical thread of execution}, with
+futures taking turns. This eliminates data races by construction: when we access
+[[PieceManager]], no other future is running.
+
+The [[biased]] modifier in [[tokio::select!]] is crucial for our shutdown handling.
+Without it, select! polls branches in random order. With [[biased]], branches are
+checked in declaration order, giving shutdown detection highest priority:
+
+\begin{verbatim}
+tokio::select! {
+    biased;  // Check branches in order
+
+    // Branch 1: Highest priority - shutdown
+    _ = ready(()), if shutdown_requested => Shutdown,
+
+    // Branch 2: Timers
+    _ = timeout_timer.tick() => RequestTimeoutCheck,
+
+    // Branch 3: Peer messages (lower priority than timers)
+    msg = read_peer() => PeerMessage(msg),
+}
+\end{verbatim}
+
+When shutdown is requested, the first branch completes immediately via
+[[std::future::ready]], and because of [[biased]], it is always selected even if
+peer messages are also ready.
+
+\subsubsection{Timer Management}
+
+The event loop uses two timer strategies:
+
+\textbf{Interval timers} (via [[tokio::time::interval]]) fire repeatedly at fixed
+intervals. We use these for periodic tasks that should happen at consistent rates:
+keep-alive checks, progress display, and choking reevaluation.
+
+\textbf{One-shot sleeps} (via [[tokio::time::sleep]]) are used when the next interval
+is dynamic. The tracker re-announce timer exemplifies this: on success, we use the
+tracker-provided interval; on failure, we apply exponential backoff. After each
+re-announce, we create a fresh [[Sleep]] future with the appropriate duration:
+
+\begin{verbatim}
+let mut re_announce_sleep = Box::pin(sleep(Duration::from_secs(interval)));
+
+loop {
+    tokio::select! {
+        _ = &mut re_announce_sleep => {
+            let next_interval = handle_re_announce().await;
+            re_announce_sleep = Box::pin(sleep(next_interval));
+        }
+        // ... other branches
+    }
+}
+\end{verbatim}
+
+The [[Box::pin]] is necessary because [[Sleep]] implements [[Future]], and select!
+requires pinned futures to poll them repeatedly.
+
 \subsection{Event Types}
 
 We define an enum to represent the different events the loop handles:
@@ -8687,15 +8964,55 @@ async fn handle_keep_alives(
 
 \subsubsection{Choking Reevaluation}
 
-BitTorrent uses a tit-for-tat algorithm to encourage reciprocal sharing. Seeders
-typically unchoke peers that upload to them. However, since we are a leecher-only
-client (per PRD non-goals), we use a simplified strategy: unchoke all interested
-peers unconditionally. This encourages other peers to reciprocate by unchoking us.
+BitTorrent uses a tit-for-tat algorithm to encourage reciprocal sharing. The
+classic algorithm works as follows:
 
-The algorithm runs periodically to catch newly-interested peers. When a peer
-sends us an Interested message, we don't immediately unchoke them in the message
-handler---instead, we wait for the next choking reevaluation cycle. This batches
-the decisions and keeps the logic centralized.
+\begin{enumerate}
+\item \textbf{Regular unchokes}: Every 10 seconds, select the 4 peers with the
+  highest upload rate to us (for leechers) or download rate from us (for seeders).
+  Unchoke these peers; choke all others.
+
+\item \textbf{Optimistic unchoke}: Every 30 seconds, randomly select one
+  additional peer to unchoke. This allows new peers to prove themselves and
+  prevents the system from getting stuck with suboptimal peer choices.
+\end{enumerate}
+
+However, since we are a leecher-only client (per PRD non-goals) that does not
+upload data, we cannot use upload rates to rank peers. Instead, we use a
+\emph{simplified choking strategy}:
+
+\textbf{Simplified Strategy: Unchoke All Interested Peers}
+
+Our algorithm is deliberately simple:
+
+\begin{verbatim}
+every 10 seconds:
+    for each connected peer:
+        if peer.interested AND we.am_choking:
+            send Unchoke
+            we.am_choking := false
+        else if NOT peer.interested AND NOT we.am_choking:
+            send Choke  (optional optimization)
+            we.am_choking := true
+\end{verbatim}
+
+This strategy has several benefits for a download-only client:
+
+\begin{enumerate}
+\item \textbf{Encourages reciprocity}: When we unchoke a peer, they may
+  reciprocate by unchoking us. Even though we don't upload, being ``generous''
+  signals good behavior.
+
+\item \textbf{Simple implementation}: No need to track upload rates or maintain
+  rolling averages. The logic is a simple conditional.
+
+\item \textbf{Low overhead}: We only need to send Unchoke/Choke messages, not
+  maintain complex data structures.
+\end{enumerate}
+
+The algorithm runs periodically (every [[CHOKE\_INTERVAL\_SECS]] = 10 seconds)
+rather than immediately on Interested messages. This batches decisions and
+keeps the logic centralized in one place.
 
 <<event loop>>=
 /// Handles the choking reevaluation timer event.
@@ -9093,6 +9410,111 @@ async fn trigger_block_requests_all_peers(
     }
 }
 @
+
+\subsection{Error Handling and Recovery Strategies}
+
+A BitTorrent client operates in an inherently unreliable environment. Peers come
+and go, network connections fail, trackers become temporarily unavailable, and
+data may be corrupted in transit. Robust error handling is essential for
+completing downloads despite these challenges.
+
+\subsubsection{Error Classification}
+
+We classify errors into three categories based on severity and recoverability:
+
+\begin{verbatim}
+  Error Type        Example                    Recovery Strategy
+  ----------        -------                    -----------------
+  Transient         Network timeout            Retry with backoff
+  Peer-specific     Invalid message            Disconnect peer, continue
+  Fatal             Disk full                  Exit with error
+\end{verbatim}
+
+\textbf{Transient errors} are temporary failures that may succeed on retry.
+Examples include tracker timeouts, connection refused (peer busy), and temporary
+network issues. The strategy is exponential backoff: wait longer between retries
+to avoid hammering a struggling service.
+
+\textbf{Peer-specific errors} affect only one peer connection. Examples include
+protocol violations (invalid message format), handshake failures (wrong info hash),
+and peer disconnections. The strategy is to disconnect the problematic peer and
+continue with others. The pool of available peers allows us to replace bad actors.
+
+\textbf{Fatal errors} prevent the download from continuing. Examples include disk
+full, output file permission denied, and corrupted metainfo. The strategy is to
+log the error clearly and exit with a non-zero status.
+
+\subsubsection{Graceful Degradation}
+
+When non-fatal errors occur, the client degrades gracefully rather than failing:
+
+\begin{itemize}
+\item \textbf{All peers disconnect}: Continue running; re-announce timer will
+  fetch new peers. Log at WARN level so user knows progress is stalled.
+
+\item \textbf{Tracker unreachable}: Continue with existing peers. Use exponential
+  backoff (2x, 4x, 8x base interval) for retries, capped at 256x.
+
+\item \textbf{Piece hash fails}: Discard the piece, mark as failed, re-download
+  from a different peer if possible. Log the failure for debugging.
+
+\item \textbf{Block request times out}: Cancel the request, reassign to another
+  peer that has the piece. If no alternative, the scheduler will retry later.
+\end{itemize}
+
+\subsubsection{Retry Logic}
+
+Block requests use a timeout-and-reassign strategy:
+
+\begin{verbatim}
+  Request block from peer A
+       |
+       | 30 seconds pass, no response
+       v
+  Request timed out
+       |
+       | Send Cancel to peer A
+       | Find peer B that has piece and is not choking us
+       |
+  +----+----+
+  | Found   | Not found
+  v         v
+  Request   Leave for scheduler
+  from B    to retry later
+\end{verbatim}
+
+Tracker re-announces use exponential backoff:
+
+\begin{verbatim}
+  Attempt re-announce
+       |
+  +----+----+
+  | Success | Failure
+  v         v
+  Use       Increment failure count (max 8)
+  tracker-  Multiply interval by 2^failures
+  provided  Schedule retry with backoff
+  interval
+\end{verbatim}
+
+\subsubsection{Error Logging Philosophy}
+
+We use structured logging (via [[tracing]]) with consistent severity levels:
+
+\begin{itemize}
+\item \textbf{ERROR}: Fatal conditions that will cause exit.
+\item \textbf{WARN}: Non-fatal problems affecting progress (all peers gone,
+  tracker down, hash failures).
+\item \textbf{INFO}: Normal operational events (peer connected, piece verified,
+  progress updates).
+\item \textbf{DEBUG}: Detailed protocol events (message sent/received, state
+  changes).
+\item \textbf{TRACE}: Very detailed internals (event loop iterations, timer
+  ticks).
+\end{itemize}
+
+Each log message includes relevant context (peer address, piece index, error
+details) as structured fields, making it easy to filter and analyze logs.
 
 \subsection{Connection Manager Extension}
 

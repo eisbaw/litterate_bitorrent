@@ -40,3 +40,6 @@ proptest = "1"
 
 # Temporary files and directories for testing
 tempfile = "3"
+
+# Serial test execution for tests that modify global state (env vars)
+serial_test = "3"

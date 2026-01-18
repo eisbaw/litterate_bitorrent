@@ -974,8 +974,12 @@ mod tests {
 // Note: Testing init_logging directly is challenging because tracing_subscriber
 // can only be initialized once per process. The tests below validate the filter
 // construction logic in isolation.
+//
+// These tests modify the RUST_LOG environment variable, which is global state.
+// They must run serially to avoid race conditions.
 #[cfg(test)]
 mod logging_tests {
+    use serial_test::serial;
     use tracing_subscriber::EnvFilter;
     use std::env;
 
@@ -987,6 +991,7 @@ mod logging_tests {
     }
 
     #[test]
+    #[serial]
     fn default_filter_is_info() {
         // Temporarily clear RUST_LOG to test default behavior
         let original = env::var("RUST_LOG").ok();
@@ -1009,6 +1014,7 @@ mod logging_tests {
     }
 
     #[test]
+    #[serial]
     fn verbose_filter_is_debug() {
         // Temporarily clear RUST_LOG to test default behavior
         let original = env::var("RUST_LOG").ok();
@@ -1029,6 +1035,7 @@ mod logging_tests {
     }
 
     #[test]
+    #[serial]
     fn invalid_rust_log_does_not_crash() {
         // Set an invalid RUST_LOG value
         let original = env::var("RUST_LOG").ok();
@@ -1053,6 +1060,7 @@ mod logging_tests {
     }
 
     #[test]
+    #[serial]
     fn valid_rust_log_is_respected() {
         // Set a valid RUST_LOG value
         let original = env::var("RUST_LOG").ok();
@@ -1076,6 +1084,7 @@ mod logging_tests {
     }
 
     #[test]
+    #[serial]
     fn rust_log_overrides_verbose() {
         // RUST_LOG should take precedence over verbose flag
         let original = env::var("RUST_LOG").ok();

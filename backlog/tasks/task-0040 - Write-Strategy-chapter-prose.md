@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 00:32'
+updated_date: '2026-01-18 00:37'
 labels: []
 dependencies: []
 ---
@@ -40,30 +40,10 @@ Strategy determines download efficiency. This chapter explains peer selection cr
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive download strategy prose to nw/05-pieces.nw:
-
-- New \section{Download Strategy} introducing the three pillars: peer selection, piece selection, and request scheduling
-- \subsection{Peer Selection Criteria} covering connection limits, peer prioritization (upload speed, piece availability, rare piece holders, geographic proximity), and optimistic unchoking
-- Enhanced \subsection{Rarest-First Piece Selection} with:
-  - Piece extinction math showing P(extinction) = p^a
-  - Game-theoretic benefits explaining the virtuous cycle
-  - Comparison with alternative strategies (random, sequential, most-common-first)
-- New \subsection{Request Pipelining} with:
-  - Latency problem explanation with throughput formulas
-  - Bandwidth-delay product (BDP) math for optimal queue depth
-  - Example calculations for 10Mbps/100ms and 100Mbps/50ms scenarios
-  - Practical considerations (memory, fairness, peer limits)
-- New \subsection{Endgame Mode} documenting:
-  - When to enter endgame mode
-  - Mechanics (duplicate requests, cancel messages)
-  - Tradeoffs and implementation status note
-- New \subsection{Strategy Tradeoffs and Swarm Health} covering:
-  - Individual vs collective optimization
-  - Free-rider problem and tit-for-tat
-  - Pipeline depth fairness
-  - Seeder economics
-  - Network effects
-  - Summary of healthy swarm properties
-
-All content uses LaTeX formatting with formulas, itemize/enumerate/description environments, and references code chunks with [[chunk name]] syntax. Both just tangle and just weave succeed, and all 799 cargo tests pass.
+Added comprehensive Strategy chapter prose:
+- Peer selection criteria with connection limits and prioritization
+- Rarest-first explanation with extinction prevention math
+- Request pipelining with BDP formula and worked examples
+- Endgame mode documentation
+- Strategy tradeoffs and swarm health section
 <!-- SECTION:NOTES:END -->
