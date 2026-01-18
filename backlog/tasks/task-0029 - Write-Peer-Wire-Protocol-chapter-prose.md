@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 00:10'
+updated_date: '2026-01-18 00:14'
 labels: []
 dependencies: []
 ---
@@ -40,19 +40,10 @@ The peer wire protocol is the heart of BitTorrent - how peers communicate. This 
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive prose documentation to nw/04-messages.nw:
-
-- Added Protocol Overview section with two-phase explanation (handshake vs message exchange)
-- Added Message Framing subsection with ASCII diagram showing length-prefixed format
-- Added Choking/Interested State Machine section with 4-state diagram showing when data can flow
-- Enhanced Handshake Wire Format with byte offsets and field breakdown
-- Added Detailed Message Wire Formats section with ASCII diagrams for all 9 message types
-- Added Message Types Summary table for quick reference
-
-Key prose additions:
-- Clear explanation that data can only flow when: requester is interested AND sender has unchoked
-- Bitfield encoding example showing spare bit handling
-- Request/Piece/Cancel format with typical values
-
-Verified: just tangle and just weave both succeed, all 134 messages module tests pass.
+Added comprehensive Peer Wire Protocol chapter prose:
+- Protocol overview with handshake vs message phases
+- Message framing diagram with length prefix
+- Choking/interested state machine diagram
+- Message types summary table
+- Wire format diagrams for all 9 message types
 <!-- SECTION:NOTES:END -->

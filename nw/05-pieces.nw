@@ -8,11 +8,223 @@ a SHA1 hash stored in the torrent metadata. Piece management is the heart of a
 BitTorrent client: it tracks which pieces we have, verifies downloaded data
 against expected hashes, and writes verified pieces to disk.
 
-This chapter defines the error types for piece operations. Piece management can
-fail in several distinct ways, and our error types are designed to provide
-sufficient context for debugging without requiring additional logging.
+\subsection{Piece and Block Geometry Overview}
+
+Before diving into implementation, we must understand the fundamental geometry of
+BitTorrent data organization. The protocol operates at two granularities:
+\textbf{pieces} and \textbf{blocks}.
+
+\subsubsection{Pieces: The Unit of Integrity}
+
+A \textbf{piece} is the unit of integrity verification. The torrent's metainfo file
+contains a [[piece\_length]] field (typically 256~KiB to 4~MiB) and a concatenated
+string of 20-byte SHA1 hashes---one for each piece. When we download a complete piece,
+we compute its SHA1 hash and compare it against the expected hash. Only if the hashes
+match do we consider the piece verified and write it to disk.
+
+The number of pieces in a torrent is calculated as:
+\[
+\text{num\_pieces} = \left\lceil \frac{\text{total\_length}}{\text{piece\_length}} \right\rceil
+\]
+
+For example, a 1~GB file with 256~KiB pieces would have:
+\[
+\left\lceil \frac{1073741824}{262144} \right\rceil = \left\lceil 4096 \right\rceil = 4096 \text{ pieces}
+\]
+
+\subsubsection{Blocks: The Unit of Transfer}
+
+While pieces are the unit of integrity, \textbf{blocks} are the unit of network
+transfer. A piece is too large to request atomically---requesting a full 256~KiB
+piece and waiting for a response would incur unacceptable latency. Instead, peers
+exchange smaller blocks, typically 16~KiB ($2^{14}$ bytes).
+
+The [[BLOCK\_SIZE]] constant defines this transfer unit:
+\[
+\texttt{BLOCK\_SIZE} = 16384 \text{ bytes} = 16 \text{ KiB} = 2^{14}
+\]
+
+The number of blocks per piece is:
+\[
+\text{blocks\_per\_piece} = \left\lceil \frac{\text{piece\_length}}{\texttt{BLOCK\_SIZE}} \right\rceil
+\]
+
+For a standard 256~KiB piece:
+\[
+\left\lceil \frac{262144}{16384} \right\rceil = \left\lceil 16 \right\rceil = 16 \text{ blocks}
+\]
+
+\subsubsection{Last Piece and Last Block Handling}
+
+The last piece of a torrent is often smaller than [[piece\_length]] because the total
+content length is rarely an exact multiple of the piece length. Similarly, the last
+block of a piece may be smaller than [[BLOCK\_SIZE]].
+
+\begin{verbatim}
+Example: A 1,000,000 byte torrent with piece_length=262144 (256 KiB)
+
+Total pieces: ceil(1000000 / 262144) = 4 pieces
+
+Piece 0: bytes       0 -  262143  (262144 bytes, full piece)
+Piece 1: bytes  262144 -  524287  (262144 bytes, full piece)
+Piece 2: bytes  524288 -  786431  (262144 bytes, full piece)
+Piece 3: bytes  786432 -  999999  (213568 bytes, PARTIAL)
+
+Last piece size = 1000000 - (3 * 262144) = 213568 bytes
+Blocks in last piece = ceil(213568 / 16384) = 14 blocks
+Last block size = 213568 - (13 * 16384) = 576 bytes
+\end{verbatim}
+
+The formulas for actual sizes are:
+\begin{align*}
+\text{piece\_size}(i) &= \begin{cases}
+  \text{piece\_length} & \text{if } i < \text{num\_pieces} - 1 \\
+  \text{total\_length} - ((\text{num\_pieces}-1) \times \text{piece\_length}) & \text{if } i = \text{num\_pieces} - 1
+\end{cases}
+\end{align*}
+
+\begin{align*}
+\text{block\_size}(p, b) &= \begin{cases}
+  \texttt{BLOCK\_SIZE} & \text{if } b < \text{blocks\_in\_piece}(p) - 1 \\
+  \text{piece\_size}(p) - (b \times \texttt{BLOCK\_SIZE}) & \text{otherwise}
+\end{cases}
+\end{align*}
+
+These calculations are implemented in the [[piece\_size]], [[block\_size]], and
+[[blocks\_per\_piece]] functions defined later in this chapter.
+
+\subsection{Byte Stream to File Mapping}
+
+BitTorrent treats all files in a torrent as a single contiguous byte stream. This
+conceptual model is crucial for understanding how pieces map to actual files on disk.
+
+\subsubsection{The Virtual Byte Stream}
+
+Consider a multi-file torrent with three files:
+
+\begin{verbatim}
+File Layout in Virtual Byte Stream (3 files, 100 bytes each):
+
+   Byte:     0          100         200         300
+            |-----------|-----------|-----------|
+            | file0.txt | file1.txt | file2.txt |
+            |  (100 B)  |  (100 B)  |  (100 B)  |
+            |-----------|-----------|-----------|
+
+   Piece boundaries (piece_length = 64 bytes):
+
+   Piece 0: bytes   0 -  63   [entirely in file0.txt]
+   Piece 1: bytes  64 - 127   [36B in file0 (64-99), 28B in file1 (100-127)]
+   Piece 2: bytes 128 - 191   [entirely in file1.txt]
+   Piece 3: bytes 192 - 255   [8B in file1 (192-199), 56B in file2 (200-255)]
+   Piece 4: bytes 256 - 299   [entirely in file2.txt, only 44 bytes - PARTIAL]
+\end{verbatim}
+
+\subsubsection{Mapping Algorithm}
+
+When writing a verified piece to disk, we must determine which file(s) it spans
+and what byte ranges within each file. The [[map\_piece\_to\_files]] function in
+the disk module implements this mapping:
+
+\begin{enumerate}
+\item Calculate the piece's byte range in the virtual stream:
+  $[\text{piece\_index} \times \text{piece\_length}, \min((\text{piece\_index}+1) \times \text{piece\_length}, \text{total\_length}))$
+\item Walk through files in order, tracking cumulative byte offsets
+\item For each file, compute the overlap with the piece's byte range
+\item Return a [[FileSlice]] for each overlapping file segment
+\end{enumerate}
+
+A [[FileSlice]] contains three fields:
+\begin{description}
+\item[file\_index] Which file in the torrent's file list
+\item[file\_offset] Byte offset within that file where writing begins
+\item[length] Number of bytes to write to this file
+\end{description}
+
+\begin{verbatim}
+Example: Piece 1 in the torrent above (bytes 64-127)
+
+Walking through files:
+  File 0: bytes 0-99, overlaps piece at 64-99 (36 bytes)
+    -> FileSlice { file_index: 0, file_offset: 64, length: 36 }
+  File 1: bytes 100-199, overlaps piece at 100-127 (28 bytes)
+    -> FileSlice { file_index: 1, file_offset: 0, length: 28 }
+  File 2: bytes 200-299, no overlap with piece 1
+
+Result: Two FileSlices, piece data split across two files
+\end{verbatim}
+
+For single-file torrents, the mapping is trivial: every piece maps to exactly
+one [[FileSlice]] at offset $\text{piece\_index} \times \text{piece\_length}$
+within the single file.
+
+\subsection{Disk I/O Strategy}
+
+Once a piece is verified, we must write it to disk. Our disk I/O strategy
+prioritizes simplicity and pedagogical clarity over maximum performance.
+
+\subsubsection{Sparse File Pre-Allocation}
+
+Before downloading begins, we create all output files as \textbf{sparse files}
+using [[File::set\_len]]. A sparse file has a logical size (as reported by [[ls -l]])
+but consumes disk space only for regions that have been written. This provides
+several benefits:
+
+\begin{itemize}
+\item \textbf{Fast initialization}: Creating a 4~GB sparse file is nearly instant;
+  we update filesystem metadata without writing any data.
+\item \textbf{Efficient partial downloads}: A half-finished download consumes only
+  half the disk space, not the full file size.
+\item \textbf{Resume support}: The sparse regions clearly indicate which parts
+  have not yet been written.
+\end{itemize}
+
+Most modern filesystems---ext4, Btrfs, NTFS, APFS---support sparse files
+transparently. On these systems, [[set\_len(4GB)]] completes in microseconds
+regardless of the size.
+
+\subsubsection{Seek-and-Write Approach}
+
+When writing a verified piece, we use explicit seek and write operations:
+
+\begin{enumerate}
+\item Map the piece to file slices using [[map\_piece\_to\_files]]
+\item For each [[FileSlice]]:
+  \begin{enumerate}
+  \item Open the file for writing
+  \item Seek to [[file\_offset]]
+  \item Write [[length]] bytes from the piece data
+  \end{enumerate}
+\end{enumerate}
+
+This approach is straightforward and matches how BitTorrent naturally operates:
+pieces arrive in arbitrary order, and each piece writes to a specific byte range.
+The explicit seek makes the write position clear, aiding debugging and understanding.
+
+\subsubsection{No Write Coalescing or Caching}
+
+A production client might batch writes or use memory-mapped files for performance.
+We deliberately avoid these optimizations:
+
+\begin{itemize}
+\item \textbf{No write caching}: Each [[write\_piece]] call goes directly to the
+  filesystem. This makes the system state predictable and debugging easier.
+\item \textbf{No memory mapping}: Memory-mapped files can complicate error handling
+  (SIGBUS on I/O errors) and make the data flow less explicit.
+\item \textbf{No fsync after each piece}: We rely on the OS buffer cache for
+  durability. A crash might lose recently-written pieces, but this is acceptable
+  for a teaching implementation.
+\end{itemize}
+
+These choices favor clarity over performance. A real-world client downloading
+from fast connections might benefit from more sophisticated I/O strategies, but
+such optimizations would obscure the fundamental algorithms.
 
 \subsection{Piece Error Types}
+
+This section defines the error types for piece operations. Piece management can
+fail in several distinct ways, and our error types are designed to provide
+sufficient context for debugging without requiring additional logging.
 
 Piece operations fail for four main reasons:
 
@@ -536,10 +748,58 @@ impl PieceError {
 
 \subsection{Piece Hash Verification}
 
-The fundamental integrity guarantee of BitTorrent is that every piece has a known
-SHA1 hash stored in the torrent metadata. After downloading all blocks of a piece,
-we must compute the SHA1 hash of the assembled data and compare it against the
-expected hash. Only pieces that pass this verification should be written to disk.
+SHA1 hash verification is the fundamental integrity guarantee of BitTorrent. Unlike
+traditional file downloads over HTTP where corruption might go undetected, BitTorrent
+provides cryptographic verification of every piece of data received.
+
+\subsubsection{The Security Model}
+
+The torrent's metainfo file (the \texttt{.torrent} file) is considered the trusted
+root. It contains a concatenated string of 20-byte SHA1 hashes---one for each piece.
+When we download a piece from a peer (which could be anyone on the internet), we
+compute the SHA1 hash of the received data and compare it against the expected hash
+from the metainfo.
+
+This model provides several guarantees:
+
+\begin{description}
+\item[Data integrity] Any corruption---whether from network errors, disk failures,
+  or malicious peers---is detected with overwhelming probability. SHA1 produces a
+  160-bit hash; the probability of a random corruption producing a matching hash is
+  $2^{-160}$, astronomically small.
+
+\item[Decentralized trust] We do not need to trust individual peers. A peer can
+  send us garbage data, and we will detect it. The only trusted party is whoever
+  created the torrent file.
+
+\item[Partial verification] Each piece is verified independently. If one piece
+  fails, we discard only that piece and request it from different peers. The rest
+  of the download is unaffected.
+
+\item[Resume capability] When resuming a download, we can verify which pieces on
+  disk are complete and correct by recomputing their hashes. This enables reliable
+  resume after crashes or restarts.
+\end{description}
+
+\subsubsection{When Verification Fails}
+
+A hash mismatch indicates one of three situations:
+
+\begin{enumerate}
+\item \textbf{Malicious peer}: A peer intentionally sent corrupt data. This is rare
+  but possible. The standard response is to re-download from different peers and
+  potentially ban the offending peer.
+
+\item \textbf{Network corruption}: TCP includes checksums, but they are not
+  cryptographically strong. Very rarely, corruption can slip through. SHA1
+  verification catches this.
+
+\item \textbf{Bug in client}: Our code might have a bug in block assembly or
+  the verification logic itself. Including both expected and computed hashes in
+  error messages aids debugging.
+\end{enumerate}
+
+\subsubsection{The Verification Process}
 
 The verification function is straightforward:
 \begin{enumerate}

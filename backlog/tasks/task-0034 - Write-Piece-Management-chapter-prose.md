@@ -1,9 +1,11 @@
 ---
 id: task-0034
 title: Write Piece Management chapter prose
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-01-16 21:28'
+updated_date: '2026-01-18 00:20'
 labels: []
 dependencies: []
 ---
@@ -16,9 +18,27 @@ Piece management bridges the protocol to disk. This chapter explains piece and b
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Piece and block geometry explained with calculations (piece_length, BLOCK_SIZE, blocks_per_piece)
-- [ ] #2 Last piece handling documented (may be smaller than piece_length)
-- [ ] #3 Byte stream to file mapping for multi-file torrents has diagram and algorithm
-- [ ] #4 SHA1 verification process explained with emphasis on integrity guarantees
-- [ ] #5 Disk I/O strategy documented: seek+write approach, sparse files, no pre-allocation
+- [x] #1 Piece and block geometry explained with calculations (piece_length, BLOCK_SIZE, blocks_per_piece)
+- [x] #2 Last piece handling documented (may be smaller than piece_length)
+- [x] #3 Byte stream to file mapping for multi-file torrents has diagram and algorithm
+- [x] #4 SHA1 verification process explained with emphasis on integrity guarantees
+- [x] #5 Disk I/O strategy documented: seek+write approach, sparse files, no pre-allocation
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Added comprehensive prose to nw/05-pieces.nw explaining piece management concepts:
+
+- **Piece and Block Geometry Overview**: New section with formulas for num_pieces, blocks_per_piece, piece_size, and block_size calculations. Includes worked example showing 1,000,000 byte torrent with 4 pieces.
+
+- **Last Piece and Last Block Handling**: Detailed explanation with verbatim diagram showing how the last piece is often smaller, with formulas for calculating actual sizes.
+
+- **Byte Stream to File Mapping**: New section with ASCII diagram showing 3-file torrent mapped to virtual byte stream. Explains how piece 1 spans file boundaries with FileSlice mapping algorithm.
+
+- **SHA1 Verification**: Expanded security model section covering data integrity, decentralized trust, partial verification, and resume capability. Documents what happens when verification fails.
+
+- **Disk I/O Strategy**: New section documenting sparse file pre-allocation, seek-and-write approach, and explicit non-use of write coalescing/caching for pedagogical clarity.
+
+All prose uses LaTeX math mode for formulas and verbatim environments for diagrams. Tests pass: just tangle, just weave, and cargo test all succeed.
+<!-- SECTION:NOTES:END -->
