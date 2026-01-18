@@ -491,6 +491,236 @@ impl PeerRequestQueue {
 }
 @
 
+\subsection{Token Bucket Rate Limiter}
+
+To prevent the BitTorrent client from saturating the user's internet connection,
+we implement a \emph{token bucket} rate limiter. This is a classic algorithm
+for traffic shaping that provides smooth rate limiting while allowing short
+bursts of traffic.
+
+The token bucket works as follows:
+
+\begin{enumerate}
+\item The bucket holds tokens, where each token represents one byte of data.
+\item Tokens are added to the bucket at a constant rate (the configured rate limit).
+\item The bucket has a maximum capacity (we use 1 second worth of tokens).
+\item To send/receive data, the caller must acquire tokens. If insufficient
+  tokens are available, the caller waits until enough tokens accumulate.
+\end{enumerate}
+
+This approach has several advantages:
+
+\begin{itemize}
+\item \textbf{Smooth limiting}: Traffic is spread evenly over time, avoiding
+  spiky patterns that can cause latency issues.
+\item \textbf{Burst tolerance}: The bucket capacity allows short bursts when
+  the network has been idle, improving responsiveness.
+\item \textbf{Simple implementation}: No complex scheduling or queuing is needed.
+\end{itemize}
+
+<<token bucket rate limiter>>=
+use tokio::sync::Mutex;
+
+/// A token bucket rate limiter for network I/O.
+///
+/// Limits the rate of data transfer by requiring callers to acquire tokens
+/// before reading or writing data. Tokens are replenished at a configurable
+/// rate (bytes per second).
+///
+/// # Design
+///
+/// The implementation uses a lazy refill strategy: tokens are not added
+/// continuously but calculated on-demand based on elapsed time since the
+/// last access. This is efficient and accurate for our use case.
+///
+/// The bucket capacity is set to the rate limit (1 second worth of tokens),
+/// allowing for short bursts after idle periods while still enforcing the
+/// average rate limit over longer periods.
+///
+/// # Thread Safety
+///
+/// The rate limiter is designed to be shared across async tasks. The internal
+/// state is protected by a Mutex to ensure correct behavior when multiple
+/// peers are transferring data concurrently.
+///
+/// # Example
+///
+/// ```
+/// use literate_bittorrent::client::TokenBucket;
+/// use std::sync::Arc;
+///
+/// // Create a rate limiter for 1 MB/s
+/// let limiter = Arc::new(TokenBucket::new(1024 * 1024));
+///
+/// // In an async context, acquire tokens before I/O
+/// // limiter.acquire(16384).await;
+/// ```
+#[derive(Debug)]
+pub struct TokenBucket {
+    /// Rate at which tokens are added (bytes per second).
+    rate: u64,
+
+    /// Current number of available tokens.
+    /// Protected by Mutex for thread-safe access.
+    tokens: Mutex<f64>,
+
+    /// Maximum capacity of the bucket (equals rate for 1 second burst).
+    capacity: u64,
+
+    /// Last time tokens were refilled.
+    /// Uses std::time::Instant for monotonic time.
+    last_refill: Mutex<std::time::Instant>,
+}
+
+impl TokenBucket {
+    /// Creates a new token bucket with the specified rate limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `rate` - Maximum bytes per second to allow
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rate` is 0. Use `Option<TokenBucket>` to represent
+    /// "no limit" instead.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use literate_bittorrent::client::TokenBucket;
+    ///
+    /// // 1 MB/s rate limit
+    /// let limiter = TokenBucket::new(1024 * 1024);
+    /// ```
+    pub fn new(rate: u64) -> Self {
+        assert!(rate > 0, "rate limit must be positive");
+        Self {
+            rate,
+            tokens: Mutex::new(rate as f64), // Start with full bucket
+            capacity: rate,
+            last_refill: Mutex::new(std::time::Instant::now()),
+        }
+    }
+
+    /// Returns the configured rate limit in bytes per second.
+    pub fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    /// Acquires tokens for the specified number of bytes.
+    ///
+    /// If sufficient tokens are available, returns immediately. Otherwise,
+    /// waits until enough tokens have accumulated based on the rate limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes (tokens) to acquire
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Before sending 16KB of data
+    /// limiter.acquire(16384).await;
+    /// socket.write_all(&data).await?;
+    /// ```
+    pub async fn acquire(&self, bytes: u64) {
+        loop {
+            // Refill tokens based on elapsed time
+            {
+                let mut last_refill = self.last_refill.lock().await;
+                let mut tokens = self.tokens.lock().await;
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(*last_refill);
+
+                // Add tokens based on elapsed time
+                let new_tokens = elapsed.as_secs_f64() * self.rate as f64;
+                *tokens = (*tokens + new_tokens).min(self.capacity as f64);
+                *last_refill = now;
+
+                // Check if we have enough tokens
+                if *tokens >= bytes as f64 {
+                    *tokens -= bytes as f64;
+                    return;
+                }
+            }
+
+            // Calculate wait time for required tokens
+            let tokens_needed = {
+                let tokens = self.tokens.lock().await;
+                (bytes as f64 - *tokens).max(0.0)
+            };
+
+            let wait_secs = tokens_needed / self.rate as f64;
+            tokio::time::sleep(Duration::from_secs_f64(wait_secs)).await;
+        }
+    }
+
+    /// Attempts to acquire tokens without blocking.
+    ///
+    /// Returns `true` if tokens were acquired, `false` if insufficient
+    /// tokens are available. This is useful for non-blocking scenarios
+    /// where waiting is not acceptable.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Number of bytes (tokens) to acquire
+    ///
+    /// # Returns
+    ///
+    /// `true` if tokens were successfully acquired, `false` otherwise.
+    pub async fn try_acquire(&self, bytes: u64) -> bool {
+        let mut last_refill = self.last_refill.lock().await;
+        let mut tokens = self.tokens.lock().await;
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(*last_refill);
+
+        // Refill tokens
+        let new_tokens = elapsed.as_secs_f64() * self.rate as f64;
+        *tokens = (*tokens + new_tokens).min(self.capacity as f64);
+        *last_refill = now;
+
+        // Try to acquire
+        if *tokens >= bytes as f64 {
+            *tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns the current number of available tokens (approximately).
+    ///
+    /// This method performs a refill calculation based on elapsed time,
+    /// so it returns an up-to-date value. However, the value may change
+    /// immediately after this method returns due to other tasks.
+    pub async fn available_tokens(&self) -> u64 {
+        let mut last_refill = self.last_refill.lock().await;
+        let mut tokens = self.tokens.lock().await;
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(*last_refill);
+
+        // Refill tokens based on elapsed time
+        let new_tokens = elapsed.as_secs_f64() * self.rate as f64;
+        *tokens = (*tokens + new_tokens).min(self.capacity as f64);
+        *last_refill = now;
+
+        *tokens as u64
+    }
+}
+@
+
+The [[acquire]] method is the primary interface for rate limiting. Before
+performing I/O, the caller acquires tokens equal to the number of bytes
+to be transferred. If the bucket is empty, the method waits until enough
+tokens have accumulated.
+
+We use a loop rather than a single wait because:
+\begin{enumerate}
+\item Floating-point timing calculations may not be perfectly accurate.
+\item Multiple tasks may race to acquire tokens.
+\item This pattern is robust against spurious wakeups.
+\end{enumerate}
+
 \subsection{Client State}
 
 The [[Client]] struct holds all state for a single torrent download. In the
@@ -2068,6 +2298,8 @@ The client module exports the [[Client]] struct and associated types.
 
 <<peer request queue>>
 
+<<token bucket rate limiter>>
+
 <<shutdown controller>>
 
 <<signal handler setup>>
@@ -2109,6 +2341,8 @@ The client module exports the [[Client]] struct and associated types.
 <<framed message writing tests>>
 
 <<peer request queue tests>>
+
+<<token bucket tests>>
 
 <<request pipelining tests>>
 
@@ -6607,6 +6841,142 @@ mod peer_request_queue_tests {
         // With zero timeout, all three are timed out
         let timed_out = queue.check_timeouts_with(Duration::ZERO);
         assert_eq!(timed_out.len(), 3);
+    }
+}
+@
+
+\subsection{Token Bucket Rate Limiter Tests}
+
+We test the token bucket rate limiter to verify it correctly limits throughput
+and handles various edge cases.
+
+<<token bucket tests>>=
+#[cfg(test)]
+mod token_bucket_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn token_bucket_new_creates_full_bucket() {
+        let bucket = TokenBucket::new(1000);
+        assert_eq!(bucket.rate(), 1000);
+        // Bucket starts with capacity tokens (1 second worth)
+        assert_eq!(bucket.available_tokens().await, 1000);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "rate limit must be positive")]
+    async fn token_bucket_zero_rate_panics() {
+        let _ = TokenBucket::new(0);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_acquire_consumes_tokens() {
+        let bucket = TokenBucket::new(1000);
+
+        // Initial state: 1000 tokens
+        assert_eq!(bucket.available_tokens().await, 1000);
+
+        // Acquire 500 tokens
+        bucket.acquire(500).await;
+
+        // Should have ~500 remaining (small refill from elapsed time)
+        let remaining = bucket.available_tokens().await;
+        assert!(remaining <= 500, "should have consumed tokens: {}", remaining);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_try_acquire_succeeds_when_available() {
+        let bucket = TokenBucket::new(1000);
+
+        // Should succeed with full bucket
+        assert!(bucket.try_acquire(500).await);
+
+        // Should have consumed tokens
+        let remaining = bucket.available_tokens().await;
+        assert!(remaining < 600, "should have consumed tokens: {}", remaining);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_try_acquire_fails_when_insufficient() {
+        let bucket = TokenBucket::new(100);
+
+        // First acquire should succeed
+        assert!(bucket.try_acquire(100).await);
+
+        // Immediate second acquire should fail (not enough time to refill)
+        assert!(!bucket.try_acquire(100).await);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_refills_over_time() {
+        let bucket = TokenBucket::new(100000); // 100000 bytes/sec (high rate for reliable test)
+
+        // Consume all tokens
+        bucket.acquire(100000).await;
+        let after_drain = bucket.available_tokens().await;
+        assert!(after_drain < 1000, "should be nearly empty: {}", after_drain);
+
+        // Wait for refill (100ms should add ~10000 tokens at 100000/sec)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let after_wait = bucket.available_tokens().await;
+        // Should have refilled some (accounting for timing variance - at least 5000 tokens)
+        assert!(after_wait >= 5000, "should have refilled: {} tokens", after_wait);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_acquire_waits_when_empty() {
+        let bucket = TokenBucket::new(10000); // 10000 bytes/sec
+
+        // Drain the bucket
+        bucket.acquire(10000).await;
+
+        let start = std::time::Instant::now();
+
+        // Request 1000 tokens (should wait ~100ms at 10000/sec)
+        bucket.acquire(1000).await;
+
+        let elapsed = start.elapsed();
+        // Should have waited approximately 100ms (allow variance for test flakiness)
+        assert!(
+            elapsed >= Duration::from_millis(50),
+            "should have waited: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn token_bucket_capacity_caps_at_rate() {
+        let bucket = TokenBucket::new(1000);
+
+        // Let a lot of time pass (simulated by not consuming)
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Available should still be at most capacity (1000)
+        let available = bucket.available_tokens().await;
+        assert!(available <= 1000, "should be capped at capacity: {}", available);
+    }
+
+    #[tokio::test]
+    async fn token_bucket_is_debug() {
+        let bucket = TokenBucket::new(1024);
+        let debug = format!("{:?}", bucket);
+        assert!(debug.contains("TokenBucket"));
+    }
+
+    #[tokio::test]
+    async fn token_bucket_small_acquisitions() {
+        let bucket = TokenBucket::new(1000000); // 1 MB/s
+
+        // Many small acquisitions should work
+        for _ in 0..100 {
+            bucket.acquire(1000).await;
+        }
+
+        // Should have consumed 100KB, leaving ~900KB
+        let remaining = bucket.available_tokens().await;
+        assert!(remaining <= 950000, "should have consumed tokens: {}", remaining);
     }
 }
 @

@@ -78,6 +78,24 @@ pub struct Args {
     /// and download progress.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Maximum download rate (bytes per second)
+    ///
+    /// Limits download speed to prevent saturating your internet connection.
+    /// Accepts human-readable suffixes: K (kilobytes), M (megabytes), G (gigabytes).
+    /// Examples: "1M" = 1 MB/s, "500K" = 500 KB/s, "10M" = 10 MB/s.
+    /// If not specified, download speed is unlimited.
+    #[arg(long, value_name = "RATE", value_parser = parse_rate_limit)]
+    pub max_download_rate: Option<u64>,
+
+    /// Maximum upload rate (bytes per second)
+    ///
+    /// Limits upload speed to prevent saturating your internet connection.
+    /// Accepts human-readable suffixes: K (kilobytes), M (megabytes), G (gigabytes).
+    /// Examples: "1M" = 1 MB/s, "500K" = 500 KB/s, "10M" = 10 MB/s.
+    /// If not specified, upload speed is unlimited.
+    #[arg(long, value_name = "RATE", value_parser = parse_rate_limit)]
+    pub max_upload_rate: Option<u64>,
 }
 @
 
@@ -99,7 +117,104 @@ each field:
 
 \item[verbose] A boolean flag that enables DEBUG-level logging. Flags don't
   take values; their presence sets the field to [[true]].
+
+\item[max\_download\_rate] An optional rate limit for download speed. Accepts
+  human-readable suffixes like [[1M]] for 1 megabyte per second. When set,
+  the client limits download speed to avoid saturating the user's connection.
+
+\item[max\_upload\_rate] An optional rate limit for upload speed. Similar to
+  [[max\_download\_rate]], this prevents the client from consuming all available
+  upload bandwidth, which can cause latency issues for other applications.
 \end{description}
+
+\subsection{Rate Limit Parsing}
+
+Users specify rate limits in human-readable format: [[1M]] means 1 megabyte per
+second, [[500K]] means 500 kilobytes per second. We need to parse these strings
+into byte counts. The parser uses 1024-based units (KiB/MiB/GiB) which matches
+user expectations for network speeds.
+
+<<rate limit parser>>=
+/// Parses a rate limit string with optional K/M/G suffix.
+///
+/// Accepts formats like:
+/// - "1000" - 1000 bytes per second
+/// - "1K" or "1k" - 1024 bytes per second (1 KiB)
+/// - "1M" or "1m" - 1048576 bytes per second (1 MiB)
+/// - "1G" or "1g" - 1073741824 bytes per second (1 GiB)
+/// - "1.5M" - 1572864 bytes per second (1.5 MiB)
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The string is empty
+/// - The numeric part cannot be parsed
+/// - The suffix is not recognized (must be K, M, G, or none)
+/// - The result would overflow u64
+///
+/// # Examples
+///
+/// ```
+/// use literate_bittorrent::cli::parse_rate_limit;
+///
+/// assert_eq!(parse_rate_limit("1000").unwrap(), 1000);
+/// assert_eq!(parse_rate_limit("1K").unwrap(), 1024);
+/// assert_eq!(parse_rate_limit("1M").unwrap(), 1024 * 1024);
+/// assert_eq!(parse_rate_limit("1G").unwrap(), 1024 * 1024 * 1024);
+/// assert_eq!(parse_rate_limit("1.5M").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
+/// ```
+pub fn parse_rate_limit(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("rate limit cannot be empty".to_string());
+    }
+
+    // Check for suffix and split into number and multiplier
+    let (num_part, multiplier) = if s.ends_with('K') || s.ends_with('k') {
+        (&s[..s.len() - 1], 1024u64)
+    } else if s.ends_with('M') || s.ends_with('m') {
+        (&s[..s.len() - 1], 1024u64 * 1024)
+    } else if s.ends_with('G') || s.ends_with('g') {
+        (&s[..s.len() - 1], 1024u64 * 1024 * 1024)
+    } else {
+        (s, 1u64)
+    };
+
+    // Parse the numeric part as f64 to support decimals like "1.5M"
+    let num: f64 = num_part.parse().map_err(|_| {
+        format!("invalid rate limit '{}': expected a number with optional K/M/G suffix", s)
+    })?;
+
+    if num < 0.0 {
+        return Err(format!("rate limit cannot be negative: '{}'", s));
+    }
+
+    // Calculate the final value
+    let result = num * multiplier as f64;
+
+    // Check for overflow
+    if result > u64::MAX as f64 {
+        return Err(format!("rate limit '{}' is too large", s));
+    }
+
+    Ok(result as u64)
+}
+@
+
+The parser handles several edge cases:
+
+\begin{itemize}
+\item \textbf{Decimal values}: [[1.5M]] is valid and equals 1.5 megabytes per second.
+  This is useful for fine-tuning bandwidth usage.
+
+\item \textbf{Case insensitivity}: Both [[1M]] and [[1m]] work the same way.
+
+\item \textbf{Plain numbers}: [[1000000]] with no suffix means 1,000,000 bytes per
+  second, allowing precise control when needed.
+
+\item \textbf{Overflow protection}: Values that would exceed [[u64::MAX]] are rejected
+  with a clear error message.
+\end{itemize}
 
 \subsection{Argument Parsing}
 
@@ -1228,6 +1343,8 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 //! println!("Port: {}", args.port);
 //! ```
 
+<<rate limit parser>>
+
 <<cli args>>
 
 <<cli parse>>
@@ -1257,6 +1374,8 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 <<cli tests>>
 
 <<cli validation tests>>
+
+<<rate limit tests>>
 
 <<error formatting tests>>
 @
@@ -1760,6 +1879,8 @@ mod validation_tests {
             output: PathBuf::from(output),
             port,
             verbose: false,
+            max_download_rate: None,
+            max_upload_rate: None,
         }
     }
 
@@ -2099,6 +2220,194 @@ mod validation_tests {
         let result = ValidationResult { warnings: vec![] };
         let debug = format!("{:?}", result);
         assert!(debug.contains("ValidationResult"));
+    }
+}
+@
+
+\subsection{Rate Limit Parsing Tests}
+
+We test the rate limit parser with various formats including suffixes,
+decimals, edge cases, and error conditions.
+
+<<rate limit tests>>=
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    // ========================================================================
+    // Basic parsing tests
+    // ========================================================================
+
+    #[test]
+    fn parse_plain_number() {
+        // Plain numbers without suffix
+        assert_eq!(parse_rate_limit("1000").unwrap(), 1000);
+        assert_eq!(parse_rate_limit("0").unwrap(), 0);
+        assert_eq!(parse_rate_limit("1").unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_kilobyte_suffix() {
+        // K suffix = 1024 bytes
+        assert_eq!(parse_rate_limit("1K").unwrap(), 1024);
+        assert_eq!(parse_rate_limit("1k").unwrap(), 1024);
+        assert_eq!(parse_rate_limit("10K").unwrap(), 10 * 1024);
+        assert_eq!(parse_rate_limit("500K").unwrap(), 500 * 1024);
+    }
+
+    #[test]
+    fn parse_megabyte_suffix() {
+        // M suffix = 1024 * 1024 bytes
+        assert_eq!(parse_rate_limit("1M").unwrap(), 1024 * 1024);
+        assert_eq!(parse_rate_limit("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_rate_limit("10M").unwrap(), 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_gigabyte_suffix() {
+        // G suffix = 1024 * 1024 * 1024 bytes
+        assert_eq!(parse_rate_limit("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_rate_limit("1g").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_rate_limit("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_decimal_values() {
+        // Decimal values with suffixes
+        assert_eq!(parse_rate_limit("1.5M").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
+        assert_eq!(parse_rate_limit("0.5K").unwrap(), 512);
+        assert_eq!(parse_rate_limit("2.5G").unwrap(), (2.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn parse_whitespace_trimmed() {
+        // Leading/trailing whitespace should be trimmed
+        assert_eq!(parse_rate_limit("  1M  ").unwrap(), 1024 * 1024);
+        assert_eq!(parse_rate_limit("\t1K\n").unwrap(), 1024);
+    }
+
+    // ========================================================================
+    // Error cases
+    // ========================================================================
+
+    #[test]
+    fn parse_empty_string_fails() {
+        let result = parse_rate_limit("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn parse_whitespace_only_fails() {
+        let result = parse_rate_limit("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_invalid_number_fails() {
+        let result = parse_rate_limit("abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid"));
+    }
+
+    #[test]
+    fn parse_invalid_suffix_fails() {
+        // T is not a valid suffix
+        let result = parse_rate_limit("1T");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_negative_number_fails() {
+        let result = parse_rate_limit("-1M");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("negative"));
+    }
+
+    #[test]
+    fn parse_suffix_only_fails() {
+        let result = parse_rate_limit("K");
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // CLI integration tests for rate limits
+    // ========================================================================
+
+    #[test]
+    fn cli_accepts_max_download_rate() {
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--max-download-rate", "1M",
+        ]).unwrap();
+
+        assert_eq!(args.max_download_rate, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn cli_accepts_max_upload_rate() {
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--max-upload-rate", "500K",
+        ]).unwrap();
+
+        assert_eq!(args.max_upload_rate, Some(500 * 1024));
+    }
+
+    #[test]
+    fn cli_accepts_both_rate_limits() {
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--max-download-rate", "10M",
+            "--max-upload-rate", "1M",
+        ]).unwrap();
+
+        assert_eq!(args.max_download_rate, Some(10 * 1024 * 1024));
+        assert_eq!(args.max_upload_rate, Some(1024 * 1024));
+    }
+
+    #[test]
+    fn cli_rate_limits_default_to_none() {
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+        ]).unwrap();
+
+        assert_eq!(args.max_download_rate, None);
+        assert_eq!(args.max_upload_rate, None);
+    }
+
+    #[test]
+    fn cli_invalid_rate_limit_fails() {
+        let result = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "--max-download-rate", "not-a-rate",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rate_limits_work_with_other_options() {
+        let args = Args::try_parse_from([
+            "literate-bittorrent",
+            "file.torrent",
+            "-o", "/tmp",
+            "-p", "6882",
+            "-v",
+            "--max-download-rate", "5M",
+            "--max-upload-rate", "1M",
+        ]).unwrap();
+
+        assert_eq!(args.output, PathBuf::from("/tmp"));
+        assert_eq!(args.port, 6882);
+        assert!(args.verbose);
+        assert_eq!(args.max_download_rate, Some(5 * 1024 * 1024));
+        assert_eq!(args.max_upload_rate, Some(1024 * 1024));
     }
 }
 @
