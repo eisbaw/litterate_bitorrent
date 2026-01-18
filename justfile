@@ -80,6 +80,11 @@ fmt-fix:
 e2e: tangle
     cargo test --test '*' -- --ignored --nocapture
 
+# Peer handshake test: test peer connection flow (connect, handshake, bitfield, interested, unchoke)
+# Requires network access to contact real BitTorrent peers
+test-peer-handshake: tangle
+    cargo test --test peer_integration -- --ignored --nocapture
+
 # ============================================================================
 # Workflow Recipes
 # ============================================================================

@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:34'
-updated_date: '2026-01-18 03:11'
+updated_date: '2026-01-18 03:14'
 labels:
   - tracker
   - integration-test
@@ -49,28 +49,11 @@ End-to-end verification that Phase 2 works: load a real .torrent file, perform a
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Created tests/tracker_integration.rs with two tests:
-
-1. test_announce_to_real_tracker (ignored, requires network)
-   - Loads ubuntu.torrent from tests/fixtures/
-   - Creates TrackerRequest with generated peer ID
-   - Calls announce() to contact Ubuntu tracker
-   - Prints peer list with IP:port pairs to stdout
-   - Handles empty peer list gracefully
-   - Validates interval > 0
-
-2. test_fixture_loads_correctly (no network required)
-   - Verifies fixture file can be parsed
-   - Validates info hash matches expected value
-
-Updated justfile e2e recipe:
-- Changed to cargo test --test "*" -- --ignored --nocapture
-- Runs only integration tests (not doc-tests)
-- Tangles before running
-
-Verified working:
-- just e2e successfully contacts Ubuntu tracker
-- Returns real peers (e.g., 185.125.190.59:6897)
-- Reports swarm stats (seeders, leechers)
-- just test passes all 95 tests
+Added tests/tracker_integration.rs with test_announce_to_real_tracker:
+- Loads ubuntu.torrent from tests/fixtures/
+- Announces to real Ubuntu tracker
+- Prints peer IP:port pairs to stdout
+- Handles empty peer list gracefully
+- Marked #[ignore] for network requirement
+- Run with just e2e or cargo test --ignored
 <!-- SECTION:NOTES:END -->
