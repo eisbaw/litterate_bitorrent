@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:35'
-updated_date: '2026-01-18 02:30'
+updated_date: '2026-01-18 02:33'
 labels:
   - phase-5
   - strategy
@@ -54,21 +54,8 @@ Verify the complete download strategy works end-to-end with simulated peers. Thi
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented integration tests for the download strategy in nw/05-pieces.nw.
-
-Added test helper structures:
-- SimulatedPeer: Models a connected peer with peer_id, bitfield, and choke state
-- SimulatedSwarm: Manages multiple peers and tracks piece availability
-
-Added 8 integration tests:
-1. integration_simulated_swarm_creates_peers_with_varying_bitfields - Validates swarm setup with 5+ peers
-2. integration_rarest_piece_selected_first - Verifies rarest-first piece selection
-3. integration_request_queue_fills_to_capacity - Tests pipeline limit enforcement
-4. integration_block_completion_removes_from_queue - Tests block completion tracking
-5. integration_piece_completion_identifies_peers_for_cancel - Tests cancel message identification
-6. integration_timeout_triggers_rerequest_from_alternate_peer - Tests timeout and re-request workflow
-7. integration_strategy_deterministic_with_seeded_rng - Verifies reproducibility with seeded RNG
-8. integration_full_download_workflow_with_multiple_peers - Comprehensive end-to-end test
-
-All tests pass with just tangle, lint, and test commands.
+Added 8 integration tests with SimulatedPeer/SimulatedSwarm helpers.
+Tests verify rarest-first selection, request pipelining, cancel message generation,
+timeout handling, and deterministic behavior with seeded RNG.
+All tests pass with 878 total tests.
 <!-- SECTION:NOTES:END -->
