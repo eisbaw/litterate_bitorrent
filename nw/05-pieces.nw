@@ -2328,6 +2328,111 @@ fn in_progress_piece_receive_all_blocks_any_order_completes() {
 }
 @
 
+\section{Download Strategy}
+
+Efficient downloading in BitTorrent requires more than simply requesting pieces
+as fast as possible. The download strategy determines \emph{which} pieces to
+request, \emph{from whom}, and \emph{how} to structure those requests for maximum
+throughput. A well-designed strategy serves two masters simultaneously:
+
+\begin{enumerate}
+\item \textbf{Individual performance}: Maximize our own download speed by
+  efficiently utilizing available bandwidth from all connected peers.
+\item \textbf{Swarm health}: Improve the overall resilience of the swarm by
+  ensuring rare pieces are replicated before they become unavailable.
+\end{enumerate}
+
+These goals are not in tension---a healthy swarm benefits every participant.
+When we download rare pieces, we become a source for those pieces, which
+encourages other peers to reciprocate with the pieces we need. The classic
+BitTorrent tit-for-tat mechanism rewards participants who contribute to swarm
+health.
+
+This section explores the three pillars of download strategy: \emph{peer
+selection} (who to connect with), \emph{piece selection} (what to download),
+and \emph{request scheduling} (how to structure requests for throughput).
+
+\subsection{Peer Selection Criteria}
+
+Before we can download anything, we must connect to peers. The tracker provides
+a list of potential peers, but not all peers are equally valuable. Effective
+peer selection balances several factors:
+
+\subsubsection{Connection Limits}
+
+Most BitTorrent clients limit the number of simultaneous peer connections,
+typically to 30--50 active connections. This limit exists for several reasons:
+
+\begin{itemize}
+\item \textbf{Resource constraints}: Each connection consumes memory (buffers,
+  state tracking) and file descriptors.
+\item \textbf{Diminishing returns}: Beyond a certain point, more connections
+  do not increase throughput---bandwidth becomes the bottleneck, not peer count.
+\item \textbf{Fairness}: Connecting to too many peers without uploading to them
+  makes us a poor swarm citizen.
+\end{itemize}
+
+Our implementation uses a configurable connection limit (see [[SchedulerConfig]]).
+When at the limit, we must decide which existing connections to keep and which
+new peers might be worth replacing them with.
+
+\subsubsection{Which Peers to Prioritize}
+
+Given limited connection slots, we prioritize peers based on:
+
+\begin{description}
+\item[Upload speed] Peers who send us data quickly are valuable. The tit-for-tat
+  mechanism naturally selects for fast uploaders: we unchoke peers who give us
+  data, and they reciprocate.
+
+\item[Piece availability] A peer who has pieces we need is more valuable than
+  one who only has pieces we already have. We track each peer's bitfield and
+  update it as they send ``have'' messages.
+
+\item[Rare piece holders] Peers who hold rare pieces deserve special consideration.
+  If only one peer in the swarm has piece 42, losing that connection means piece 42
+  becomes unavailable. We may tolerate slower speeds from such peers to maintain
+  access to rare content.
+
+\item[Geographic proximity] Lower latency connections often provide better
+  throughput, though this is less important than raw bandwidth. Some clients
+  prefer peers in the same autonomous system (AS) or country.
+
+\item[Protocol compliance] Peers who violate the protocol (sending malformed
+  messages, claiming pieces they don't have, sending corrupt data) should be
+  disconnected and potentially banned.
+\end{description}
+
+\subsubsection{Optimistic Unchoking}
+
+The tit-for-tat mechanism could create a chicken-and-egg problem: new peers
+have no upload history, so no one unchokes them, so they never get to download,
+so they have nothing to upload. BitTorrent solves this with \textbf{optimistic
+unchoking}: periodically (typically every 30 seconds), we unchoke a randomly
+selected peer regardless of their contribution.
+
+This mechanism:
+\begin{itemize}
+\item Allows new peers to bootstrap into the swarm
+\item Discovers potentially fast peers we haven't tried
+\item Maintains swarm connectivity when a peer has little to offer us directly
+\end{itemize}
+
+\subsubsection{Peer Selection in Practice}
+
+In our implementation, peer selection is handled by the connection manager
+(not covered in this chapter). The pieces module receives an already-connected
+peer with its bitfield and choke state. Our concern here is \emph{piece}
+selection---given a set of unchoked peers, which pieces should we request?
+
+The key insight is that peer selection and piece selection interact. We maintain
+\textbf{piece availability} (how many peers have each piece) precisely because
+it informs both decisions:
+\begin{itemize}
+\item For peer selection: prefer keeping connections to peers with rare pieces
+\item For piece selection: prioritize downloading rare pieces (rarest-first)
+\end{itemize}
+
 \subsection{Piece Availability Tracking}
 
 In order to implement the rarest-first piece selection strategy, we need to track
@@ -2941,6 +3046,81 @@ two critical goals:
   piece, we can upload it to other peers who want it, improving our reputation
   and reciprocation from the swarm.
 \end{enumerate}
+
+\subsubsection{Why Rarest-First Matters: Preventing Piece Extinction}
+
+Consider a swarm where the original seeder has left, and the remaining peers
+collectively have all pieces but no single peer has the complete file. This is
+common: the seeder uploads the file once, then leechers finish downloading and
+become seeds themselves, allowing the original seeder to leave.
+
+Now imagine a new peer joins the swarm. If everyone downloads pieces randomly,
+a problematic pattern emerges. Suppose piece 42 exists on only one peer (Alice),
+while piece 7 exists on ten peers. Random selection gives both pieces equal
+probability of being requested. But if Alice disconnects before anyone downloads
+piece 42, that piece is \textbf{extinct}---no one in the swarm has it, and the
+download can never complete.
+
+Rarest-first prevents extinction by ensuring rare pieces are replicated first.
+When multiple peers prioritize piece 42 (the rare one), it quickly spreads to
+many peers. By the time Alice might disconnect, piece 42 exists on five other
+peers. The swarm remains healthy.
+
+The mathematics of piece extinction are stark. If a piece has availability $a$
+(number of peers who have it), and each peer has probability $p$ of disconnecting
+in the next hour, the probability of extinction is approximately:
+\[
+P(\text{extinction}) \approx p^a
+\]
+
+For $p = 0.1$ (10\% chance of disconnecting):
+\begin{align*}
+a = 1: \quad P &= 0.1 \quad \text{(10\% chance of losing the piece)} \\
+a = 2: \quad P &= 0.01 \quad \text{(1\% chance)} \\
+a = 5: \quad P &= 0.00001 \quad \text{(essentially zero)}
+\end{align*}
+
+Rarest-first rapidly increases $a$ for vulnerable pieces, exponentially
+reducing extinction risk.
+
+\subsubsection{Game-Theoretic Benefits}
+
+Rarest-first also has game-theoretic advantages. In BitTorrent's tit-for-tat
+economy, peers who have rare pieces are valuable trading partners---others
+\emph{need} what they have. By acquiring rare pieces:
+
+\begin{itemize}
+\item We become desirable trading partners, attracting reciprocal uploads
+\item We can trade rare pieces for common ones when we need them
+\item We contribute to swarm health, which benefits everyone including ourselves
+\end{itemize}
+
+This creates a virtuous cycle: selfish behavior (getting rare pieces to trade)
+aligns with altruistic outcomes (keeping the swarm healthy).
+
+\subsubsection{Comparison with Alternative Strategies}
+
+Other piece selection strategies have significant drawbacks:
+
+\begin{description}
+\item[Random selection] Treats all pieces equally, ignoring availability.
+  Leads to piece extinction in swarms without persistent seeders.
+
+\item[Sequential selection] Downloads pieces in order (0, 1, 2, ...).
+  Good for streaming video but terrible for swarm health: everyone
+  downloads the same pieces, creating artificial scarcity of later pieces.
+  Also provides nothing to upload until near completion.
+
+\item[Most-common-first] The opposite of rarest-first. Maximizes short-term
+  download speed (common pieces have many sources) but destroys swarm health.
+  Rare pieces become rarer as everyone ignores them.
+\end{description}
+
+The only situation where rarest-first is suboptimal is streaming, where the
+user needs pieces in order to begin playback. Some clients offer a ``sequential
+mode'' for this use case, with the understanding that it harms swarm health.
+
+\subsubsection{Implementation Approach}
 
 The [[select_rarest]] function combines information from three sources:
 
@@ -3990,6 +4170,117 @@ fn select_next_blocks_last_piece_smaller() {
 }
 @
 
+\subsection{Request Pipelining}
+
+Having decided \emph{which} pieces to download (rarest-first) and \emph{from whom}
+(peers with those pieces), we now address \emph{how} to structure the requests.
+Request pipelining is the key technique for achieving high throughput.
+
+\subsubsection{The Latency Problem}
+
+Consider a naive approach: send one request, wait for the response, send the
+next request, wait, and so on. This stop-and-wait protocol severely limits
+throughput. If the round-trip time (RTT) between us and a peer is 100ms, and
+each block is 16 KiB, the maximum throughput is:
+\[
+\text{throughput}_{\text{stop-and-wait}} = \frac{\text{block\_size}}{\text{RTT}} = \frac{16384 \text{ bytes}}{0.1 \text{ s}} = 163840 \text{ bytes/s} \approx 160 \text{ KB/s}
+\]
+
+This is far below what modern internet connections can achieve. The problem is
+that the connection sits idle while we wait for responses---we spend most of
+our time waiting, not transferring data.
+
+\subsubsection{Pipelining: Hiding Latency}
+
+Request pipelining solves this by having multiple requests ``in flight''
+simultaneously. While waiting for the response to request 1, we've already
+sent requests 2, 3, 4, and more. By the time request 1's response arrives,
+request 2's response is close behind, and so on. The connection stays saturated.
+
+The key insight is that we're trading \emph{memory} (buffering multiple
+in-flight requests) for \emph{throughput}. Each in-flight request consumes:
+\begin{itemize}
+\item A small amount of memory for request metadata ($\approx$ 50 bytes)
+\item Eventually, buffer space for the response (16 KiB per block)
+\end{itemize}
+
+\subsubsection{Optimal Queue Depth}
+
+How many requests should be in flight simultaneously? This is the
+\textbf{pipeline depth} or \textbf{queue depth}. The answer depends on the
+\textbf{bandwidth-delay product} (BDP):
+\[
+\text{BDP} = \text{bandwidth} \times \text{RTT}
+\]
+
+The BDP represents the amount of data ``in the pipe'' at any moment. To fully
+utilize a connection, we need enough in-flight data to fill this pipe. With
+block size $B$:
+\[
+\text{optimal\_queue\_depth} = \left\lceil \frac{\text{BDP}}{B} \right\rceil = \left\lceil \frac{\text{bandwidth} \times \text{RTT}}{B} \right\rceil
+\]
+
+\paragraph{Example calculations:}
+
+For a 10 Mbps connection with 100ms RTT:
+\begin{align*}
+\text{BDP} &= 10 \times 10^6 \text{ bits/s} \times 0.1 \text{ s} = 10^6 \text{ bits} = 125000 \text{ bytes} \\
+\text{queue\_depth} &= \left\lceil \frac{125000}{16384} \right\rceil = \left\lceil 7.6 \right\rceil = 8 \text{ requests}
+\end{align*}
+
+For a 100 Mbps connection with 50ms RTT:
+\begin{align*}
+\text{BDP} &= 100 \times 10^6 \text{ bits/s} \times 0.05 \text{ s} = 625000 \text{ bytes} \\
+\text{queue\_depth} &= \left\lceil \frac{625000}{16384} \right\rceil = \left\lceil 38 \right\rceil = 38 \text{ requests}
+\end{align*}
+
+\subsubsection{Practical Queue Depth Limits}
+
+While the BDP calculation suggests optimal queue depths, practical considerations
+impose limits:
+
+\begin{description}
+\item[Memory pressure] Each in-flight request will eventually need buffer space
+  for its response. With 16 KiB blocks and 50 requests, that's 800 KiB per peer.
+  With 30 peers, that's 24 MB of buffers---not excessive, but worth considering.
+
+\item[Fairness] Sending too many requests to one peer may starve other peers
+  of our attention. BitTorrent's tit-for-tat mechanism encourages spreading
+  requests across multiple peers.
+
+\item[Peer limits] Some peers may have their own request queue limits and drop
+  excess requests. The de facto standard maximum is around 250 requests, though
+  most clients use far fewer.
+
+\item[Timeout complexity] More in-flight requests mean more state to track and
+  more complex timeout handling.
+\end{description}
+
+The BitTorrent community has converged on \textbf{10--16 requests per peer} as
+a practical default. This provides excellent throughput for typical connections
+(10--20 Mbps per peer with 50--100ms latency) while keeping memory usage reasonable.
+
+Our implementation defaults to 10 requests per peer (see [[SchedulerConfig]]),
+which is conservative but works well across a wide range of network conditions.
+The limit is configurable for users with unusual requirements.
+
+\subsubsection{Queue Depth and Multiple Peers}
+
+When downloading from multiple peers simultaneously, the total queue depth is
+the sum of per-peer depths. With 10 peers and 10 requests per peer, we have
+100 total in-flight requests. This provides several benefits:
+
+\begin{itemize}
+\item \textbf{Aggregate bandwidth}: Even if each peer is slow, many slow peers
+  add up to fast downloads.
+\item \textbf{Resilience}: If one peer stalls, others continue delivering data.
+\item \textbf{Piece diversity}: Different peers have different pieces, enabling
+  parallel progress on multiple pieces.
+\end{itemize}
+
+The scheduler distributes requests across all unchoked peers, respecting each
+peer's individual pipeline limit while maximizing aggregate throughput.
+
 \subsection{Request Scheduler}
 
 The [[RequestScheduler]] is the central coordinator for block requests across all
@@ -4853,6 +5144,220 @@ fn scheduler_timed_out_can_be_reassigned() {
     assert!(scheduler.is_block_pending(0, 0));
 }
 @
+
+\subsection{Endgame Mode}
+
+As a download nears completion, a performance problem emerges. Suppose we have
+downloaded 999 of 1000 pieces, and the final piece is being downloaded from a
+single slow peer. All other peers are idle---they have nothing we need. Our
+download speed drops from the aggregate bandwidth of all peers to the speed of
+one slow peer.
+
+\textbf{Endgame mode} addresses this by temporarily relaxing the duplicate
+avoidance rule. When only a few pieces remain, we request those pieces from
+\emph{all} peers who have them, not just one. The first peer to respond wins;
+we send ``cancel'' messages to other peers to avoid wasting their bandwidth.
+
+\subsubsection{When to Enter Endgame Mode}
+
+The classic trigger is when all remaining pieces are already being downloaded
+(no piece is in [[Missing]] state---all are [[InProgress]]). At this point,
+there's nothing new to request, so we can only speed up by duplicating requests.
+
+More aggressive implementations enter endgame mode earlier, when only a small
+number of pieces remain (e.g., less than 5\% of total pieces, or fewer than 10
+pieces). The tradeoff is bandwidth waste (duplicate data received) versus
+faster completion.
+
+\subsubsection{Endgame Mode Mechanics}
+
+In endgame mode:
+
+\begin{enumerate}
+\item For each block that has not been received, send requests to \emph{all}
+  unchoked peers who have that piece (subject to pipeline limits).
+\item When a block is received, immediately send ``cancel'' messages to all
+  other peers who were also requested that block.
+\item Repeat until the piece is complete.
+\end{enumerate}
+
+The cancel messages are important for two reasons:
+\begin{itemize}
+\item \textbf{Bandwidth conservation}: Without cancellation, peers waste upload
+  bandwidth sending data we already have.
+\item \textbf{Goodwill}: Wasting peer bandwidth hurts our reputation in the
+  tit-for-tat economy.
+\end{itemize}
+
+\subsubsection{Tradeoffs}
+
+Endgame mode accelerates completion at the cost of:
+
+\begin{description}
+\item[Duplicate data] Some blocks may be received multiple times before
+  cancellation takes effect. This wastes some download bandwidth, but the
+  waste is bounded: at most we download each remaining block twice (once from
+  the ``winning'' peer, once from a peer who hadn't received the cancel yet).
+
+\item[Complexity] The scheduler must track which peers received duplicate
+  requests and send appropriate cancellations. This adds state and logic.
+
+\item[Cancel overhead] Each cancel message is 13 bytes of protocol overhead.
+  With many peers and many blocks, this can add up, though it's typically
+  negligible compared to block data.
+\end{description}
+
+For a typical download, endgame mode lasts only a few seconds and dramatically
+improves perceived completion time. The user sees the download ``sprint to the
+finish'' rather than crawling at the speed of the slowest peer.
+
+\subsubsection{Implementation Status}
+
+Our current implementation does \emph{not} include endgame mode. The scheduler
+enforces strict duplicate avoidance: once a block is requested from one peer,
+it cannot be requested from another until the first request times out (30
+seconds by default).
+
+Endgame mode is documented here as an important optimization that production
+clients implement. Adding it would require:
+
+\begin{enumerate}
+\item A flag in [[RequestScheduler]] to indicate endgame mode is active
+\item Modification of [[is_block_pending]] to return which peer(s) have pending
+  requests, not just whether any request is pending
+\item Logic to detect when endgame mode should be entered
+\item Cancel message generation when duplicate blocks arrive
+\end{enumerate}
+
+For a teaching implementation, the added complexity may not be worth the
+benefit. Downloads still complete correctly; they simply don't have the
+final-sprint optimization.
+
+\subsection{Strategy Tradeoffs and Swarm Health}
+
+The strategies described in this chapter interact in complex ways. Understanding
+these interactions helps explain why BitTorrent works so well---and what can go
+wrong when clients deviate from recommended behavior.
+
+\subsubsection{Individual vs. Collective Optimization}
+
+BitTorrent's genius is aligning individual and collective incentives. Consider
+rarest-first piece selection:
+
+\begin{description}
+\item[Individual benefit] Acquiring rare pieces makes us a valuable trading
+  partner. Others need what we have and will upload to us to get it.
+
+\item[Collective benefit] Rare pieces get replicated faster, preventing
+  extinction and keeping the swarm healthy for everyone.
+\end{description}
+
+A client that ``defects'' by using random or sequential selection might get
+slightly faster downloads in the short term (avoiding the overhead of
+availability tracking), but degrades the swarm for everyone, including
+themselves in future downloads.
+
+\subsubsection{The Free-Rider Problem}
+
+BitTorrent's tit-for-tat mechanism addresses free-riding: peers who download
+but refuse to upload. Such peers are:
+
+\begin{itemize}
+\item Unchoked less often (they provide nothing to trade)
+\item Limited to optimistic unchoking slots (rare opportunities)
+\item Effectively throttled to slow download speeds
+\end{itemize}
+
+However, the mechanism isn't perfect. Peers with asymmetric connections
+(fast download, slow upload) appear to be free-riders even when they're
+uploading at full capacity. Some clients ``game'' the protocol by:
+
+\begin{itemize}
+\item Connecting to many more peers than usual (more optimistic unchoke chances)
+\item Reporting false piece availability
+\item Never actually uploading anything
+\end{itemize}
+
+Our implementation doesn't attempt to detect such bad actors, though production
+clients often include heuristics for banning misbehaving peers.
+
+\subsubsection{Impact of Pipeline Depth on Fairness}
+
+Pipeline depth affects not just throughput but also fairness. A client with
+a very deep pipeline (many requests per peer) can ``starve'' peers that limit
+their queue more conservatively. The starved peers may interpret long response
+times as slow connections and de-prioritize the greedy client.
+
+Our default of 10 requests per peer is deliberately conservative to be a
+good swarm citizen. Clients configured for maximum individual performance
+might use 16 or more, at the cost of potentially harming their reputation.
+
+\subsubsection{Seeder Economics}
+
+Seeders (peers who have the complete file) face different incentives. They
+gain nothing from tit-for-tat---they have nothing to download. Yet seeders
+are essential for swarm health; without at least one seeder, many swarms
+would never achieve the complete file.
+
+Seeders are motivated by:
+\begin{itemize}
+\item Altruism (wanting to share)
+\item Ratio requirements (private trackers require upload:download ratios)
+\item Completion bonuses (some trackers reward seeding time)
+\end{itemize}
+
+Our piece selection strategy doesn't distinguish seeders from leechers, but
+a production client might prioritize uploading rare pieces to maximize swarm
+health per byte uploaded.
+
+\subsubsection{Network Effects}
+
+BitTorrent exhibits strong network effects: a swarm with more participants is
+more valuable to each participant. This manifests as:
+
+\begin{description}
+\item[More sources] More peers means more potential sources for any piece,
+  reducing dependence on any single peer.
+
+\item[Higher aggregate bandwidth] Even slow peers contribute; aggregate
+  bandwidth scales with swarm size.
+
+\item[Better resilience] More copies of each piece means lower extinction risk.
+
+\item[Faster rare-piece replication] With more downloaders prioritizing rare
+  pieces, those pieces spread faster.
+\end{description}
+
+However, very popular content can strain tracker infrastructure (though
+DHT and peer exchange mitigate this) and may attract unwanted attention
+from copyright holders.
+
+\subsubsection{Summary: A Healthy Swarm}
+
+A healthy BitTorrent swarm exhibits these properties:
+
+\begin{enumerate}
+\item \textbf{Balanced piece distribution}: No piece is significantly rarer
+  than others (except transiently in new swarms).
+
+\item \textbf{Active tit-for-tat}: Peers upload to those who upload to them,
+  incentivizing contribution.
+
+\item \textbf{Seeder presence}: At least one seeder exists, or the collective
+  leechers hold all pieces.
+
+\item \textbf{Reasonable churn}: Peers join and leave at rates the swarm can
+  absorb without losing pieces.
+
+\item \textbf{Good behavior}: Most peers use rarest-first and contribute
+  uploads, maintaining the cooperative equilibrium.
+\end{enumerate}
+
+Our implementation contributes to swarm health by following the canonical
+strategies: rarest-first piece selection, fair request distribution, and
+timeout-based reassignment. While we omit some optimizations (endgame mode,
+dynamic pipeline adjustment, bad peer detection), the core algorithms ensure
+we're a good citizen in any swarm we join.
 
 \subsection{Module Assembly}
 

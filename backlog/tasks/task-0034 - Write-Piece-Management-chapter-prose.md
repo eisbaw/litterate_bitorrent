@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 00:20'
+updated_date: '2026-01-18 00:23'
 labels: []
 dependencies: []
 ---
@@ -28,17 +28,10 @@ Piece management bridges the protocol to disk. This chapter explains piece and b
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive prose to nw/05-pieces.nw explaining piece management concepts:
-
-- **Piece and Block Geometry Overview**: New section with formulas for num_pieces, blocks_per_piece, piece_size, and block_size calculations. Includes worked example showing 1,000,000 byte torrent with 4 pieces.
-
-- **Last Piece and Last Block Handling**: Detailed explanation with verbatim diagram showing how the last piece is often smaller, with formulas for calculating actual sizes.
-
-- **Byte Stream to File Mapping**: New section with ASCII diagram showing 3-file torrent mapped to virtual byte stream. Explains how piece 1 spans file boundaries with FileSlice mapping algorithm.
-
-- **SHA1 Verification**: Expanded security model section covering data integrity, decentralized trust, partial verification, and resume capability. Documents what happens when verification fails.
-
-- **Disk I/O Strategy**: New section documenting sparse file pre-allocation, seek-and-write approach, and explicit non-use of write coalescing/caching for pedagogical clarity.
-
-All prose uses LaTeX math mode for formulas and verbatim environments for diagrams. Tests pass: just tangle, just weave, and cargo test all succeed.
+Added comprehensive Piece Management chapter prose:
+- Piece/block geometry with formulas and worked examples
+- Last piece handling with edge case diagrams
+- Byte stream to file mapping diagram
+- SHA1 verification with security model
+- Disk I/O strategy documentation
 <!-- SECTION:NOTES:END -->
