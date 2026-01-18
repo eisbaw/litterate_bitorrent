@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 02:03'
+updated_date: '2026-01-18 02:04'
 labels:
   - quality
   - safety
@@ -44,31 +44,9 @@ Audit the codebase for unsafe blocks. The PRD specifies 'no unsafe unless justif
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-## Audit Results
-
-**No unsafe code found in the crate:**
-- Searched nw/*.nw (10 literate source files): no matches
-- Searched src/*.rs (10 generated source files): no matches
-
-**Dependency analysis:**
-- 270 transitive dependencies analyzed
-- Key dependencies using unsafe (all necessary/well-audited):
-  - libc: FFI bindings (required for OS interaction)
-  - ring: TLS cryptography (via rustls)
-  - tokio/mio: Async runtime (syscall integration)
-  - bytes: High-performance byte buffers
-- Using rustls-tls instead of OpenSSL to minimize C code exposure
-
-**Documentation added:**
-- New "Safety Properties" section in nw/09-appendix.nw
-- Documents the 100% safe Rust property
-- Explains rationale and dependency justification
-- Provides verification command for future audits
-
-**Verification:**
-- just tangle: passes
-- just weave: generates 712-page PDF
-- cargo build: compiles successfully
-
-Conditional ACs for "If unsafe exists" removed as N/A.
+Unsafe code audit complete:
+- Crate is 100% safe Rust (no unsafe in nw/*.nw or src/*.rs)
+- Added Safety Properties section to appendix
+- Documented justified unsafe in dependencies
+- Choice of rustls over OpenSSL minimizes C code surface
 <!-- SECTION:NOTES:END -->

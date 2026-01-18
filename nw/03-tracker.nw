@@ -199,6 +199,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<compact peer parsing>>
 
+<<dictionary peer parsing>>
+
 <<announce result struct>>
 
 <<announce function>>
@@ -224,6 +226,8 @@ mod tests {
     <<tracker response tests>>
 
     <<compact peer parsing tests>>
+
+    <<dictionary peer parsing tests>>
 
     <<announce result tests>>
 
@@ -2236,6 +2240,219 @@ For the peers field, we handle both formats:
   tracker responses, but keeps the peer parsing logic clean.
 \end{itemize}
 
+\subsection{Dictionary Peer List Parsing (BEP-3 Original Format)}
+
+While the compact format from BEP-23 is the modern standard, the original
+BEP-3 specification defined peers as a list of dictionaries. Some older or
+specialized trackers still return this format, particularly when they do not
+support the \texttt{compact=1} request parameter or when returning IPv6 peers
+(which cannot be represented in the 6-byte compact format).
+
+In the dictionary format, the \texttt{peers} field is a bencoded list where
+each element is a dictionary containing:
+
+\begin{description}
+\item[ip] A byte string containing the peer's IP address as a human-readable
+  string (e.g., \texttt{"192.168.1.100"} or \texttt{"2001:db8::1"}).
+\item[port] An integer containing the peer's TCP port number.
+\item[peer id] (Optional) A 20-byte string containing the peer's identifier.
+  We ignore this field since we only need the socket address for connecting.
+\end{description}
+
+\subsubsection{Dictionary Format Example}
+
+The following bencode represents two peers in dictionary format:
+
+\begin{verbatim}
+l                                  # List start
+  d                                # Dict start (peer 0)
+    2:ip 13:192.168.1.100          # "ip" -> "192.168.1.100"
+    7:peer id 20:xxxxxxxxxxxxxxxxxxxx  # "peer id" -> 20 bytes (ignored)
+    4:port i6881e                  # "port" -> 6881
+  e                                # Dict end
+  d                                # Dict start (peer 1)
+    2:ip 11:10.0.0.1               # "ip" -> "10.0.0.1"
+    4:port i8080e                  # "port" -> 8080
+  e                                # Dict end
+e                                  # List end
+\end{verbatim}
+
+Notice that:
+\begin{itemize}
+\item The \texttt{peer id} key is optional---peer 1 omits it entirely.
+\item Dictionary keys in bencode are always sorted, so \texttt{ip} comes before
+  \texttt{peer id} which comes before \texttt{port}.
+\item The IP address is a variable-length string, unlike the fixed 4-byte
+  representation in compact format.
+\end{itemize}
+
+\subsubsection{Why Support Dictionary Format?}
+
+Even though compact format is more efficient, we support dictionary format for
+several reasons:
+
+\begin{enumerate}
+\item \textbf{Compatibility}: Some trackers, especially older or custom
+  implementations, may not support compact format at all.
+\item \textbf{IPv6 support}: The compact format only handles IPv4 (6 bytes per
+  peer). While BEP-7 defines a compact IPv6 format (18 bytes per peer), many
+  trackers return IPv6 addresses using the dictionary format instead.
+\item \textbf{Graceful degradation}: If our \texttt{compact=1} request is
+  ignored, we can still extract peers from the fallback format.
+\item \textbf{Specification compliance}: BEP-3 is the foundational specification,
+  and a compliant client should handle its defined response format.
+\end{enumerate}
+
+<<dictionary peer parsing>>=
+/// Parse a dictionary-format peer list into socket addresses.
+///
+/// BEP-3 defines the original peer format where each peer is a dictionary
+/// containing `ip` (string) and `port` (integer) keys. The optional `peer id`
+/// key is ignored since we only need the socket address for connecting.
+///
+/// This function serves as a fallback when trackers return the non-compact
+/// format, either because they don't support BEP-23 or when returning IPv6
+/// addresses.
+///
+/// # Arguments
+///
+/// * `peers_value` - A `BencodeValue::List` containing peer dictionaries
+///
+/// # Returns
+///
+/// On success, returns a vector of socket addresses. The vector may be empty
+/// if the list contains no peers.
+///
+/// # Errors
+///
+/// Returns [`TrackerError::TrackerInvalidResponse`] if:
+/// - The input is not a list
+/// - Any element in the list is not a dictionary
+/// - Any dictionary is missing the required `ip` key
+/// - Any dictionary is missing the required `port` key
+/// - The `ip` value cannot be parsed as a valid IP address
+/// - The `port` value is not a valid integer in range 0-65535
+///
+/// # Example
+///
+/// ```ignore
+/// let peers_value = decode(b"ld2:ip9:127.0.0.14:porti6881eee")?;
+/// let peers = parse_dictionary_peers(&peers_value)?;
+/// assert_eq!(peers[0].to_string(), "127.0.0.1:6881");
+/// ```
+pub fn parse_dictionary_peers(peers_value: &BencodeValue) -> Result<Vec<SocketAddr>, TrackerError> {
+    // Step 1: Ensure input is a list
+    let list = match peers_value {
+        BencodeValue::List(l) => l,
+        _ => {
+            return Err(TrackerError::TrackerInvalidResponse(
+                "dictionary peers: expected list, got other type".to_string(),
+            ))
+        }
+    };
+
+    // Empty list is valid (no peers available)
+    if list.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut peers = Vec::with_capacity(list.len());
+
+    for (index, item) in list.iter().enumerate() {
+        // Step 2: Each item must be a dictionary
+        let dict = match item {
+            BencodeValue::Dict(d) => d,
+            _ => {
+                return Err(TrackerError::TrackerInvalidResponse(format!(
+                    "dictionary peers: peer {} is not a dictionary",
+                    index
+                )))
+            }
+        };
+
+        // Step 3: Extract required "ip" field
+        let ip_value = dict.get(b"ip".as_slice()).ok_or_else(|| {
+            TrackerError::TrackerInvalidResponse(format!(
+                "dictionary peers: peer {} missing 'ip' field",
+                index
+            ))
+        })?;
+
+        let ip_str = match ip_value {
+            BencodeValue::Bytes(b) => String::from_utf8_lossy(b),
+            _ => {
+                return Err(TrackerError::TrackerInvalidResponse(format!(
+                    "dictionary peers: peer {} 'ip' is not a string",
+                    index
+                )))
+            }
+        };
+
+        // Step 4: Extract required "port" field
+        let port_value = dict.get(b"port".as_slice()).ok_or_else(|| {
+            TrackerError::TrackerInvalidResponse(format!(
+                "dictionary peers: peer {} missing 'port' field",
+                index
+            ))
+        })?;
+
+        let port = match port_value {
+            BencodeValue::Integer(n) if *n >= 0 && *n <= 65535 => *n as u16,
+            BencodeValue::Integer(n) => {
+                return Err(TrackerError::TrackerInvalidResponse(format!(
+                    "dictionary peers: peer {} port {} out of range",
+                    index, n
+                )))
+            }
+            _ => {
+                return Err(TrackerError::TrackerInvalidResponse(format!(
+                    "dictionary peers: peer {} 'port' is not an integer",
+                    index
+                )))
+            }
+        };
+
+        // Step 5: Parse IP address string
+        // We use std::net::IpAddr to support both IPv4 and IPv6
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|_| {
+            TrackerError::TrackerInvalidResponse(format!(
+                "dictionary peers: peer {} has invalid IP address '{}'",
+                index, ip_str
+            ))
+        })?;
+
+        // Note: "peer id" key is optional and ignored
+
+        peers.push(SocketAddr::new(ip, port));
+    }
+
+    Ok(peers)
+}
+@
+
+The implementation iterates through the list and extracts the required fields
+from each dictionary. Notable design choices:
+
+\begin{itemize}
+\item We use [[std::net::IpAddr::parse]] which handles both IPv4 and IPv6
+  addresses transparently. This provides future-proofing for IPv6 support.
+
+\item Error messages include the peer index to help identify which entry
+  caused the failure. When debugging tracker responses, knowing that ``peer 7
+  is missing the ip field'' is far more useful than a generic error.
+
+\item We explicitly ignore the [[peer id]] key rather than requiring it. Many
+  trackers omit this field, and we don't need it for establishing connections.
+
+\item The port validation ensures the value fits in a [[u16]] before casting.
+  While negative ports or values above 65535 are technically representable in
+  bencode integers, they are not valid TCP ports.
+
+\item We use [[String::from_utf8_lossy]] for the IP string because bencode
+  byte strings are not guaranteed to be valid UTF-8. In practice, IP addresses
+  are always ASCII, but this handles edge cases gracefully.
+\end{itemize}
+
 \subsubsection{Response Parsing Tests}
 
 We test the response parser with various scenarios to ensure correct behavior
@@ -2673,6 +2890,415 @@ fn compact_peer_size_constant_is_6() {
     assert_eq!(COMPACT_PEER_SIZE, 6);
 }
 @
+
+\subsubsection{Dictionary Peer Parsing Tests}
+
+We test the dictionary peer parser with comprehensive test cases covering
+valid input, edge cases, and error conditions.
+
+<<dictionary peer parsing tests>>=
+#[test]
+fn parse_dictionary_peers_two_peers() {
+    use std::collections::BTreeMap;
+
+    // Create a list with two peer dictionaries
+    let mut peer1 = BTreeMap::new();
+    peer1.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.100".to_vec()));
+    peer1.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let mut peer2 = BTreeMap::new();
+    peer2.insert(b"ip".to_vec(), BencodeValue::Bytes(b"10.0.0.1".to_vec()));
+    peer2.insert(b"port".to_vec(), BencodeValue::Integer(8080));
+
+    let peers_value = BencodeValue::List(vec![
+        BencodeValue::Dict(peer1),
+        BencodeValue::Dict(peer2),
+    ]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Should parse valid peer list: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 2);
+    assert_eq!(peers[0].to_string(), "192.168.1.100:6881");
+    assert_eq!(peers[1].to_string(), "10.0.0.1:8080");
+}
+
+#[test]
+fn parse_dictionary_peers_empty_list_returns_empty_vec() {
+    let peers_value = BencodeValue::List(vec![]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Empty list should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert!(peers.is_empty(), "Should return empty vec for empty list");
+}
+
+#[test]
+fn parse_dictionary_peers_missing_ip_returns_error() {
+    use std::collections::BTreeMap;
+
+    // Dictionary with only port, missing ip
+    let mut peer = BTreeMap::new();
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Missing ip should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("missing 'ip' field"),
+                "Error should mention missing ip: {}",
+                msg
+            );
+            assert!(msg.contains("peer 0"), "Error should mention peer index: {}", msg);
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_missing_port_returns_error() {
+    use std::collections::BTreeMap;
+
+    // Dictionary with only ip, missing port
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Missing port should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("missing 'port' field"),
+                "Error should mention missing port: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_ignores_peer_id() {
+    use std::collections::BTreeMap;
+
+    // Dictionary with optional peer_id field (should be ignored)
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"127.0.0.1".to_vec()));
+    peer.insert(b"peer id".to_vec(), BencodeValue::Bytes(vec![0u8; 20]));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(51413));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Should ignore peer_id: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "127.0.0.1:51413");
+}
+
+#[test]
+fn parse_dictionary_peers_ipv6_address() {
+    use std::collections::BTreeMap;
+
+    // IPv6 address
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"::1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Should parse IPv6 address: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].to_string(), "[::1]:6881");
+}
+
+#[test]
+fn parse_dictionary_peers_invalid_ip_returns_error() {
+    use std::collections::BTreeMap;
+
+    // Invalid IP address string
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"not.an.ip.address".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Invalid IP should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("invalid IP address"),
+                "Error should mention invalid IP: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_port_out_of_range() {
+    use std::collections::BTreeMap;
+
+    // Port number too large
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(70000));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Port out of range should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("out of range"),
+                "Error should mention out of range: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_negative_port() {
+    use std::collections::BTreeMap;
+
+    // Negative port number
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(-1));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Negative port should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("out of range"),
+                "Error should mention out of range: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_not_a_list_returns_error() {
+    // Input is a dict instead of a list
+    let peers_value = BencodeValue::Dict(std::collections::BTreeMap::new());
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Non-list input should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("expected list"),
+                "Error should mention expected list: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_item_not_dict_returns_error() {
+    // List contains an integer instead of a dict
+    let peers_value = BencodeValue::List(vec![BencodeValue::Integer(42)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Non-dict item should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("not a dictionary"),
+                "Error should mention not a dictionary: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_ip_not_string_returns_error() {
+    use std::collections::BTreeMap;
+
+    // IP field is an integer instead of string
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Integer(12345));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Non-string IP should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("'ip' is not a string"),
+                "Error should mention ip not a string: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_port_not_integer_returns_error() {
+    use std::collections::BTreeMap;
+
+    // Port field is a string instead of integer
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Bytes(b"6881".to_vec()));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err(), "Non-integer port should be rejected");
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("'port' is not an integer"),
+                "Error should mention port not an integer: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_error_includes_peer_index() {
+    use std::collections::BTreeMap;
+
+    // First peer is valid, second peer has missing ip
+    let mut peer1 = BTreeMap::new();
+    peer1.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer1.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let mut peer2 = BTreeMap::new();
+    peer2.insert(b"port".to_vec(), BencodeValue::Integer(8080));
+    // peer2 is missing ip
+
+    let peers_value = BencodeValue::List(vec![
+        BencodeValue::Dict(peer1),
+        BencodeValue::Dict(peer2),
+    ]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_err());
+
+    match result {
+        Err(TrackerError::TrackerInvalidResponse(msg)) => {
+            assert!(
+                msg.contains("peer 1"),
+                "Error should mention peer index 1: {}",
+                msg
+            );
+        }
+        other => panic!("Expected TrackerInvalidResponse, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_dictionary_peers_max_port() {
+    use std::collections::BTreeMap;
+
+    // Maximum valid port (65535)
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(65535));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Max port should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers[0].to_string(), "192.168.1.1:65535");
+}
+
+#[test]
+fn parse_dictionary_peers_min_port() {
+    use std::collections::BTreeMap;
+
+    // Minimum valid port (0)
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"192.168.1.1".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(0));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Min port should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers[0].to_string(), "192.168.1.1:0");
+}
+
+#[test]
+fn parse_dictionary_peers_full_ipv6() {
+    use std::collections::BTreeMap;
+
+    // Full IPv6 address
+    let mut peer = BTreeMap::new();
+    peer.insert(b"ip".to_vec(), BencodeValue::Bytes(b"2001:0db8:85a3:0000:0000:8a2e:0370:7334".to_vec()));
+    peer.insert(b"port".to_vec(), BencodeValue::Integer(6881));
+
+    let peers_value = BencodeValue::List(vec![BencodeValue::Dict(peer)]);
+
+    let result = parse_dictionary_peers(&peers_value);
+    assert!(result.is_ok(), "Full IPv6 should be valid: {:?}", result);
+
+    let peers = result.unwrap();
+    assert_eq!(peers.len(), 1);
+    // The address may be normalized, so just check it's IPv6
+    assert!(peers[0].is_ipv6());
+}
+@
+
+These tests verify:
+\begin{enumerate}
+\item Basic functionality with two peer dictionaries.
+\item Empty list returns an empty vector (valid: no peers available).
+\item Missing required \texttt{ip} field produces a descriptive error with peer index.
+\item Missing required \texttt{port} field is detected.
+\item Optional \texttt{peer id} field is properly ignored.
+\item IPv6 addresses are parsed correctly.
+\item Invalid IP address strings produce clear errors.
+\item Port numbers outside the 0--65535 range are rejected.
+\item Wrong input types (not a list, items not dicts) are caught.
+\item Error messages include the peer index for debugging.
+\item Edge cases for minimum and maximum port values.
+\end{enumerate}
 
 \subsection{The Complete Announce Function}
 
