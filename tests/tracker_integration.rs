@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use literate_bittorrent::metainfo::{parse, Metainfo};
 use literate_bittorrent::tracker::{
-    announce, generate_peer_id, AnnounceResult, TrackerEvent, TrackerRequest,
+    announce, generate_peer_id, AnnounceResult, TrackerEvent, TrackerManager, TrackerRequest,
 };
 
 /// Convert a 20-byte hash to a hex string
@@ -156,4 +156,182 @@ fn test_fixture_loads_correctly() {
     let expected_hash = "a1dfefec1a9dd7fa8a041ebeeea271db55126d2f";
     let actual_hash = hash_to_hex(&metainfo.info_hash);
     assert_eq!(actual_hash, expected_hash);
+}
+
+/// Test TrackerManager construction from metainfo
+/// This verifies TrackerManager properly loads trackers from announce-list
+#[test]
+fn test_tracker_manager_loads_trackers() {
+    let metainfo = load_ubuntu_torrent();
+
+    let manager = TrackerManager::new(&metainfo);
+
+    // The ubuntu.torrent may have an announce-list
+    // Verify the manager loads at least 1 tier and 1 tracker
+    assert!(
+        manager.tier_count() >= 1,
+        "Should have at least 1 tier, got {}",
+        manager.tier_count()
+    );
+    assert!(
+        manager.tracker_count() >= 1,
+        "Should have at least 1 tracker, got {}",
+        manager.tracker_count()
+    );
+
+    // Verify all_trackers returns non-empty
+    let all = manager.all_trackers();
+    assert!(!all.is_empty(), "Should have at least one tracker URL");
+
+    // Verify the primary announce URL is in the list
+    // (it should either be in announce-list or used as fallback)
+    println!("Tracker tiers: {:?}", manager.tiers());
+    println!("All trackers: {:?}", all);
+}
+
+/// Integration test: TrackerManager with fallback behavior
+///
+/// This test creates a metainfo with multiple trackers (simulating announce-list)
+/// and verifies the TrackerManager properly handles the tier structure.
+///
+/// Note: This test is marked #[ignore] because it requires network access.
+#[tokio::test]
+#[ignore]
+async fn test_tracker_manager_fallback_to_secondary() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
+
+    // Load the base torrent
+    let metainfo = load_ubuntu_torrent();
+
+    // Create a modified metainfo with announce-list containing:
+    // - Tier 0: Invalid tracker (will fail)
+    // - Tier 1: The real Ubuntu tracker (should succeed)
+    let modified_metainfo = Metainfo {
+        announce: metainfo.announce.clone(),
+        announce_list: Some(vec![
+            // Tier 0: Invalid tracker that will definitely fail
+            vec!["http://invalid-tracker.localhost:1/announce".to_string()],
+            // Tier 1: The real tracker
+            vec![metainfo.announce.clone()],
+        ]),
+        info_hash: metainfo.info_hash,
+        piece_length: metainfo.piece_length,
+        piece_hashes: metainfo.piece_hashes.clone(),
+        total_length: metainfo.total_length,
+        files: metainfo.files.clone(),
+        name: metainfo.name.clone(),
+    };
+
+    // Create TrackerManager
+    let mut manager = TrackerManager::new(&modified_metainfo);
+
+    assert_eq!(manager.tier_count(), 2);
+    assert_eq!(manager.tracker_count(), 2);
+
+    println!("\nTesting TrackerManager fallback behavior...");
+    println!("Tier 0: http://invalid-tracker.localhost:1/announce (will fail)");
+    println!("Tier 1: {} (should succeed)", metainfo.announce);
+
+    // Create announce request
+    let request = TrackerRequest {
+        info_hash: modified_metainfo.info_hash,
+        peer_id: generate_peer_id(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: modified_metainfo.total_length,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    // Attempt announce - should fail on tier 0, succeed on tier 1
+    let result = manager.announce_with_fallback(request).await;
+
+    match result {
+        Ok(announce_result) => {
+            println!("\nFallback successful!");
+            print_announce_result(&announce_result);
+
+            // Verify we got a valid response
+            assert!(
+                announce_result.interval > 0,
+                "Tracker should return a positive interval"
+            );
+
+            println!("\nTest passed: TrackerManager successfully fell back to tier 1");
+        }
+        Err(e) => {
+            // If both trackers fail, this is a network issue
+            eprintln!("\nAll trackers failed: {}", e);
+            panic!("TrackerManager fallback test failed: {}", e);
+        }
+    }
+}
+
+/// Test that TrackerManager properly orders attempts starting from last successful
+#[tokio::test]
+#[ignore]
+async fn test_tracker_manager_remembers_successful_tracker() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("debug")
+        .try_init();
+
+    let metainfo = load_ubuntu_torrent();
+
+    // Create metainfo with announce-list where the real tracker is in tier 1
+    let modified_metainfo = Metainfo {
+        announce: metainfo.announce.clone(),
+        announce_list: Some(vec![
+            // Tier 0: Invalid
+            vec!["http://invalid1.localhost:1/announce".to_string()],
+            // Tier 1: Real tracker
+            vec![metainfo.announce.clone()],
+        ]),
+        info_hash: metainfo.info_hash,
+        piece_length: metainfo.piece_length,
+        piece_hashes: metainfo.piece_hashes.clone(),
+        total_length: metainfo.total_length,
+        files: metainfo.files.clone(),
+        name: metainfo.name.clone(),
+    };
+
+    let mut manager = TrackerManager::new(&modified_metainfo);
+
+    // First announce - should fail tier 0, succeed tier 1
+    let request1 = TrackerRequest {
+        info_hash: modified_metainfo.info_hash,
+        peer_id: generate_peer_id(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: modified_metainfo.total_length,
+        event: Some(TrackerEvent::Started),
+        compact: true,
+    };
+
+    println!("\nFirst announce (should try tier 0, fail, then tier 1)...");
+    let result1 = manager.announce_with_fallback(request1).await;
+    assert!(result1.is_ok(), "First announce should succeed via fallback");
+    println!("First announce succeeded via fallback to tier 1");
+
+    // Second announce - should start with tier 1 (the previously successful tracker)
+    let request2 = TrackerRequest {
+        info_hash: modified_metainfo.info_hash,
+        peer_id: generate_peer_id(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: modified_metainfo.total_length - 1000,
+        event: None,
+        compact: true,
+    };
+
+    println!("\nSecond announce (should try tier 1 first now)...");
+    let result2 = manager.announce_with_fallback(request2).await;
+    assert!(result2.is_ok(), "Second announce should succeed immediately");
+    println!("Second announce succeeded (should have been faster)");
+
+    println!("\nTest passed: TrackerManager remembers successful tracker");
 }

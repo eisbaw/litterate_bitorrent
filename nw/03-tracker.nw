@@ -207,6 +207,8 @@ parsing. For now, we define just the error types needed by other modules.
 
 <<announce function>>
 
+<<tracker manager>>
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +238,8 @@ mod tests {
     <<announce result tests>>
 
     <<announce function tests>>
+
+    <<tracker manager tests>>
 }
 @
 
@@ -3912,6 +3916,7 @@ fn announce_function_exists_with_correct_signature() {
     // Create a dummy metainfo for type checking only
     let metainfo = crate::metainfo::Metainfo {
         announce: "http://example.com/announce".to_string(),
+        announce_list: None,
         info_hash: [0u8; 20],
         piece_length: 262144,
         piece_hashes: vec![[0u8; 20]],
@@ -3981,6 +3986,549 @@ These tests ensure that:
 Full end-to-end testing of the announce flow happens in the project's integration
 tests, where we can control the network environment and verify the complete
 request/response cycle.
+
+\subsection{Multi-Tracker Support (BEP 12)}
+
+BEP 12 defines the \texttt{announce-list} extension for multi-tracker support.
+When a torrent includes an announce-list, the client should try trackers in
+order, respecting the tier structure. Within each tier, trackers are tried
+sequentially. If all trackers in a tier fail, the client moves to the next tier.
+
+The [[TrackerManager]] struct encapsulates this logic, providing a simple
+interface for announcing to multiple trackers with automatic failover.
+
+\subsubsection{TrackerManager State}
+
+The [[TrackerManager]] maintains state about which trackers are available and
+which one succeeded last time. This allows subsequent announces to start with
+the known-working tracker rather than always starting from the beginning.
+
+<<tracker manager>>=
+/// Manages multi-tracker support with tier-based fallback (BEP 12).
+///
+/// The TrackerManager handles the complexity of announce-list traversal:
+/// - Tries trackers within each tier before moving to the next tier
+/// - Remembers which tracker last succeeded for future announces
+/// - Falls back to the primary announce URL if no announce-list is present
+///
+/// # Example
+///
+/// ```ignore
+/// let manager = TrackerManager::new(&metainfo);
+/// match manager.announce_with_fallback(request).await {
+///     Ok(result) => println!("Got {} peers", result.peers.len()),
+///     Err(e) => println!("All trackers failed: {}", e),
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct TrackerManager {
+    /// List of tracker tiers. Each tier is a list of tracker URLs.
+    /// Tier 0 is primary, tier 1 is first backup, etc.
+    tiers: Vec<Vec<String>>,
+
+    /// Index of the last successful tracker as (tier_index, tracker_index_within_tier).
+    /// If None, start from the beginning.
+    last_successful: Option<(usize, usize)>,
+}
+
+impl TrackerManager {
+    /// Create a new TrackerManager from metainfo.
+    ///
+    /// If the metainfo has an announce-list, it is used for tiered tracker support.
+    /// Otherwise, the single announce URL is used as a single-tier list.
+    ///
+    /// # Arguments
+    ///
+    /// * `metainfo` - The parsed torrent file containing tracker information
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let metainfo = parse(&torrent_bytes)?;
+    /// let manager = TrackerManager::new(&metainfo);
+    /// ```
+    pub fn new(metainfo: &Metainfo) -> Self {
+        let tiers = if let Some(ref announce_list) = metainfo.announce_list {
+            // Use announce-list if present and non-empty
+            if !announce_list.is_empty() {
+                announce_list.clone()
+            } else {
+                // Empty announce-list: fall back to announce URL
+                vec![vec![metainfo.announce.clone()]]
+            }
+        } else {
+            // No announce-list: use the single announce URL as a one-tier list
+            vec![vec![metainfo.announce.clone()]]
+        };
+
+        TrackerManager {
+            tiers,
+            last_successful: None,
+        }
+    }
+
+    /// Get all trackers as a flat list of URLs, preserving tier order.
+    ///
+    /// Useful for debugging or displaying available trackers.
+    pub fn all_trackers(&self) -> Vec<&str> {
+        self.tiers
+            .iter()
+            .flat_map(|tier| tier.iter().map(|s| s.as_str()))
+            .collect()
+    }
+
+    /// Get the number of tiers.
+    pub fn tier_count(&self) -> usize {
+        self.tiers.len()
+    }
+
+    /// Get the total number of trackers across all tiers.
+    pub fn tracker_count(&self) -> usize {
+        self.tiers.iter().map(|t| t.len()).sum()
+    }
+
+    /// Get a reference to the tier structure.
+    pub fn tiers(&self) -> &Vec<Vec<String>> {
+        &self.tiers
+    }
+
+    /// Record a successful announce from a specific tracker.
+    ///
+    /// This updates the internal state so that future announces will try
+    /// this tracker first (within its tier).
+    fn record_success(&mut self, tier_idx: usize, tracker_idx: usize) {
+        self.last_successful = Some((tier_idx, tracker_idx));
+    }
+
+    /// Attempt to announce to trackers with automatic tier-based fallback.
+    ///
+    /// This method tries trackers in order:
+    /// 1. If a previous announce succeeded, start with that tracker
+    /// 2. Try each tracker in the current tier
+    /// 3. If all trackers in a tier fail, move to the next tier
+    /// 4. If all tiers fail, return the last error
+    ///
+    /// On success, the manager remembers which tracker worked for next time.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The announce request parameters
+    ///
+    /// # Returns
+    ///
+    /// On success, returns the `AnnounceResult` from the first successful tracker.
+    /// On failure, returns the error from the last attempted tracker.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let mut manager = TrackerManager::new(&metainfo);
+    /// let request = TrackerRequest { ... };
+    /// match manager.announce_with_fallback(request).await {
+    ///     Ok(result) => {
+    ///         println!("Got {} peers from successful tracker", result.peers.len());
+    ///     }
+    ///     Err(e) => {
+    ///         println!("All trackers failed, last error: {}", e);
+    ///     }
+    /// }
+    /// ```
+    pub async fn announce_with_fallback(
+        &mut self,
+        request: TrackerRequest,
+    ) -> Result<AnnounceResult, TrackerError> {
+        let mut last_error: Option<TrackerError> = None;
+
+        // Generate an ordering of (tier_idx, tracker_idx) pairs to try.
+        // If we have a last_successful, we start there and wrap around.
+        let attempts = self.generate_attempt_order();
+
+        for (tier_idx, tracker_idx) in attempts {
+            // Clone the URL to avoid borrow issues with self
+            let tracker_url = self.tiers[tier_idx][tracker_idx].clone();
+
+            debug!(
+                tier = tier_idx,
+                tracker = tracker_idx,
+                url = %tracker_url,
+                "trying tracker"
+            );
+
+            // Build the announce URL
+            let url = build_announce_url(&tracker_url, &request);
+
+            // Attempt the announce
+            match announce_http(&url).await {
+                Ok(body) => {
+                    // Parse the response
+                    match parse_tracker_response(&body) {
+                        Ok(response) => {
+                            // Parse peers
+                            match parse_compact_peers(&response.peers) {
+                                Ok(peers) => {
+                                    // Success! Record which tracker worked
+                                    self.record_success(tier_idx, tracker_idx);
+
+                                    info!(
+                                        tier = tier_idx,
+                                        tracker = tracker_idx,
+                                        url = %tracker_url,
+                                        peers = peers.len(),
+                                        interval = response.interval,
+                                        "tracker announce successful"
+                                    );
+
+                                    return Ok(AnnounceResult {
+                                        peers,
+                                        interval: response.interval,
+                                        seeders: response.complete,
+                                        leechers: response.incomplete,
+                                    });
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        tier = tier_idx,
+                                        tracker = tracker_idx,
+                                        error = %e,
+                                        "failed to parse peers"
+                                    );
+                                    last_error = Some(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                tier = tier_idx,
+                                tracker = tracker_idx,
+                                error = %e,
+                                "tracker returned error or invalid response"
+                            );
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        tier = tier_idx,
+                        tracker = tracker_idx,
+                        error = %e,
+                        "tracker HTTP request failed"
+                    );
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // All trackers failed
+        Err(last_error.unwrap_or_else(|| {
+            TrackerError::TrackerInvalidResponse("no trackers available".to_string())
+        }))
+    }
+
+    /// Generate the order in which to attempt trackers.
+    ///
+    /// If we have a last_successful tracker, we start with it, then continue
+    /// through its tier, then move to subsequent tiers, then wrap around to
+    /// earlier tiers if needed.
+    fn generate_attempt_order(&self) -> Vec<(usize, usize)> {
+        let mut order = Vec::new();
+
+        // If we have a last successful, start from there
+        if let Some((last_tier, last_tracker)) = self.last_successful {
+            // Start with the last successful tracker
+            if last_tier < self.tiers.len() && last_tracker < self.tiers[last_tier].len() {
+                order.push((last_tier, last_tracker));
+
+                // Add remaining trackers in the same tier
+                for t in (last_tracker + 1)..self.tiers[last_tier].len() {
+                    order.push((last_tier, t));
+                }
+                for t in 0..last_tracker {
+                    order.push((last_tier, t));
+                }
+
+                // Add all trackers in subsequent tiers
+                for tier_idx in (last_tier + 1)..self.tiers.len() {
+                    for tracker_idx in 0..self.tiers[tier_idx].len() {
+                        order.push((tier_idx, tracker_idx));
+                    }
+                }
+
+                // Add all trackers in earlier tiers (wrap around)
+                for tier_idx in 0..last_tier {
+                    for tracker_idx in 0..self.tiers[tier_idx].len() {
+                        order.push((tier_idx, tracker_idx));
+                    }
+                }
+            } else {
+                // Last successful is invalid, use default order
+                for (tier_idx, tier) in self.tiers.iter().enumerate() {
+                    for tracker_idx in 0..tier.len() {
+                        order.push((tier_idx, tracker_idx));
+                    }
+                }
+            }
+        } else {
+            // No last successful: try in tier order
+            for (tier_idx, tier) in self.tiers.iter().enumerate() {
+                for tracker_idx in 0..tier.len() {
+                    order.push((tier_idx, tracker_idx));
+                }
+            }
+        }
+
+        order
+    }
+}
+@
+
+The [[TrackerManager]] is designed to be simple and stateless from the caller's
+perspective. The caller just needs to create a manager from the metainfo and
+call [[announce_with_fallback]]. The manager handles all the complexity of
+tier traversal and remembering which tracker worked.
+
+Key design decisions:
+
+\begin{itemize}
+\item \textbf{Mutable for state tracking}: The [[announce_with_fallback]] method
+  takes [[&mut self]] because it updates the [[last_successful]] field. This is
+  intentional: subsequent announces should prefer the known-working tracker.
+
+\item \textbf{Single announce URL as tier 0}: When there's no announce-list,
+  we treat the single announce URL as a one-tracker, one-tier list. This
+  simplifies the announce logic---it always works with tiers.
+
+\item \textbf{Wrap-around for resilience}: If the last successful tracker is
+  in tier 1 and it fails, we try the rest of tier 1, then tier 2, etc., then
+  wrap around to tier 0. This maximizes the chance of finding a working tracker.
+
+\item \textbf{Error preservation}: We keep track of the last error so that if
+  all trackers fail, we can return a meaningful error to the caller.
+\end{itemize}
+
+\subsubsection{TrackerManager Tests}
+
+We test the TrackerManager's construction and attempt ordering logic. The actual
+announce functionality is tested via integration tests since it requires network
+access.
+
+<<tracker manager tests>>=
+#[test]
+fn tracker_manager_with_no_announce_list() {
+    // Test with a metainfo that has no announce-list
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://primary.example.com/announce".to_string(),
+        announce_list: None,
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+
+    assert_eq!(manager.tier_count(), 1);
+    assert_eq!(manager.tracker_count(), 1);
+    assert_eq!(manager.all_trackers(), vec!["http://primary.example.com/announce"]);
+}
+
+#[test]
+fn tracker_manager_with_single_tier() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://primary.example.com/announce".to_string(),
+        announce_list: Some(vec![
+            vec![
+                "http://tracker1.example.com/announce".to_string(),
+                "http://tracker2.example.com/announce".to_string(),
+            ],
+        ]),
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+
+    assert_eq!(manager.tier_count(), 1);
+    assert_eq!(manager.tracker_count(), 2);
+    assert_eq!(
+        manager.all_trackers(),
+        vec![
+            "http://tracker1.example.com/announce",
+            "http://tracker2.example.com/announce"
+        ]
+    );
+}
+
+#[test]
+fn tracker_manager_with_multiple_tiers() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://primary.example.com/announce".to_string(),
+        announce_list: Some(vec![
+            vec!["http://tier0-a.example.com/announce".to_string()],
+            vec![
+                "http://tier1-a.example.com/announce".to_string(),
+                "http://tier1-b.example.com/announce".to_string(),
+            ],
+            vec!["http://tier2-a.example.com/announce".to_string()],
+        ]),
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+
+    assert_eq!(manager.tier_count(), 3);
+    assert_eq!(manager.tracker_count(), 4);
+}
+
+#[test]
+fn tracker_manager_attempt_order_no_previous_success() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://primary.example.com/announce".to_string(),
+        announce_list: Some(vec![
+            vec!["http://t0-a.com".to_string(), "http://t0-b.com".to_string()],
+            vec!["http://t1-a.com".to_string()],
+        ]),
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+    let order = manager.generate_attempt_order();
+
+    // Should be in tier order: tier 0 trackers, then tier 1 trackers
+    assert_eq!(
+        order,
+        vec![(0, 0), (0, 1), (1, 0)]
+    );
+}
+
+#[test]
+fn tracker_manager_attempt_order_with_previous_success() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://primary.example.com/announce".to_string(),
+        announce_list: Some(vec![
+            vec!["http://t0-a.com".to_string(), "http://t0-b.com".to_string()],
+            vec!["http://t1-a.com".to_string(), "http://t1-b.com".to_string()],
+        ]),
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let mut manager = TrackerManager::new(&metainfo);
+    // Simulate that tier 1, tracker 0 was successful last time
+    manager.record_success(1, 0);
+
+    let order = manager.generate_attempt_order();
+
+    // Should start with (1, 0), then rest of tier 1, then wrap to tier 0
+    assert_eq!(
+        order,
+        vec![(1, 0), (1, 1), (0, 0), (0, 1)]
+    );
+}
+
+#[test]
+fn tracker_manager_empty_announce_list_uses_announce_url() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://fallback.example.com/announce".to_string(),
+        announce_list: Some(vec![]), // Empty announce-list
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+
+    // Should fall back to the single announce URL
+    assert_eq!(manager.tier_count(), 1);
+    assert_eq!(manager.tracker_count(), 1);
+    assert_eq!(
+        manager.all_trackers(),
+        vec!["http://fallback.example.com/announce"]
+    );
+}
+
+#[test]
+fn tracker_manager_implements_debug_and_clone() {
+    use std::path::PathBuf;
+
+    let metainfo = Metainfo {
+        announce: "http://example.com/announce".to_string(),
+        announce_list: None,
+        info_hash: [0u8; 20],
+        piece_length: 262144,
+        piece_hashes: vec![[0u8; 20]],
+        total_length: 1000,
+        files: vec![crate::metainfo::FileInfo {
+            length: 1000,
+            path: PathBuf::from("test.txt"),
+        }],
+        name: "test".to_string(),
+    };
+
+    let manager = TrackerManager::new(&metainfo);
+
+    // Test Debug
+    let debug_str = format!("{:?}", manager);
+    assert!(debug_str.contains("TrackerManager"));
+
+    // Test Clone
+    let cloned = manager.clone();
+    assert_eq!(cloned.tier_count(), manager.tier_count());
+}
+@
 
 \subsection{Announce Intervals and the Re-Announce Cycle}
 

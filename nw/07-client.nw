@@ -2168,6 +2168,7 @@ mod tests {
 
         Metainfo {
             announce: "http://tracker.example.com/announce".to_string(),
+            announce_list: None,
             info_hash,
             piece_length,
             piece_hashes,
@@ -4043,6 +4044,7 @@ mod shutdown_announce_tests {
     fn make_test_metainfo() -> Metainfo {
         Metainfo {
             announce: "http://tracker.example.com/announce".to_string(),
+            announce_list: None,
             info_hash: [0xAA; 20],
             piece_length: 262144,
             piece_hashes: vec![[0u8; 20]],
@@ -4120,6 +4122,7 @@ mod shutdown_announce_tests {
         let metainfo = Metainfo {
             // Use a definitely-invalid tracker URL
             announce: "http://definitely-invalid-tracker.local:1/announce".to_string(),
+            announce_list: None,
             info_hash: [0xBB; 20],
             piece_length: 262144,
             piece_hashes: vec![[0u8; 20]],
@@ -4526,6 +4529,7 @@ mod completion_tests {
     fn make_test_metainfo(num_pieces: usize) -> Metainfo {
         Metainfo {
             announce: "http://tracker.example.com/announce".to_string(),
+            announce_list: None,
             info_hash: [0xAA; 20],
             piece_length: 262144,
             piece_hashes: vec![[0u8; 20]; num_pieces],

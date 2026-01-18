@@ -301,6 +301,16 @@ pub struct Metainfo {
     /// The URL typically uses HTTP or UDP protocol.
     pub announce: String,
 
+    /// Optional list of tracker tiers for multi-tracker support (BEP 12).
+    ///
+    /// Each tier is a list of tracker URLs. The client should try trackers
+    /// within each tier in order, and move to the next tier only if all
+    /// trackers in the current tier fail.
+    ///
+    /// If present, this takes precedence over the single `announce` URL.
+    /// The `announce` URL is still used as a fallback if `announce_list` is empty.
+    pub announce_list: Option<Vec<Vec<String>>>,
+
     /// The 20-byte SHA1 hash of the bencoded info dictionary.
     ///
     /// This uniquely identifies the torrent across the BitTorrent network.
@@ -533,6 +543,8 @@ use crate::bencode::{decode, encode, BencodeError, BencodeValue};
 <<parse single file>>
 
 <<parse multi file>>
+
+<<parse announce list>>
 
 <<parse function>>
 
@@ -912,6 +924,106 @@ We also validate that neither the path array nor individual components are
 empty, and check for potential overflow when accumulating the total length.
 These edge cases may seem unlikely, but malformed torrents exist in the wild.
 
+\subsection{Parsing Announce-List (BEP 12)}
+
+BEP 12 defines the [[announce-list]] extension for multi-tracker support. The
+announce-list is a list of tiers, where each tier is a list of tracker URLs.
+The client should try trackers within each tier before moving to the next tier.
+
+The format is:
+\begin{verbatim}
+announce-list = [
+  [tracker1_tier0, tracker2_tier0],  # Tier 0 (primary)
+  [tracker1_tier1],                   # Tier 1 (backup)
+  [tracker1_tier2, tracker2_tier2]    # Tier 2
+]
+\end{verbatim}
+
+Within a tier, trackers should be tried in a random order (or the order returned
+by the tracker). If all trackers in a tier fail, move to the next tier. If a
+tracker succeeds, subsequent announces should try that tracker first.
+
+<<parse announce list>>=
+/// Parses the optional announce-list field from a torrent dictionary.
+///
+/// BEP 12 defines announce-list as a list of tiers, where each tier is a
+/// list of tracker URLs. This function attempts to parse this structure,
+/// returning None if the field is missing or malformed.
+///
+/// The announce-list provides redundancy: if the primary tracker is down,
+/// the client can try alternative trackers.
+///
+/// # Arguments
+///
+/// * `root` - The root dictionary of the torrent file
+///
+/// # Returns
+///
+/// - `Some(Vec<Vec<String>>)` if announce-list is present and well-formed
+/// - `None` if announce-list is missing or has any malformed entries
+///
+/// # Note
+///
+/// This function is lenient: it returns None for any malformed data rather
+/// than returning an error. This allows torrents with broken announce-list
+/// to still be parsed using the single announce URL.
+fn parse_announce_list(root: &BTreeMap<Vec<u8>, BencodeValue>) -> Option<Vec<Vec<String>>> {
+    // Get the announce-list field
+    let announce_list_value = root.get(b"announce-list".as_slice())?;
+
+    // It must be a list
+    let tiers = match announce_list_value {
+        BencodeValue::List(l) => l,
+        _ => return None,
+    };
+
+    // Parse each tier
+    let mut result = Vec::with_capacity(tiers.len());
+
+    for tier in tiers {
+        // Each tier must be a list
+        let urls = match tier {
+            BencodeValue::List(l) => l,
+            _ => return None, // Malformed: tier is not a list
+        };
+
+        // Parse each URL in the tier
+        let mut tier_urls = Vec::with_capacity(urls.len());
+        for url_value in urls {
+            match url_value {
+                BencodeValue::Bytes(bytes) => {
+                    // Convert to string, skipping invalid UTF-8
+                    if let Ok(url) = String::from_utf8(bytes.clone()) {
+                        if !url.is_empty() {
+                            tier_urls.push(url);
+                        }
+                    }
+                    // Skip invalid URLs silently
+                }
+                _ => return None, // Malformed: URL is not a byte string
+            }
+        }
+
+        // Only add non-empty tiers
+        if !tier_urls.is_empty() {
+            result.push(tier_urls);
+        }
+    }
+
+    // Return None if no valid tiers were found
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+@
+
+The parsing is lenient by design. If the announce-list is malformed in any way,
+we return [[None]] and fall back to the single [[announce]] URL. This ensures
+compatibility with torrents that have broken announce-list entries while still
+supporting the extension when it's properly formatted.
+
 \subsection{The Main Parse Function}
 
 The [[parse]] function is the main entry point for parsing metainfo files. It
@@ -958,6 +1070,9 @@ pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
     // Extract announce URL
     let announce = get_string(root, "announce")?;
 
+    // Extract optional announce-list (BEP 12)
+    let announce_list = parse_announce_list(root);
+
     // Extract the info dictionary as BencodeValue (for info hash computation)
     let info_value = get_value(root, "info")?;
 
@@ -1003,6 +1118,7 @@ pub fn parse(data: &[u8]) -> Result<Metainfo, MetainfoError> {
 
     Ok(Metainfo {
         announce,
+        announce_list,
         info_hash,
         piece_length,
         piece_hashes,
@@ -1883,6 +1999,263 @@ mod tests {
 
         let metainfo = parse(&torrent).expect("should parse");
         assert_eq!(metainfo.total_length, 10_000_000);
+    }
+
+    // ========================================
+    // Announce-List (BEP 12) Tests
+    // ========================================
+
+    /// Helper to create a torrent with an announce-list
+    fn make_torrent_with_announce_list(
+        announce: &str,
+        announce_list: &[&[&str]], // tiers of URLs
+        name: &str,
+        length: i64,
+    ) -> Vec<u8> {
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(length));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(name.as_bytes().to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(
+            b"announce".to_vec(),
+            BencodeValue::Bytes(announce.as_bytes().to_vec()),
+        );
+
+        // Build announce-list
+        let tiers: Vec<BencodeValue> = announce_list
+            .iter()
+            .map(|tier| {
+                let urls: Vec<BencodeValue> = tier
+                    .iter()
+                    .map(|url| BencodeValue::Bytes(url.as_bytes().to_vec()))
+                    .collect();
+                BencodeValue::List(urls)
+            })
+            .collect();
+        root.insert(b"announce-list".to_vec(), BencodeValue::List(tiers));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        encode(&BencodeValue::Dict(root))
+    }
+
+    #[test]
+    fn parse_torrent_without_announce_list() {
+        // Standard torrent without announce-list should have None
+        let pieces = [0u8; 20];
+        let torrent = make_single_file_torrent(
+            "http://tracker.example.com/announce",
+            "test.txt",
+            1024,
+            16384,
+            &pieces,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+        assert!(metainfo.announce_list.is_none());
+        assert_eq!(metainfo.announce, "http://tracker.example.com/announce");
+    }
+
+    #[test]
+    fn parse_torrent_with_single_tier_announce_list() {
+        let announce_list: &[&[&str]] = &[
+            &["http://tracker1.example.com/announce", "http://tracker2.example.com/announce"],
+        ];
+        let torrent = make_torrent_with_announce_list(
+            "http://primary.example.com/announce",
+            announce_list,
+            "test.txt",
+            1024,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+
+        assert!(metainfo.announce_list.is_some());
+        let tiers = metainfo.announce_list.unwrap();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers[0].len(), 2);
+        assert_eq!(tiers[0][0], "http://tracker1.example.com/announce");
+        assert_eq!(tiers[0][1], "http://tracker2.example.com/announce");
+    }
+
+    #[test]
+    fn parse_torrent_with_multiple_tier_announce_list() {
+        let announce_list: &[&[&str]] = &[
+            &["http://tier0-a.example.com/announce", "http://tier0-b.example.com/announce"],
+            &["http://tier1.example.com/announce"],
+            &["http://tier2-a.example.com/announce", "http://tier2-b.example.com/announce", "http://tier2-c.example.com/announce"],
+        ];
+        let torrent = make_torrent_with_announce_list(
+            "http://primary.example.com/announce",
+            announce_list,
+            "test.txt",
+            1024,
+        );
+
+        let metainfo = parse(&torrent).expect("should parse");
+
+        assert!(metainfo.announce_list.is_some());
+        let tiers = metainfo.announce_list.unwrap();
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[0].len(), 2);
+        assert_eq!(tiers[1].len(), 1);
+        assert_eq!(tiers[2].len(), 3);
+        assert_eq!(tiers[0][0], "http://tier0-a.example.com/announce");
+        assert_eq!(tiers[1][0], "http://tier1.example.com/announce");
+        assert_eq!(tiers[2][2], "http://tier2-c.example.com/announce");
+    }
+
+    #[test]
+    fn parse_announce_list_with_empty_tier_skipped() {
+        // An empty tier should be skipped, not cause an error
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://primary.example.com/announce".to_vec()));
+
+        // Create announce-list with an empty tier in the middle
+        let tiers = vec![
+            BencodeValue::List(vec![BencodeValue::Bytes(b"http://tracker1.example.com/announce".to_vec())]),
+            BencodeValue::List(vec![]),  // Empty tier
+            BencodeValue::List(vec![BencodeValue::Bytes(b"http://tracker2.example.com/announce".to_vec())]),
+        ];
+        root.insert(b"announce-list".to_vec(), BencodeValue::List(tiers));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let metainfo = parse(&torrent).expect("should parse");
+
+        // Empty tier is skipped, so we should have 2 tiers
+        assert!(metainfo.announce_list.is_some());
+        let tiers = metainfo.announce_list.unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0][0], "http://tracker1.example.com/announce");
+        assert_eq!(tiers[1][0], "http://tracker2.example.com/announce");
+    }
+
+    #[test]
+    fn parse_announce_list_malformed_returns_none() {
+        // If announce-list is not a list, parsing should return None
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://primary.example.com/announce".to_vec()));
+        // announce-list is an integer instead of a list
+        root.insert(b"announce-list".to_vec(), BencodeValue::Integer(42));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let metainfo = parse(&torrent).expect("should still parse");
+
+        // Malformed announce-list should result in None
+        assert!(metainfo.announce_list.is_none());
+        // But the announce URL should still work
+        assert_eq!(metainfo.announce, "http://primary.example.com/announce");
+    }
+
+    #[test]
+    fn parse_announce_list_tier_not_list_returns_none() {
+        // If a tier is not a list, parsing should return None
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://primary.example.com/announce".to_vec()));
+        // Tier is a string instead of a list
+        let tiers = vec![
+            BencodeValue::Bytes(b"http://tracker.example.com/announce".to_vec()),
+        ];
+        root.insert(b"announce-list".to_vec(), BencodeValue::List(tiers));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let metainfo = parse(&torrent).expect("should still parse");
+
+        // Malformed tier should result in None
+        assert!(metainfo.announce_list.is_none());
+    }
+
+    #[test]
+    fn parse_announce_list_url_not_string_returns_none() {
+        // If a URL is not a byte string, parsing should return None
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://primary.example.com/announce".to_vec()));
+        // URL is an integer instead of a string
+        let tiers = vec![
+            BencodeValue::List(vec![BencodeValue::Integer(12345)]),
+        ];
+        root.insert(b"announce-list".to_vec(), BencodeValue::List(tiers));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let metainfo = parse(&torrent).expect("should still parse");
+
+        // URL not a string should result in None
+        assert!(metainfo.announce_list.is_none());
+    }
+
+    #[test]
+    fn parse_announce_list_all_empty_returns_none() {
+        // If all tiers are empty, parsing should return None
+        use crate::bencode::encode;
+
+        let pieces = [0u8; 20];
+        let mut info = BTreeMap::new();
+        info.insert(b"length".to_vec(), BencodeValue::Integer(1024));
+        info.insert(b"name".to_vec(), BencodeValue::Bytes(b"test.txt".to_vec()));
+        info.insert(b"piece length".to_vec(), BencodeValue::Integer(16384));
+        info.insert(b"pieces".to_vec(), BencodeValue::Bytes(pieces.to_vec()));
+
+        let mut root = BTreeMap::new();
+        root.insert(b"announce".to_vec(), BencodeValue::Bytes(b"http://primary.example.com/announce".to_vec()));
+        // All tiers are empty
+        let tiers = vec![
+            BencodeValue::List(vec![]),
+            BencodeValue::List(vec![]),
+        ];
+        root.insert(b"announce-list".to_vec(), BencodeValue::List(tiers));
+        root.insert(b"info".to_vec(), BencodeValue::Dict(info));
+
+        let torrent = encode(&BencodeValue::Dict(root));
+        let metainfo = parse(&torrent).expect("should still parse");
+
+        // All empty tiers should result in None
+        assert!(metainfo.announce_list.is_none());
     }
 }
 @
