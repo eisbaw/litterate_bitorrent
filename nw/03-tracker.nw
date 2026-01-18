@@ -8,6 +8,47 @@ to download a torrent, it contacts the tracker to announce its presence and
 receive a list of other peers sharing the same content. This chapter implements
 HTTP tracker communication as specified in BEP 3.
 
+\subsection{The Tracker's Role in BitTorrent}
+
+In the BitTorrent ecosystem, the tracker serves as a \emph{rendezvous point}---a
+central directory where peers discover each other. Without the tracker, a peer
+joining a swarm would have no way to find other participants. The tracker does
+not transfer any torrent data itself; it merely facilitates introductions.
+
+The communication pattern is simple:
+
+\begin{enumerate}
+\item \textbf{Client announces}: Our client sends an HTTP GET request to the
+  tracker's announce URL, providing identifying information (info hash, peer ID),
+  network information (port, IP address), and progress statistics (bytes uploaded,
+  downloaded, remaining).
+
+\item \textbf{Tracker responds}: The tracker returns a list of other peers
+  currently participating in the same swarm, along with timing information
+  indicating when we should announce again.
+
+\item \textbf{Client connects to peers}: Armed with the peer list, our client
+  establishes direct TCP connections to other peers and begins exchanging
+  piece data. The tracker is no longer involved in data transfer.
+
+\item \textbf{Periodic re-announce}: At intervals specified by the tracker,
+  our client sends fresh announcements to report updated statistics and
+  receive potentially new peers.
+\end{enumerate}
+
+This design has important implications. The tracker is a \emph{single point of
+failure}: if the tracker goes offline, new peers cannot join the swarm, though
+existing peer connections continue to function. The tracker also sees every
+participant's IP address, creating potential privacy concerns. These limitations
+motivate alternative discovery mechanisms like DHT (Distributed Hash Table),
+which our client does not implement but which we discuss briefly at the end
+of this chapter.
+
+Despite its limitations, tracker-based discovery remains widely supported and
+is often the most reliable way to bootstrap into a swarm. Our implementation
+focuses on the HTTP tracker protocol defined in BEP 3 and the compact peer
+format extension defined in BEP 23.
+
 \subsection{Tracker Error Types}
 
 Communicating with a tracker can fail in several ways. We define a dedicated
@@ -1393,6 +1434,121 @@ These tests cover the key scenarios specified in the acceptance criteria:
   format without encoding ambiguity.
 \end{enumerate}
 
+\subsection{The Announce Request/Response Cycle: A Walkthrough}
+
+Before diving into the HTTP implementation, let us trace through a complete
+announce cycle with concrete data. This walkthrough illustrates how all the
+pieces fit together.
+
+\subsubsection{Constructing the Request}
+
+Suppose our client is starting to download a torrent with the following
+characteristics:
+
+\begin{itemize}
+\item Announce URL: \texttt{http://tracker.example.com:6969/announce}
+\item Info hash (20 bytes, shown in hex): \texttt{aaf4c61d...} (SHA1 of ``hello'')
+\item Our peer ID: \texttt{-LT0001-abcdefghijkl} (Literate Torrent, version 0.0.01)
+\item Port: 6881 (standard BitTorrent port)
+\item Torrent size: 1,073,741,824 bytes (1 GiB)
+\end{itemize}
+
+For the first announce (event=started), with nothing downloaded yet, we
+construct this URL:
+
+\begin{verbatim}
+http://tracker.example.com:6969/announce
+  ?info_hash=%AA%F4%C6%1D%DC%C5%E8%A2%DA%BE%DE%5BT%CAz%A4%E77%92%02
+  &peer_id=-LT0001-abcdefghijkl
+  &port=6881
+  &uploaded=0
+  &downloaded=0
+  &left=1073741824
+  &event=started
+  &compact=1
+\end{verbatim}
+
+Note how the info hash is percent-encoded (binary bytes become \texttt{\%XX}),
+while the peer ID passes through mostly unchanged since it consists of
+unreserved ASCII characters.
+
+\subsubsection{The HTTP Request}
+
+Our client sends an HTTP/1.1 GET request:
+
+\begin{verbatim}
+GET /announce?info_hash=%AA%F4...&peer_id=...&port=6881&... HTTP/1.1
+Host: tracker.example.com:6969
+User-Agent: LiterateTorrent/0.1
+Accept: */*
+Connection: close
+\end{verbatim}
+
+The tracker receives this, looks up the info hash in its database, finds
+other peers currently sharing this torrent, and prepares a response.
+
+\subsubsection{The Tracker's Response}
+
+The tracker responds with HTTP 200 and a bencoded dictionary body. Here is
+an example response (with the bencoded structure shown in readable form):
+
+\begin{verbatim}
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 87
+
+d
+  8:interval  i1800e
+  12:min interval  i900e
+  8:complete  i15e
+  10:incomplete  i47e
+  5:peers  30:<binary peer data: 5 peers x 6 bytes each>
+e
+\end{verbatim}
+
+The actual bencoded response is a continuous byte stream without whitespace.
+The peer data in compact format looks like this (30 bytes for 5 peers):
+
+\begin{verbatim}
+Offset   Bytes (hex)         Decoded
+------   ------------------  -------------------------
+0-5      C0 A8 01 0A 1A E1   192.168.1.10:6881
+6-11     0A 00 00 01 1F 90   10.0.0.1:8080
+12-17    5D B8 D8 22 16 88   93.184.216.34:5768
+18-23    AC 10 00 05 0B B8   172.16.0.5:3000
+24-29    2F 68 9C A1 C8 01   47.104.156.161:51201
+\end{verbatim}
+
+\subsubsection{Parsing the Response}
+
+Our client parses the bencoded response and extracts:
+
+\begin{itemize}
+\item \texttt{interval}: 1800 seconds (30 minutes until next regular announce)
+\item \texttt{min interval}: 900 seconds (minimum 15 minutes between any announces)
+\item \texttt{complete}: 15 seeders have the complete file
+\item \texttt{incomplete}: 47 leechers are still downloading
+\item \texttt{peers}: 5 peer addresses to connect to
+\end{itemize}
+
+Armed with this information, our client can now establish TCP connections
+to the five peers and begin exchanging piece data. After 30 minutes (or sooner
+if needed), we will announce again---but without the \texttt{event} parameter,
+since it is only used for lifecycle events.
+
+\subsubsection{Error Responses}
+
+If the tracker rejects our request, it returns a bencoded dictionary with
+a \texttt{failure reason} key instead of the normal fields:
+
+\begin{verbatim}
+d14:failure reason22:torrent not registerede
+\end{verbatim}
+
+This decodes to: \texttt{\{``failure reason'': ``torrent not registered''\}}.
+Our client must detect this failure response before attempting to extract
+peer data.
+
 \subsection{HTTP Announce Request}
 
 With the announce URL constructed, we now need to actually send the HTTP request
@@ -1894,6 +2050,87 @@ compared to the dictionary format which requires dozens of bytes per peer
 for the bencoded dictionary structure, key names, and quoted string values.
 For a response with 50 peers, compact format uses 300 bytes while dictionary
 format might use 2000+ bytes.
+
+\subsubsection{Byte-Level Format Diagram}
+
+The following diagram shows the exact layout of the compact peer format:
+
+\begin{verbatim}
+                        6 bytes per peer
+     +-----------------------------------------------+
+     |                                               |
+     v                                               v
++----+----+----+----+----+----+----+----+----+----+----+----+
+| B0 | B1 | B2 | B3 | B4 | B5 | B0 | B1 | B2 | B3 | B4 | B5 | ...
++----+----+----+----+----+----+----+----+----+----+----+----+
+|    IPv4 Address   |    Port   |    IPv4 Address   | Port  |
+|    (big-endian)   | (big-end) |    (big-endian)   | ...   |
++-------------------+-----------+-------------------+-------+
+      Peer 0                          Peer 1           ...
+\end{verbatim}
+
+For a concrete example, consider the byte sequence representing two peers:
+
+\begin{verbatim}
+Byte:    0     1     2     3     4     5     6     7     8     9    10    11
+Hex:    C0    A8    01    01    1A    E1    0A    00    00    01    1F    90
+Dec:   192   168     1     1    26   225    10     0     0     1    31   144
+        |_____|_____|_____|     |_____|     |_____|_____|_____|     |_____|
+              |                    |               |                   |
+        192.168.1.1            6881          10.0.0.1               8080
+\end{verbatim}
+
+The decoding process:
+
+\begin{enumerate}
+\item \textbf{Peer 0 IP Address}: Bytes 0--3 are \texttt{C0 A8 01 01}.
+  Reading as decimal: 192, 168, 1, 1. Result: \texttt{192.168.1.1}
+
+\item \textbf{Peer 0 Port}: Bytes 4--5 are \texttt{1A E1}.
+  In big-endian: $(26 \times 256) + 225 = 6656 + 225 = 6881$. Result: \texttt{6881}
+
+\item \textbf{Peer 1 IP Address}: Bytes 6--9 are \texttt{0A 00 00 01}.
+  Reading as decimal: 10, 0, 0, 1. Result: \texttt{10.0.0.1}
+
+\item \textbf{Peer 1 Port}: Bytes 10--11 are \texttt{1F 90}.
+  In big-endian: $(31 \times 256) + 144 = 7936 + 144 = 8080$. Result: \texttt{8080}
+\end{enumerate}
+
+\subsubsection{Why Big-Endian (Network Byte Order)?}
+
+Network protocols universally use big-endian byte order, also called ``network
+byte order.'' This convention dates back to early internet standards (RFC 1700)
+and ensures interoperability: a peer on a big-endian machine and a peer on a
+little-endian machine can exchange data without confusion about byte ordering.
+
+On x86/x64 machines (little-endian), the port value 6881 is stored in memory as
+\texttt{E1 1A} (low byte first). But when transmitted on the network, it becomes
+\texttt{1A E1} (high byte first). Our code uses [[u16::from_be_bytes]] to
+explicitly decode from big-endian, making the conversion clear and correct
+regardless of the host architecture.
+
+\subsubsection{Comparison with Dictionary Format}
+
+The deprecated dictionary format encodes the same two peers as:
+
+\begin{verbatim}
+l                              # List start
+  d                            # Dict start (peer 0)
+    2:ip 11:192.168.1.1        # "ip" -> "192.168.1.1"
+    7:peer id 20:xxxx...       # "peer id" -> 20 bytes
+    4:port i6881e              # "port" -> 6881
+  e                            # Dict end
+  d                            # Dict start (peer 1)
+    2:ip 8:10.0.0.1            # "ip" -> "10.0.0.1"
+    7:peer id 20:xxxx...       # "peer id" -> 20 bytes
+    4:port i8080e              # "port" -> 8080
+  e                            # Dict end
+e                              # List end
+\end{verbatim}
+
+This requires approximately 100+ bytes for just two peers, compared to 12 bytes
+in compact format. The bandwidth savings are substantial for responses with
+many peers, which is why BEP-23 compact format is now the default.
 
 <<compact peer parsing>>=
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -2855,3 +3092,221 @@ These tests ensure that:
 Full end-to-end testing of the announce flow happens in the project's integration
 tests, where we can control the network environment and verify the complete
 request/response cycle.
+
+\subsection{Announce Intervals and the Re-Announce Cycle}
+
+A BitTorrent client does not announce just once---it must periodically
+re-announce to the tracker throughout the download lifecycle. This serves
+several purposes:
+
+\begin{itemize}
+\item \textbf{Keep-alive}: The tracker needs to know we are still active.
+  Without periodic announcements, the tracker would eventually remove us from
+  its peer list (typically after 30--60 minutes of inactivity).
+
+\item \textbf{Statistics update}: Each announce reports our current upload/download
+  statistics. Trackers use this for ratio enforcement (on private trackers) and
+  for displaying swarm statistics.
+
+\item \textbf{Fresh peers}: The tracker may return different peers on each
+  announce, giving us opportunities to connect to faster or more reliable peers.
+\end{itemize}
+
+\subsubsection{Timing Parameters}
+
+The tracker controls announce timing through two response fields:
+
+\begin{description}
+\item[interval] The number of seconds until the next \emph{regular} announce.
+  This is mandatory in every successful response. Typical values range from
+  300 seconds (5 minutes) for small trackers to 3600 seconds (1 hour) for
+  high-traffic trackers like those serving Linux distributions.
+
+\item[min interval] The minimum number of seconds between \emph{any} two
+  announces. This is optional but, when present, acts as a hard limit. The
+  client must not announce more frequently than this, even for event-driven
+  announces like ``completed.''
+\end{description}
+
+These timing parameters serve as a load-balancing mechanism. A tracker serving
+millions of peers would be overwhelmed if every client announced every minute.
+By specifying longer intervals, the tracker can reduce load while still
+maintaining reasonably current peer lists.
+
+\subsubsection{The Re-Announce State Machine}
+
+Our client's announce behavior follows this state machine:
+
+\begin{verbatim}
+                  +-------------+
+                  |   INITIAL   |
+                  +------+------+
+                         |
+                         | (startup)
+                         v
+           +-------------+-------------+
+           |  ANNOUNCE(event=started)  |
+           +-------------+-------------+
+                         |
+                         | (wait interval seconds)
+                         v
+           +-------------+-------------+
+           |   ANNOUNCE(event=none)    |<--------+
+           +-------------+-------------+         |
+                         |                       |
+                         | (wait interval)       |
+                         +-----------------------+
+                         |
+                         | (download complete)
+                         v
+           +-------------+-------------+
+           |  ANNOUNCE(event=completed)|
+           +-------------+-------------+
+                         |
+                         | (user quits)
+                         v
+           +-------------+-------------+
+           |  ANNOUNCE(event=stopped)  |
+           +-------------+-------------+
+                         |
+                         v
+                  +-------------+
+                  |    DONE     |
+                  +-------------+
+\end{verbatim}
+
+Key transitions:
+
+\begin{enumerate}
+\item \textbf{First announce}: Always includes \texttt{event=started}. This
+  registers us with the tracker.
+
+\item \textbf{Periodic announces}: Omit the event parameter. These occur
+  every \texttt{interval} seconds as specified by the tracker.
+
+\item \textbf{Completion announce}: When the download finishes (all pieces
+  verified), we send \texttt{event=completed} exactly once. This tells the
+  tracker we have transitioned from leecher to seeder.
+
+\item \textbf{Shutdown announce}: When the client exits cleanly, we send
+  \texttt{event=stopped}. This allows the tracker to remove us immediately
+  rather than waiting for our entry to expire.
+\end{enumerate}
+
+\subsubsection{Handling Interval Changes}
+
+The tracker may change the interval between announces. Our client should
+always use the most recent interval value. For example:
+
+\begin{itemize}
+\item First response: \texttt{interval=1800} (30 minutes)
+\item Second response: \texttt{interval=3600} (1 hour)---tracker is under load
+\item Third response: \texttt{interval=900} (15 minutes)---load reduced
+\end{itemize}
+
+This dynamic adjustment allows trackers to respond to load conditions. During
+peak hours or DDoS attacks, trackers may dramatically increase intervals to
+survive.
+
+\subsubsection{Failure Recovery}
+
+When an announce fails (timeout, HTTP error, tracker error response), the
+client should:
+
+\begin{enumerate}
+\item Log the failure for debugging.
+\item Wait a brief period (e.g., 30 seconds to 2 minutes) before retrying.
+\item If using announce-list (multiple trackers), try the next tracker in
+  the list.
+\item Continue with existing peer connections---they are not affected by
+  tracker failures.
+\end{enumerate}
+
+A single failed announce is not catastrophic. The client can continue
+downloading with its existing peers. However, prolonged tracker unavailability
+prevents new peers from discovering us and vice versa.
+
+\subsection{Limitations of Tracker-Based Discovery}
+
+While tracker-based peer discovery is simple and widely supported, it has
+significant limitations that have motivated the development of alternative
+discovery mechanisms.
+
+\subsubsection{Single Point of Failure}
+
+The tracker is a centralized service. If the tracker goes offline:
+
+\begin{itemize}
+\item New peers cannot join the swarm---they have no way to discover existing
+  participants.
+\item Existing peers can continue exchanging data with their current connections,
+  but cannot find new peers.
+\item If the torrent's only tracker becomes permanently unavailable, the swarm
+  eventually dies as peers disconnect and cannot be replaced.
+\end{itemize}
+
+The \texttt{announce-list} extension (BEP 12) partially mitigates this by
+allowing multiple backup trackers, but all listed trackers could still fail
+simultaneously.
+
+\subsubsection{Privacy Concerns}
+
+Trackers necessarily see:
+
+\begin{itemize}
+\item Every participant's IP address
+\item What torrents each IP is downloading
+\item Transfer statistics (upload/download amounts)
+\item How long each peer participates
+\end{itemize}
+
+This information is valuable for surveillance, copyright enforcement, or
+traffic analysis. Even well-intentioned tracker operators may be compelled
+to provide logs, or their systems may be compromised.
+
+\subsubsection{Scalability Limits}
+
+A single tracker serving a very popular torrent (e.g., a new Linux release)
+must handle millions of announce requests. Even with long intervals, this
+creates significant load:
+
+\begin{verbatim}
+1,000,000 peers * 1 announce / 30 minutes = 555 announces/second
+\end{verbatim}
+
+Tracker operators must invest in robust infrastructure, and even then may
+struggle during peak periods.
+
+\subsubsection{Legal and Political Vulnerability}
+
+Tracker operators are visible targets. They can be:
+
+\begin{itemize}
+\item Served with takedown notices
+\item Subjected to DDoS attacks
+\item Pressured to block certain torrents
+\item Prosecuted in some jurisdictions
+\end{itemize}
+
+This has led to the shutdown of many public trackers over the years.
+
+\subsubsection{The Case for DHT}
+
+These limitations motivated the development of the Distributed Hash Table (DHT)
+protocol for BitTorrent, specified in BEP 5. DHT eliminates the central tracker
+by distributing peer discovery across all participating clients:
+
+\begin{itemize}
+\item \textbf{No single point of failure}: The network is fully decentralized.
+\item \textbf{Privacy improvement}: No single entity sees all traffic.
+\item \textbf{Resilience}: The network heals itself as nodes join and leave.
+\end{itemize}
+
+However, DHT is more complex to implement and has its own tradeoffs (bootstrap
+problems, slower peer discovery, Sybil attack vulnerability). Our client does
+not implement DHT---we rely solely on tracker-based discovery---but understanding
+why DHT exists helps explain the broader BitTorrent ecosystem.
+
+For a practical client, tracker-based discovery remains valuable even when DHT
+is available. Trackers provide faster initial peer discovery, and many private
+trackers (which require registration and enforce ratio) do not allow DHT at all.

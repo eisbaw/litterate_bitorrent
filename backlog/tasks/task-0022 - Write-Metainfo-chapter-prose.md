@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-17 23:50'
+updated_date: '2026-01-17 23:54'
 labels: []
 dependencies: []
 ---
@@ -41,15 +41,10 @@ The metainfo (.torrent) file is what users interact with. This chapter must expl
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Enhanced nw/02-metainfo.nw with comprehensive prose covering:
-
-- **Why Metainfo Matters**: Explains the four key problems solved (discovery, identity, integrity, structure)
-- **Top-Level Structure**: Field-by-field breakdown with BEP 3 alignment
-- **The Info Dictionary**: Detailed explanation of all info dict fields
-- **Info Hash sections**: Why it matters, immutability rationale, and computation details
-- **Single-File vs Multi-File**: Separate subsections with concrete bencode examples, plus explanation of how pieces span file boundaries
-- **Implementation Overview**: 6-step parsing walkthrough from bytes to Metainfo struct
-
-All tests pass (32/32 metainfo tests). Both just tangle and just weave succeed.
-PDF generated: 638 pages.
+Added comprehensive Metainfo chapter prose:
+- "Why Metainfo Matters" covering 4 key concerns
+- Field-by-field breakdown of .torrent structure
+- Info hash computation with immutability explanation
+- Single-file vs multi-file with bencode examples
+- 6-step parsing implementation walkthrough
 <!-- SECTION:NOTES:END -->
