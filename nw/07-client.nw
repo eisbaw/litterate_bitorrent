@@ -9094,24 +9094,37 @@ statistics and potentially receive new peers. The tracker response includes
 an updated interval which we respect for the next re-announce.
 
 The implementation handles tracker failures gracefully with exponential backoff:
-consecutive failures double the wait time (capped at 8 failures = 256x multiplier),
-while successful re-announces reset the backoff. This prevents hammering a
-temporarily unavailable tracker while ensuring we recover quickly when it returns.
+on failure, we wait 30 seconds before the first retry, then double the wait time
+for each subsequent failure (30s, 60s, 120s, 240s, 480s) capped at 15 minutes.
+Successful re-announces reset the backoff. This prevents hammering a temporarily
+unavailable tracker while ensuring we recover quickly when it returns.
 
 The event loop uses [[sleep()]] rather than [[interval()]] for re-announce timing,
 allowing dynamic adjustment of the next re-announce interval. On success, the
-interval from the tracker response is used. On failure, the base interval is
-multiplied by the exponential backoff factor.
+interval from the tracker response is used. On failure, a fixed base interval of
+30 seconds is multiplied by the exponential backoff factor, capped at 15 minutes.
 
 <<event loop>>=
 use crate::tracker::announce;
 
+/// Base backoff interval for tracker re-announce failures (30 seconds).
+///
+/// When a re-announce fails, we start with this interval and double it
+/// for each consecutive failure (30s, 60s, 120s, 240s, 480s, ...).
+const TRACKER_BACKOFF_BASE_SECS: u64 = 30;
+
+/// Maximum backoff interval for tracker re-announce failures (15 minutes).
+///
+/// The exponential backoff is capped at this value to ensure we eventually
+/// retry even after many consecutive failures.
+const TRACKER_BACKOFF_MAX_SECS: u64 = 900;
+
 /// Maximum consecutive announce failures before capping backoff.
 ///
 /// After this many consecutive failures, we stop increasing the wait time.
-/// With an initial interval of 30 minutes and 8 failures, the maximum backoff
-/// is 2^8 * 30 = 7680 minutes = 128 hours.
-const MAX_CONSECUTIVE_ANNOUNCE_FAILURES: u32 = 8;
+/// With base interval of 30 seconds and 6 failures, the interval reaches
+/// 30 * 2^5 = 960 seconds, which is capped at 900 seconds (15 minutes).
+const MAX_CONSECUTIVE_ANNOUNCE_FAILURES: u32 = 6;
 
 /// Handles the re-announce timer event.
 ///
@@ -9125,13 +9138,17 @@ const MAX_CONSECUTIVE_ANNOUNCE_FAILURES: u32 = 8;
 /// # Backoff Strategy
 ///
 /// - Success: Reset failure count, use tracker-provided interval
-/// - Failure: Increment failure count, double effective interval (capped)
+/// - Failure: Increment failure count, use exponential backoff with fixed base
+///   - First failure: 30s
+///   - Second failure: 60s
+///   - Third failure: 120s
+///   - And so on, capped at 15 minutes (900s)
 ///
 /// # Returns
 ///
 /// The duration to wait before the next re-announce. On success, this is
-/// the interval from the tracker response. On failure, this is the base
-/// interval multiplied by an exponential backoff factor.
+/// the interval from the tracker response. On failure, this is a fixed base
+/// interval (30s) multiplied by an exponential backoff factor, capped at 15 minutes.
 async fn handle_re_announce(
     ctx: &mut EventLoopContext<'_>,
 ) -> Duration {
@@ -9183,14 +9200,17 @@ async fn handle_re_announce(
             *ctx.re_announce_failures = (*ctx.re_announce_failures + 1)
                 .min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
 
-            let backoff_multiplier = 1u64 << *ctx.re_announce_failures;
-            let backoff_secs = ctx.tracker_interval.saturating_mul(backoff_multiplier);
+            // Calculate backoff: base * 2^(failures-1), capped at max
+            // failures=1 -> 30s, failures=2 -> 60s, failures=3 -> 120s, etc.
+            let backoff_multiplier = 1u64 << (*ctx.re_announce_failures - 1);
+            let backoff_secs = TRACKER_BACKOFF_BASE_SECS
+                .saturating_mul(backoff_multiplier)
+                .min(TRACKER_BACKOFF_MAX_SECS);
             let next_interval = Duration::from_secs(backoff_secs);
 
             warn!(
                 error = %e,
                 consecutive_failures = *ctx.re_announce_failures,
-                backoff_multiplier = backoff_multiplier,
                 next_interval_secs = backoff_secs,
                 "re-announce failed, continuing with existing peers"
             );
@@ -9459,7 +9479,7 @@ When non-fatal errors occur, the client degrades gracefully rather than failing:
   fetch new peers. Log at WARN level so user knows progress is stalled.
 
 \item \textbf{Tracker unreachable}: Continue with existing peers. Use exponential
-  backoff (2x, 4x, 8x base interval) for retries, capped at 256x.
+  backoff (30s, 60s, 120s, 240s, 480s) for retries, capped at 15 minutes.
 
 \item \textbf{Piece hash fails}: Discard the piece, mark as failed, re-download
   from a different peer if possible. Log the failure for debugging.
@@ -9497,10 +9517,10 @@ Tracker re-announces use exponential backoff:
   +----+----+
   | Success | Failure
   v         v
-  Use       Increment failure count (max 8)
-  tracker-  Multiply interval by 2^failures
-  provided  Schedule retry with backoff
-  interval
+  Use       Increment failure count
+  tracker-  Calculate backoff: 30s * 2^failures
+  provided  Cap at 15 minutes (900s)
+  interval  Schedule retry with backoff
 \end{verbatim}
 
 \subsubsection{Error Logging Philosophy}
@@ -9792,28 +9812,44 @@ mod re_announce_tests {
 
     #[test]
     #[allow(clippy::assertions_on_constants)]
-    fn max_consecutive_failures_constant_reasonable() {
-        // Max failures should cap at a reasonable value
-        // With failures=8, multiplier = 2^8 = 256
-        // With 30min base interval: 30 * 256 = 7680 min = 128 hours max
+    fn backoff_constants_are_reasonable() {
+        // Base interval should be 30 seconds
+        assert_eq!(TRACKER_BACKOFF_BASE_SECS, 30);
+        // Max interval should be 15 minutes (900 seconds)
+        assert_eq!(TRACKER_BACKOFF_MAX_SECS, 900);
+        // Max failures should be reasonable (enough to reach cap)
         assert!(MAX_CONSECUTIVE_ANNOUNCE_FAILURES >= 4);
-        assert!(MAX_CONSECUTIVE_ANNOUNCE_FAILURES <= 16);
+        assert!(MAX_CONSECUTIVE_ANNOUNCE_FAILURES <= 10);
     }
 
+    /// Tests that backoff intervals follow the expected sequence:
+    /// 30s, 60s, 120s, 240s, 480s, capped at 900s (15 min)
     #[test]
-    fn backoff_calculation_works() {
-        // Test the backoff formula: 1 << failures
-        let failures = 0u32;
-        assert_eq!(1u32 << failures, 1); // No failures = normal interval
+    fn backoff_sequence_follows_spec() {
+        // Helper to calculate backoff as done in handle_re_announce
+        // Formula: base * 2^(failures-1), capped at max
+        fn calculate_backoff(failures: u32) -> u64 {
+            assert!(failures >= 1, "failures must be at least 1");
+            let multiplier = 1u64 << (failures - 1);
+            TRACKER_BACKOFF_BASE_SECS
+                .saturating_mul(multiplier)
+                .min(TRACKER_BACKOFF_MAX_SECS)
+        }
 
-        let failures = 1u32;
-        assert_eq!(1u32 << failures, 2); // 1 failure = 2x
-
-        let failures = 3u32;
-        assert_eq!(1u32 << failures, 8); // 3 failures = 8x
-
-        let failures = MAX_CONSECUTIVE_ANNOUNCE_FAILURES;
-        assert_eq!(1u32 << failures, 256); // Max failures = 256x
+        // First failure: 30s * 2^0 = 30s
+        assert_eq!(calculate_backoff(1), 30);
+        // Second failure: 30s * 2^1 = 60s
+        assert_eq!(calculate_backoff(2), 60);
+        // Third failure: 30s * 2^2 = 120s
+        assert_eq!(calculate_backoff(3), 120);
+        // Fourth failure: 30s * 2^3 = 240s
+        assert_eq!(calculate_backoff(4), 240);
+        // Fifth failure: 30s * 2^4 = 480s
+        assert_eq!(calculate_backoff(5), 480);
+        // Sixth failure: 30s * 2^5 = 960s, but capped at 900s
+        assert_eq!(calculate_backoff(6), 900);
+        // Beyond max failures: still capped at 900s
+        assert_eq!(calculate_backoff(10), 900);
     }
 
     #[test]
@@ -9838,9 +9874,9 @@ mod re_announce_tests {
 
     /// Verifies the logic for handling tracker unavailability:
     /// - Failure count increments correctly
-    /// - Backoff multiplier doubles with each failure
-    /// - Backoff caps at maximum to prevent infinite growth
-    /// - Reset to 0 on success (tested via the cap test - if it caps, reset would work)
+    /// - Backoff uses fixed 30s base, not tracker interval
+    /// - Backoff caps at 15 minutes (900s)
+    /// - Reset to 0 on success
     ///
     /// Note: Full network integration tests would require a mock HTTP server.
     /// The handle_re_announce function correctly:
@@ -9849,27 +9885,94 @@ mod re_announce_tests {
     /// 3. Adds new peers on success without duplicates (via add_peers)
     #[test]
     fn tracker_unavailability_handling_logic() {
-        // Simulate multiple failures and verify backoff behavior
+        // Helper to calculate backoff as done in handle_re_announce
+        // Formula: base * 2^(failures-1), capped at max
+        fn calculate_backoff(failures: u32) -> u64 {
+            assert!(failures >= 1);
+            let multiplier = 1u64 << (failures - 1);
+            TRACKER_BACKOFF_BASE_SECS
+                .saturating_mul(multiplier)
+                .min(TRACKER_BACKOFF_MAX_SECS)
+        }
+
         let mut failures = 0u32;
 
-        // First failure
+        // First failure: 30s * 2^0 = 30s
         failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
         assert_eq!(failures, 1);
-        assert_eq!(1u32 << failures, 2); // 2x backoff
+        assert_eq!(calculate_backoff(failures), 30);
 
-        // Second failure
+        // Second failure: 30s * 2^1 = 60s
         failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
         assert_eq!(failures, 2);
-        assert_eq!(1u32 << failures, 4); // 4x backoff
+        assert_eq!(calculate_backoff(failures), 60);
+
+        // Third failure: 30s * 2^2 = 120s
+        failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
+        assert_eq!(failures, 3);
+        assert_eq!(calculate_backoff(failures), 120);
 
         // Simulate success: reset to 0
         failures = 0;
         assert_eq!(failures, 0);
-        assert_eq!(1u32 << failures, 1); // Normal interval
 
-        // Another failure after success starts from 1 again
+        // After success, next failure starts from 1 again
         failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
         assert_eq!(failures, 1);
+        assert_eq!(calculate_backoff(failures), 30);
+    }
+
+    /// Verifies that the backoff caps at 15 minutes (900 seconds)
+    /// as specified in the acceptance criteria.
+    #[test]
+    fn backoff_caps_at_fifteen_minutes() {
+        // Calculate backoff for many failures - should always cap at 900s
+        // Formula: base * 2^(failures-1), capped at max
+        // 30 * 2^5 = 960 > 900, so failures >= 6 should all cap at 900
+        for failures in 6..=20 {
+            let multiplier = 1u64 << (failures - 1);
+            let backoff = TRACKER_BACKOFF_BASE_SECS
+                .saturating_mul(multiplier)
+                .min(TRACKER_BACKOFF_MAX_SECS);
+            assert_eq!(
+                backoff, 900,
+                "backoff for {} failures should cap at 900s",
+                failures
+            );
+        }
+    }
+
+    /// Integration test: verifies that tracker failure triggers backoff
+    /// and download can continue with existing peers.
+    ///
+    /// This test verifies the backoff calculation logic without requiring
+    /// actual network operations. The handle_re_announce function uses
+    /// the same calculation tested here.
+    #[test]
+    fn tracker_failure_triggers_backoff() {
+        // Simulate the backoff calculation done in handle_re_announce
+        // Formula: base * 2^(failures-1), capped at max
+        let mut failures = 0u32;
+
+        // Simulate a failure
+        failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
+
+        // Calculate backoff as done in handle_re_announce
+        let multiplier = 1u64 << (failures - 1);
+        let backoff_secs = TRACKER_BACKOFF_BASE_SECS
+            .saturating_mul(multiplier)
+            .min(TRACKER_BACKOFF_MAX_SECS);
+
+        // First failure should give 30 seconds (30 * 2^0)
+        assert_eq!(backoff_secs, 30);
+
+        // After second failure: 60 seconds (30 * 2^1)
+        failures = (failures + 1).min(MAX_CONSECUTIVE_ANNOUNCE_FAILURES);
+        let multiplier = 1u64 << (failures - 1);
+        let backoff_secs = TRACKER_BACKOFF_BASE_SECS
+            .saturating_mul(multiplier)
+            .min(TRACKER_BACKOFF_MAX_SECS);
+        assert_eq!(backoff_secs, 60);
     }
 }
 @

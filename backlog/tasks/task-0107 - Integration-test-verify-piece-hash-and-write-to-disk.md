@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:35'
-updated_date: '2026-01-18 02:41'
+updated_date: '2026-01-18 02:43'
 labels:
   - phase4
   - integration
@@ -73,14 +73,11 @@ Create an integration test that exercises the complete Phase 4 pipeline: given r
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented 6 integration tests in nw/08-disk.nw that exercise the complete Phase 4 pipeline:
-
-- **integration_multifile_torrent_out_of_order_blocks**: 3-file torrent (80+60+60=200 bytes), 64-byte pieces, tests piece spanning file boundary with block reception, hash verification, disk write, and read-back verification
-- **integration_multiblock_piece_out_of_order**: 40KB piece (3 blocks) received in reverse order (2,0,1), verifies out-of-order block assembly
-- **integration_piece_spanning_two_files**: Focused test on piece crossing file boundary (64-byte piece across two 100-byte files)
-- **integration_hash_mismatch_detection**: Verifies corrupted data fails hash verification with meaningful error message
-- **integration_full_pipeline_multiple_pieces**: Downloads all 4 pieces of torrent in reverse order, writes each, then reads back and reconstructs complete data
-- **integration_read_back_spanning_piece**: Tests piece spanning 3 files (30+30+30=90 bytes)
-
-All tests pass: `just tangle && just lint && just test`
+Added 6 integration tests for Phase 4 pipeline:
+- Multi-file torrent with file-spanning pieces
+- Out-of-order block assembly
+- SHA1 hash verification
+- Disk write and read-back
+- Hash mismatch detection
+All 884 tests pass.
 <!-- SECTION:NOTES:END -->
