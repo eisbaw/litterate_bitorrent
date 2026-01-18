@@ -2411,6 +2411,8 @@ fn cancel_stores_fields() {
 <<message serialization tests>>
 
 <<message parsing tests>>
+
+<<message round-trip tests>>
 @
 
 These tests verify:
@@ -3384,6 +3386,403 @@ These parsing tests verify:
 \item Messages without payloads reject extra data
 \item Edge cases like maximum values work correctly
 \end{itemize}
+
+\subsubsection{Comprehensive Round-Trip Tests}
+
+Round-trip testing is a powerful technique for verifying serialization correctness:
+we serialize a message using [[to_bytes()]], then parse it back with [[from_bytes()]],
+and verify the result matches the original. If the round-trip fails for any message,
+it indicates an asymmetry between serialization and parsing---a bug that could cause
+protocol incompatibility with other BitTorrent clients.
+
+Our round-trip tests systematically cover edge cases for each message type:
+
+\begin{description}
+\item[Bitfield] We test bitfields representing 0, 1, 100, and 1000 pieces to cover
+  empty bitfields, single-byte bitfields, multi-byte bitfields, and large bitfields.
+  The 0-piece case is an edge case where the bitfield is empty; the 1000-piece case
+  exercises 125 bytes of data.
+
+\item[Have] We test with [[piece_index=0]] (minimum valid index) and
+  [[piece_index=u32::MAX]] (maximum valid index, 4,294,967,295). This verifies
+  correct handling of the full 32-bit index range.
+
+\item[Request and Cancel] These messages share the same structure (index, begin,
+  length). We test with [[begin=0]] (first block) and [[begin]] at piece boundaries
+  (multiples of [[BLOCK_SIZE]]). We also test maximum values to ensure no overflow.
+
+\item[Piece] We test with empty data (minimum valid), [[BLOCK_SIZE]] bytes (typical
+  full block), and data larger than [[BLOCK_SIZE]] (edge case for unusual requests).
+  The Piece message is the largest in typical operation, so thorough testing is
+  important.
+\end{description}
+
+<<message round-trip tests>>=
+// ===== Comprehensive Round-Trip Tests =====
+//
+// These tests verify that to_bytes() followed by from_bytes() yields an
+// identical message. This catches serialization/deserialization asymmetries
+// that could cause protocol incompatibility.
+
+/// Helper function to verify a message survives round-trip serialization.
+fn assert_round_trip(original: &Message) {
+    let bytes = original.to_bytes();
+    let parsed = Message::from_bytes(&bytes)
+        .unwrap_or_else(|e| panic!("failed to parse {:?}: {}", original, e));
+    assert_eq!(&parsed, original, "round-trip failed for {:?}", original);
+}
+
+// ===== Bitfield Round-Trip Tests =====
+
+#[test]
+fn round_trip_bitfield_0_pieces() {
+    // 0 pieces = 0 bytes bitfield (empty)
+    let msg = Message::Bitfield(vec![]);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_bitfield_1_piece() {
+    // 1 piece = 1 byte bitfield (only high bit meaningful)
+    // 0x80 = bit 0 set (piece 0 available)
+    let msg = Message::Bitfield(vec![0x80]);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_bitfield_8_pieces() {
+    // 8 pieces = 1 byte, all bits meaningful
+    let msg = Message::Bitfield(vec![0xFF]); // All 8 pieces available
+    assert_round_trip(&msg);
+
+    // Also test with no pieces available
+    let msg_empty = Message::Bitfield(vec![0x00]);
+    assert_round_trip(&msg_empty);
+}
+
+#[test]
+fn round_trip_bitfield_100_pieces() {
+    // 100 pieces = ceil(100/8) = 13 bytes
+    // Last byte has 4 meaningful bits (pieces 96-99), 4 spare bits
+    let mut bitfield = vec![0xFF; 12]; // First 96 pieces all available
+    bitfield.push(0xF0); // Pieces 96-99 available, spare bits zero
+    let msg = Message::Bitfield(bitfield);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_bitfield_1000_pieces() {
+    // 1000 pieces = ceil(1000/8) = 125 bytes
+    // All pieces available
+    let bitfield = vec![0xFF; 125];
+    let msg = Message::Bitfield(bitfield);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_bitfield_1000_pieces_partial() {
+    // 1000 pieces with alternating availability
+    let bitfield: Vec<u8> = (0..125).map(|i| if i % 2 == 0 { 0xAA } else { 0x55 }).collect();
+    let msg = Message::Bitfield(bitfield);
+    assert_round_trip(&msg);
+}
+
+// ===== Have Round-Trip Tests =====
+
+#[test]
+fn round_trip_have_index_zero() {
+    // Minimum valid piece index
+    let msg = Message::Have(0);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_have_index_max() {
+    // Maximum valid piece index (u32::MAX = 4,294,967,295)
+    let msg = Message::Have(u32::MAX);
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_have_typical_values() {
+    // Test several typical piece indices
+    for index in [1, 100, 1000, 10000, 100000, 1000000] {
+        let msg = Message::Have(index);
+        assert_round_trip(&msg);
+    }
+}
+
+// ===== Request Round-Trip Tests =====
+
+#[test]
+fn round_trip_request_begin_zero() {
+    // First block of first piece
+    let msg = Message::Request {
+        index: 0,
+        begin: 0,
+        length: BLOCK_SIZE,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_request_at_piece_boundary() {
+    // Block starting at BLOCK_SIZE offset (second block)
+    let msg = Message::Request {
+        index: 5,
+        begin: BLOCK_SIZE,
+        length: BLOCK_SIZE,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_request_at_multiple_block_boundaries() {
+    // Blocks at various offsets within a piece
+    for block_num in 0..10 {
+        let msg = Message::Request {
+            index: 42,
+            begin: block_num * BLOCK_SIZE,
+            length: BLOCK_SIZE,
+        };
+        assert_round_trip(&msg);
+    }
+}
+
+#[test]
+fn round_trip_request_max_values() {
+    // Maximum values for all fields
+    let msg = Message::Request {
+        index: u32::MAX,
+        begin: u32::MAX,
+        length: u32::MAX,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_request_partial_block() {
+    // Last block of a piece may be smaller than BLOCK_SIZE
+    let msg = Message::Request {
+        index: 10,
+        begin: 3 * BLOCK_SIZE,
+        length: 8192, // Half a block
+    };
+    assert_round_trip(&msg);
+}
+
+// ===== Cancel Round-Trip Tests =====
+
+#[test]
+fn round_trip_cancel_begin_zero() {
+    // Cancel first block of a piece
+    let msg = Message::Cancel {
+        index: 0,
+        begin: 0,
+        length: BLOCK_SIZE,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_cancel_at_piece_boundary() {
+    // Cancel block at BLOCK_SIZE offset
+    let msg = Message::Cancel {
+        index: 7,
+        begin: BLOCK_SIZE,
+        length: BLOCK_SIZE,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_cancel_at_multiple_boundaries() {
+    // Cancel blocks at various offsets
+    for block_num in 0..5 {
+        let msg = Message::Cancel {
+            index: 99,
+            begin: block_num * BLOCK_SIZE,
+            length: BLOCK_SIZE,
+        };
+        assert_round_trip(&msg);
+    }
+}
+
+#[test]
+fn round_trip_cancel_max_values() {
+    // Maximum values for all fields
+    let msg = Message::Cancel {
+        index: u32::MAX,
+        begin: u32::MAX,
+        length: u32::MAX,
+    };
+    assert_round_trip(&msg);
+}
+
+// ===== Piece Round-Trip Tests =====
+
+#[test]
+fn round_trip_piece_empty_data() {
+    // Piece with no data (edge case - technically valid per protocol)
+    let msg = Message::Piece {
+        index: 0,
+        begin: 0,
+        data: vec![],
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_block_size_data() {
+    // Full block of data (typical case)
+    let data = vec![0xAB; BLOCK_SIZE as usize];
+    let msg = Message::Piece {
+        index: 5,
+        begin: BLOCK_SIZE * 2,
+        data,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_larger_than_block_size() {
+    // Data larger than BLOCK_SIZE (unusual but valid)
+    let data = vec![0xCD; (BLOCK_SIZE as usize) + 1000];
+    let msg = Message::Piece {
+        index: 10,
+        begin: 0,
+        data,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_small_data() {
+    // Small piece data (last block of piece may be small)
+    let data = vec![0xEF; 1024];
+    let msg = Message::Piece {
+        index: 100,
+        begin: 3 * BLOCK_SIZE,
+        data,
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_single_byte() {
+    // Minimum non-empty piece
+    let msg = Message::Piece {
+        index: 0,
+        begin: 0,
+        data: vec![0x42],
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_max_index_and_begin() {
+    // Maximum index and begin values with data
+    let msg = Message::Piece {
+        index: u32::MAX,
+        begin: u32::MAX,
+        data: vec![1, 2, 3, 4, 5],
+    };
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_piece_with_pattern_data() {
+    // Data with recognizable pattern to verify no corruption
+    let data: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i % 256) as u8).collect();
+    let msg = Message::Piece {
+        index: 42,
+        begin: BLOCK_SIZE,
+        data,
+    };
+    assert_round_trip(&msg);
+}
+
+// ===== Other Message Round-Trip Tests =====
+
+#[test]
+fn round_trip_keepalive() {
+    let msg = Message::KeepAlive;
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_choke() {
+    let msg = Message::Choke;
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_unchoke() {
+    let msg = Message::Unchoke;
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_interested() {
+    let msg = Message::Interested;
+    assert_round_trip(&msg);
+}
+
+#[test]
+fn round_trip_not_interested() {
+    let msg = Message::NotInterested;
+    assert_round_trip(&msg);
+}
+
+// ===== Exhaustive Round-Trip Test =====
+
+#[test]
+fn round_trip_all_message_types_comprehensive() {
+    // Comprehensive test covering all message types with various values
+    let messages = vec![
+        // Control messages
+        Message::KeepAlive,
+        Message::Choke,
+        Message::Unchoke,
+        Message::Interested,
+        Message::NotInterested,
+
+        // Have with edge cases
+        Message::Have(0),
+        Message::Have(1),
+        Message::Have(u32::MAX),
+        Message::Have(u32::MAX / 2),
+
+        // Bitfield with various sizes
+        Message::Bitfield(vec![]),
+        Message::Bitfield(vec![0x80]),
+        Message::Bitfield(vec![0xFF]),
+        Message::Bitfield(vec![0xFF; 13]), // 100 pieces
+        Message::Bitfield(vec![0xFF; 125]), // 1000 pieces
+
+        // Request with edge cases
+        Message::Request { index: 0, begin: 0, length: BLOCK_SIZE },
+        Message::Request { index: 0, begin: BLOCK_SIZE, length: BLOCK_SIZE },
+        Message::Request { index: u32::MAX, begin: 0, length: 1 },
+        Message::Request { index: 100, begin: 5 * BLOCK_SIZE, length: 8192 },
+
+        // Piece with edge cases
+        Message::Piece { index: 0, begin: 0, data: vec![] },
+        Message::Piece { index: 0, begin: 0, data: vec![0xFF] },
+        Message::Piece { index: 5, begin: BLOCK_SIZE, data: vec![0xAB; BLOCK_SIZE as usize] },
+        Message::Piece { index: u32::MAX, begin: u32::MAX, data: vec![1, 2, 3] },
+
+        // Cancel with edge cases
+        Message::Cancel { index: 0, begin: 0, length: BLOCK_SIZE },
+        Message::Cancel { index: 0, begin: BLOCK_SIZE, length: BLOCK_SIZE },
+        Message::Cancel { index: u32::MAX, begin: u32::MAX, length: u32::MAX },
+    ];
+
+    for msg in &messages {
+        assert_round_trip(msg);
+    }
+}
+@
 
 \subsection{Bitfield Validation}
 

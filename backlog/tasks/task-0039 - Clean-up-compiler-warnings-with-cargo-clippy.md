@@ -1,11 +1,11 @@
 ---
 id: task-0039
 title: Clean up compiler warnings with cargo clippy
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:28'
-updated_date: '2026-01-18 01:33'
+updated_date: '2026-01-18 01:50'
 labels:
   - quality
   - clippy
@@ -23,10 +23,22 @@ Eliminate all compiler warnings and clippy lints. Warnings indicate potential bu
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 cargo build produces zero warnings
-- [ ] #2 cargo clippy produces zero warnings (with default lint level)
-- [ ] #3 No #[allow(unused)] attributes hiding legitimate issues
-- [ ] #4 No dead code remaining in the codebase
-- [ ] #5 All public items have documentation (no missing_docs warnings when enabled)
-- [ ] #6 CI check for warnings is added to justfile
+- [x] #1 cargo build produces zero warnings
+- [x] #2 cargo clippy produces zero warnings (with default lint level)
+- [x] #3 No #[allow(unused)] attributes hiding legitimate issues
+- [x] #4 No dead code remaining in the codebase
+- [x] #5 All public items have documentation (no missing_docs warnings when enabled)
+- [x] #6 CI check for warnings is added to justfile
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Cleaned up all compiler warnings:
+- Fixed dead code warning for assert_signature
+- Fixed needless borrow, range loop, useless vec
+- Added clippy allows for intentional patterns in tests
+- Added crate-level documentation
+- Updated justfile lint to use --all-targets
+- Zero warnings from cargo build and cargo clippy
+<!-- SECTION:NOTES:END -->
