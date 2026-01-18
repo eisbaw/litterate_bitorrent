@@ -5315,6 +5315,20 @@ pub struct PeerConnection {
     /// When we last sent a message to this peer.
     /// Used for keep-alive scheduling.
     pub last_send_time: Instant,
+
+    /// When this peer last provided useful data (block, bitfield, have).
+    ///
+    /// Unlike `last_recv_time` which tracks any message (including keep-alives),
+    /// this tracks only messages that indicate the peer is actively participating
+    /// in data transfer. A peer that only sends keep-alives is technically alive
+    /// but not useful for downloading.
+    ///
+    /// Useful activity includes:
+    /// - Receiving Piece (block) data
+    /// - Receiving Bitfield (initial peer state)
+    /// - Receiving Have (piece availability update)
+    /// - Receiving Unchoke (allows us to request data)
+    pub last_useful_activity: Instant,
 }
 
 impl PeerConnection {
@@ -5361,6 +5375,7 @@ impl PeerConnection {
             state: PeerState::new(num_pieces as u32),
             last_recv_time: now,
             last_send_time: now,
+            last_useful_activity: now,
         }
     }
 
@@ -5379,6 +5394,21 @@ impl PeerConnection {
     pub fn mark_sent(&mut self) {
         self.last_send_time = Instant::now();
     }
+
+    /// Updates the last useful activity time to now.
+    ///
+    /// Call this when the peer provides useful data:
+    /// - Block (Piece message) received
+    /// - Bitfield received
+    /// - Have message received
+    /// - Unchoke received (allows us to request data)
+    ///
+    /// Keep-alives and other non-data messages do NOT update this timestamp.
+    /// This allows detection of "stale" peers that are technically connected
+    /// but not providing useful data.
+    pub fn mark_useful_activity(&mut self) {
+        self.last_useful_activity = Instant::now();
+    }
 }
 
 impl std::fmt::Debug for PeerConnection {
@@ -5389,6 +5419,7 @@ impl std::fmt::Debug for PeerConnection {
             .field("state", &self.state)
             .field("last_recv_time", &self.last_recv_time)
             .field("last_send_time", &self.last_send_time)
+            .field("last_useful_activity", &self.last_useful_activity)
             // Omit stream - it's not useful to print
             .finish_non_exhaustive()
     }
@@ -6154,6 +6185,37 @@ mod connection_manager_tests {
         assert!(conn.last_send_time > before_mark);
     }
 
+    #[tokio::test]
+    async fn peer_connection_mark_useful_activity_updates_time() {
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+        let mut conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        let before_mark = conn.last_useful_activity;
+
+        // Small delay to ensure time difference
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        conn.mark_useful_activity();
+
+        assert!(conn.last_useful_activity > before_mark);
+    }
+
+    #[tokio::test]
+    async fn peer_connection_new_initializes_useful_activity_time() {
+        let before = Instant::now();
+
+        let (stream, _server, addr) = create_test_stream().await;
+        let peer_handshake = Handshake::new([0xAA; 20], [0xBB; 20]);
+        let conn = PeerConnection::new(stream, addr, &peer_handshake, 100);
+
+        let after = Instant::now();
+
+        // last_useful_activity should be initialized to now
+        assert!(conn.last_useful_activity >= before);
+        assert!(conn.last_useful_activity <= after);
+    }
+
     // ========================================================================
     // connect_with_timeout Tests
     // ========================================================================
@@ -6481,6 +6543,26 @@ pub const KEEP_ALIVE_INTERVAL_SECS: u64 = 120;
 /// and delayed keep-alives.
 pub const PEER_IDLE_TIMEOUT_SECS: u64 = 180;
 
+/// Stale peer timeout in seconds. Peers that haven't provided useful data
+/// (blocks, bitfield, have messages) in this time are disconnected.
+///
+/// Unlike `PEER_IDLE_TIMEOUT_SECS` which tracks any message, this tracks only
+/// "useful" activity - messages that contribute to data transfer. A peer that
+/// only sends keep-alives is technically alive but consuming a connection slot
+/// without providing value.
+///
+/// This matches the idle timeout (180s) but conceptually different:
+/// - Idle timeout: no messages at all (dead connection)
+/// - Stale timeout: no useful data (live but useless connection)
+pub const PEER_STALE_TIMEOUT_SECS: u64 = 180;
+
+/// Interval in seconds for checking stale peer connections.
+///
+/// The event loop checks for stale peers every 30 seconds, matching the
+/// request timeout check interval. This is frequent enough to detect stale
+/// peers promptly without adding significant overhead.
+pub const STALE_PEER_CHECK_INTERVAL_SECS: u64 = 30;
+
 /// Writes a message to the TCP stream.
 ///
 /// Serializes the message using `Message::to_bytes()` which includes
@@ -6615,6 +6697,27 @@ mod framed_message_writing_tests {
         // Otherwise, peers could be disconnected before they have a chance
         // to send their keep-alive.
         assert!(PEER_IDLE_TIMEOUT_SECS > KEEP_ALIVE_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn stale_peer_timeout_is_180_seconds() {
+        // Stale timeout matches idle timeout but tracks useful activity
+        assert_eq!(PEER_STALE_TIMEOUT_SECS, 180);
+    }
+
+    #[test]
+    fn stale_peer_check_interval_is_30_seconds() {
+        // Check for stale peers every 30 seconds
+        assert_eq!(STALE_PEER_CHECK_INTERVAL_SECS, 30);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn stale_timeout_matches_idle_timeout() {
+        // Both timeouts are 180 seconds, though they track different things:
+        // - Idle timeout: no messages at all (including keep-alives)
+        // - Stale timeout: no useful data (blocks, bitfield, have)
+        assert_eq!(PEER_STALE_TIMEOUT_SECS, PEER_IDLE_TIMEOUT_SECS);
     }
 
     #[tokio::test]
@@ -8442,6 +8545,15 @@ pub enum EventLoopEvent {
     /// client, this means unchoking all interested peers to encourage
     /// reciprocal unchoking.
     ChokingReevaluation,
+
+    /// Time to check for stale peer connections.
+    ///
+    /// Triggered every STALE_PEER_CHECK_INTERVAL_SECS seconds. Stale peers
+    /// are those that haven't provided useful data (blocks, bitfield, have
+    /// messages) within PEER_STALE_TIMEOUT_SECS, even if they're sending
+    /// keep-alives. These peers are disconnected to free connection slots
+    /// for potentially more useful peers.
+    StalePeerCheck,
 }
 
 /// Result of processing one event loop iteration.
@@ -8639,6 +8751,9 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     let mut choking_interval = interval(
         Duration::from_secs(CHOKE_INTERVAL_SECS)
     );
+    let mut stale_peer_interval = interval(
+        Duration::from_secs(STALE_PEER_CHECK_INTERVAL_SECS)
+    );
     // Use sleep() for re-announce to support dynamic intervals (backoff on failure)
     let mut re_announce_sleep: Pin<Box<Sleep>> = Box::pin(
         sleep(Duration::from_secs(ctx.tracker_interval))
@@ -8649,6 +8764,7 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
     keep_alive_interval.tick().await;
     progress_display_interval.tick().await;
     choking_interval.tick().await;
+    stale_peer_interval.tick().await;
     // Note: re_announce_sleep doesn't need skipping - it's a one-shot sleep
 
     let mut iteration: u64 = 0;
@@ -8701,6 +8817,11 @@ pub async fn run_event_loop(ctx: &mut EventLoopContext<'_>) -> EventLoopAction {
             // Choking reevaluation timer
             _ = choking_interval.tick() => {
                 EventLoopEvent::ChokingReevaluation
+            }
+
+            // Stale peer check timer
+            _ = stale_peer_interval.tick() => {
+                EventLoopEvent::StalePeerCheck
             }
 
             // Read from peers (only if we have connections)
@@ -8811,6 +8932,10 @@ async fn handle_event(
             handle_choking_reevaluation(ctx).await
         }
 
+        EventLoopEvent::StalePeerCheck => {
+            handle_stale_peer_check(ctx).await
+        }
+
         // ReAnnounce is handled specially in run_event_loop for dynamic intervals
         EventLoopEvent::ReAnnounce => {
             unreachable!("ReAnnounce events are handled in run_event_loop")
@@ -8873,6 +8998,7 @@ async fn handle_peer_message(
 
         Message::Unchoke => {
             handle_incoming_unchoke(conn);
+            conn.mark_useful_activity();  // Unchoke is useful - we can now request data
             // Trigger block requests now that we're unchoked
             trigger_block_requests_for_peer(addr, ctx).await;
         }
@@ -8888,6 +9014,7 @@ async fn handle_peer_message(
         }
 
         Message::Have(piece_index) => {
+            conn.mark_useful_activity();  // Have is useful - tells us about piece availability
             let should_be_interested = handle_incoming_have(
                 &mut conn.state,
                 piece_index,
@@ -8908,6 +9035,7 @@ async fn handle_peer_message(
         }
 
         Message::Bitfield(bits) => {
+            conn.mark_useful_activity();  // Bitfield is useful - tells us what peer has
             match handle_incoming_bitfield(
                 &mut conn.state,
                 &bits,
@@ -8964,6 +9092,9 @@ async fn handle_peer_message(
                     return EventLoopAction::Continue;
                 }
             };
+
+            // Mark useful activity before processing - we received actual block data
+            conn.mark_useful_activity();
 
             let result = handle_incoming_piece(
                 conn,
@@ -9336,6 +9467,74 @@ async fn handle_keep_alives(
                 }
             }
         }
+    }
+
+    EventLoopAction::Continue
+}
+@
+
+\subsubsection{Stale Peer Detection}
+
+While the keep-alive handler disconnects peers that haven't sent \emph{any} message
+(including keep-alives) within [[PEER\_IDLE\_TIMEOUT\_SECS]], some peers may keep
+connections alive with keep-alives but never provide useful data. These ``stale''
+peers waste connection slots that could be used by more productive peers.
+
+The stale peer check identifies peers that:
+\begin{enumerate}
+\item Are still connected and responding to keep-alives
+\item Haven't provided useful data (blocks, bitfield, have messages) recently
+\end{enumerate}
+
+By disconnecting stale peers, we free up slots for new connections that might
+be more productive.
+
+<<event loop>>=
+/// Handles the stale peer check timer.
+///
+/// Identifies and disconnects peers that haven't provided useful data
+/// within PEER_STALE_TIMEOUT_SECS, even if they're still responding to
+/// keep-alives. This frees connection slots for potentially more useful peers.
+///
+/// "Useful" data includes:
+/// - Piece (block) messages: actual download data
+/// - Bitfield messages: tells us what pieces the peer has
+/// - Have messages: updates about piece availability
+/// - Unchoke messages: allows us to request data
+///
+/// A peer sending only keep-alives or choke/interested messages is considered
+/// stale because it's not contributing to the download.
+async fn handle_stale_peer_check(
+    ctx: &mut EventLoopContext<'_>,
+) -> EventLoopAction {
+    trace!("checking for stale peers");
+
+    let stale_timeout = Duration::from_secs(PEER_STALE_TIMEOUT_SECS);
+
+    // Collect addresses to avoid borrowing issues
+    let peer_addrs: Vec<SocketAddr> = ctx.connection_manager
+        .connections()
+        .map(|(addr, _)| *addr)
+        .collect();
+
+    // Identify stale peers
+    let mut stale_peers: Vec<SocketAddr> = Vec::new();
+    for &addr in &peer_addrs {
+        if let Some(conn) = ctx.connection_manager.get_connection(&addr) {
+            if conn.last_useful_activity.elapsed() >= stale_timeout {
+                stale_peers.push(addr);
+            }
+        }
+    }
+
+    // Disconnect stale peers
+    for addr in stale_peers {
+        info!(
+            peer = %addr,
+            timeout_secs = PEER_STALE_TIMEOUT_SECS,
+            "disconnecting stale peer (no useful activity)"
+        );
+        handle_peer_disconnected(addr, "stale peer - no useful activity", ctx).await;
     }
 
     EventLoopAction::Continue
@@ -10056,6 +10255,34 @@ mod event_loop_tests {
         let event = EventLoopEvent::ChokingReevaluation;
         let debug_str = format!("{:?}", event);
         assert!(debug_str.contains("ChokingReevaluation"));
+    }
+
+    #[test]
+    fn stale_peer_check_event_debug() {
+        let event = EventLoopEvent::StalePeerCheck;
+        let debug_str = format!("{:?}", event);
+        assert!(debug_str.contains("StalePeerCheck"));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn stale_peer_check_interval_is_reasonable() {
+        // Stale peer check should happen frequently enough to detect
+        // unproductive peers, but not so often as to add overhead.
+        // 30 seconds matches the request timeout check interval.
+        assert!(STALE_PEER_CHECK_INTERVAL_SECS >= 15);
+        assert!(STALE_PEER_CHECK_INTERVAL_SECS <= 60);
+        // Should match or be a multiple of request timeout check
+        assert!(STALE_PEER_CHECK_INTERVAL_SECS == REQUEST_TIMEOUT_CHECK_INTERVAL_SECS);
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn stale_timeout_greater_than_keep_alive_interval() {
+        // The stale timeout must be greater than the keep-alive interval.
+        // This ensures peers have time to send useful data between keep-alives.
+        // Otherwise, a peer that just connected might be immediately marked stale.
+        assert!(PEER_STALE_TIMEOUT_SECS > KEEP_ALIVE_INTERVAL_SECS);
     }
 
     // ========================================================================
