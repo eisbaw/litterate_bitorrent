@@ -577,6 +577,598 @@ The formatter is configured for human readability: timestamps help correlate
 events during debugging, targets (module paths) help identify where messages
 originated, and the hierarchical span display shows the context chain.
 
+\subsection{User-Friendly Error Reporting}
+
+Technical error messages are valuable for developers but confusing for users.
+When a download fails, users need to know: what went wrong, and what they can
+do about it. Our error reporting strategy translates internal errors into
+actionable guidance.
+
+\subsubsection{Design Philosophy}
+
+User-friendly error messages follow three principles:
+
+\begin{enumerate}
+\item \textbf{Simple language}: Avoid jargon like ``hash mismatch'' or
+  ``EACCES''. Instead, say ``piece 42 failed verification'' or ``permission
+  denied.''
+
+\item \textbf{Actionable guidance}: Tell users what to try next. ``Check your
+  network connection'' is more helpful than ``connection refused.''
+
+\item \textbf{Relevant details}: Include context that helps diagnose the
+  problem: which piece failed, which file couldn't be accessed, what the
+  tracker said.
+\end{enumerate}
+
+\subsubsection{Error Categories}
+
+Our client can encounter errors from several subsystems:
+
+\begin{description}
+\item[Network errors] Connection failures, DNS resolution failures, timeouts.
+  These suggest checking network connectivity or firewall settings.
+
+\item[Torrent file errors] Invalid or corrupt torrent files. The error
+  identifies the specific parsing problem (missing field, invalid format).
+
+\item[Tracker errors] The tracker may return an explicit ``failure reason''
+  message, which we display verbatim since trackers write these for users.
+
+\item[Piece verification errors] Hash mismatches indicate data corruption.
+  We identify which piece failed and suggest that it will be re-downloaded.
+
+\item[Permission errors] File or directory access failures. We suggest
+  checking permissions on the specific path involved.
+\end{description}
+
+\subsubsection{The ClientRunError Type}
+
+We define a unified error type that wraps errors from all subsystems. This
+type serves as the interface between the internal error types and user-facing
+messages.
+
+<<client run error>>=
+/// Unified error type for client runtime errors.
+///
+/// This enum wraps errors from all subsystems (torrent parsing, tracker,
+/// peers, pieces, disk) and provides user-friendly formatting through the
+/// [`format_user_error`] function.
+///
+/// All variants preserve the original error for debugging while enabling
+/// translation to user-friendly messages.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientRunError {
+    /// Error parsing the torrent file.
+    #[error("torrent file error: {0}")]
+    TorrentParsing(#[from] crate::metainfo::MetainfoError),
+
+    /// Error communicating with the tracker.
+    #[error("tracker error: {0}")]
+    Tracker(#[from] crate::tracker::TrackerError),
+
+    /// Error with disk I/O operations.
+    #[error("disk error: {0}")]
+    Disk(#[from] crate::disk::DiskError),
+
+    /// Error with piece verification or management.
+    #[error("piece error: {0}")]
+    Piece(#[from] crate::pieces::PieceError),
+
+    /// Error with peer connections.
+    #[error("peer error: {0}")]
+    Peer(#[from] crate::messages::PeerError),
+
+    /// Error initializing the client.
+    #[error("client initialization error: {0}")]
+    ClientInit(#[from] crate::client::ClientError),
+
+    /// Generic I/O error (e.g., reading torrent file).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+@
+
+\subsubsection{User-Friendly Formatting}
+
+The [[format\_user\_error]] function transforms a [[ClientRunError]] into a
+user-friendly message. Each error category is handled specifically, extracting
+relevant details and suggesting appropriate actions.
+
+<<format user error>>=
+/// Formats a ClientRunError as a user-friendly error message.
+///
+/// This function translates technical errors into messages that:
+/// - Use simple, non-technical language
+/// - Suggest actionable next steps
+/// - Include relevant context (file paths, piece numbers, etc.)
+///
+/// # Arguments
+///
+/// * `error` - The error to format
+///
+/// # Returns
+///
+/// A string containing the user-friendly error message, suitable for
+/// display on stderr.
+///
+/// # Example
+///
+/// ```ignore
+/// match run_download(&args) {
+///     Ok(()) => std::process::exit(0),
+///     Err(e) => {
+///         eprintln!("{}", format_user_error(&e));
+///         std::process::exit(1);
+///     }
+/// }
+/// ```
+pub fn format_user_error(error: &ClientRunError) -> String {
+    match error {
+        ClientRunError::TorrentParsing(e) => format_torrent_error(e),
+        ClientRunError::Tracker(e) => format_tracker_error(e),
+        ClientRunError::Disk(e) => format_disk_error(e),
+        ClientRunError::Piece(e) => format_piece_error(e),
+        ClientRunError::Peer(e) => format_peer_error(e),
+        ClientRunError::ClientInit(e) => format_client_init_error(e),
+        ClientRunError::Io(e) => format_io_error(e),
+    }
+}
+@
+
+\subsubsection{Torrent File Error Formatting}
+
+Torrent file errors typically indicate a corrupt or invalid file. We explain
+the specific problem and suggest the user obtain a valid torrent file.
+
+<<format torrent error>>=
+fn format_torrent_error(error: &crate::metainfo::MetainfoError) -> String {
+    use crate::metainfo::MetainfoError;
+
+    match error {
+        MetainfoError::MissingField(field) => {
+            format!(
+                "Error: Invalid torrent file - missing required field '{}'.\n\
+                 \n\
+                 The torrent file appears to be corrupt or incomplete.\n\
+                 Try downloading the torrent file again from the source.",
+                field
+            )
+        }
+        MetainfoError::InvalidPieceLength(detail) => {
+            format!(
+                "Error: Invalid torrent file - bad piece length ({}).\n\
+                 \n\
+                 The torrent file specifies an invalid piece size.\n\
+                 This file may be corrupt. Try obtaining a fresh copy.",
+                detail
+            )
+        }
+        MetainfoError::InvalidPieceHashes(detail) => {
+            format!(
+                "Error: Invalid torrent file - malformed piece hashes ({}).\n\
+                 \n\
+                 The piece hash data in the torrent file is corrupt.\n\
+                 Please obtain a valid torrent file.",
+                detail
+            )
+        }
+        MetainfoError::InvalidMultiFile(detail) => {
+            format!(
+                "Error: Invalid torrent file - malformed file list ({}).\n\
+                 \n\
+                 The multi-file torrent structure is invalid.\n\
+                 Please obtain a valid torrent file.",
+                detail
+            )
+        }
+    }
+}
+@
+
+\subsubsection{Tracker Error Formatting}
+
+Tracker errors require careful handling because the tracker may provide its
+own user-facing message in the ``failure reason'' field. Network errors
+suggest checking connectivity.
+
+<<format tracker error>>=
+fn format_tracker_error(error: &crate::tracker::TrackerError) -> String {
+    use crate::tracker::TrackerError;
+
+    match error {
+        TrackerError::TrackerHttpError(e) => {
+            // Check for common network error patterns
+            let error_str = e.to_string().to_lowercase();
+            if error_str.contains("connection refused") {
+                "Error: Could not connect to the tracker.\n\
+                 \n\
+                 The tracker server refused the connection. This could mean:\n\
+                 - The tracker is temporarily down\n\
+                 - Your firewall is blocking the connection\n\
+                 - The tracker URL in the torrent file is outdated\n\
+                 \n\
+                 Try again later, or use a torrent with a different tracker.".to_string()
+            } else if error_str.contains("dns") || error_str.contains("resolve") {
+                "Error: Could not find the tracker server.\n\
+                 \n\
+                 The tracker hostname could not be resolved. This could mean:\n\
+                 - You are not connected to the internet\n\
+                 - The tracker domain no longer exists\n\
+                 - DNS is not working on your network\n\
+                 \n\
+                 Check your internet connection and try again.".to_string()
+            } else if error_str.contains("timeout") || error_str.contains("timed out") {
+                "Error: Tracker request timed out.\n\
+                 \n\
+                 The tracker did not respond in time. This could mean:\n\
+                 - The tracker server is overloaded\n\
+                 - Your network connection is slow or unstable\n\
+                 \n\
+                 Try again in a few minutes.".to_string()
+            } else {
+                format!(
+                    "Error: Network error while contacting tracker.\n\
+                     \n\
+                     Details: {}\n\
+                     \n\
+                     Check your internet connection and try again.",
+                    e
+                )
+            }
+        }
+        TrackerError::TrackerErrorResponse(reason) => {
+            // Display the tracker's failure reason verbatim - it's meant for users
+            format!(
+                "Error: The tracker rejected our request.\n\
+                 \n\
+                 Tracker message: {}\n\
+                 \n\
+                 This usually means the torrent is no longer tracked here.",
+                reason
+            )
+        }
+        TrackerError::TrackerInvalidResponse(detail) => {
+            format!(
+                "Error: Received invalid response from tracker.\n\
+                 \n\
+                 The tracker sent a malformed response: {}\n\
+                 \n\
+                 The tracker may be incompatible or malfunctioning.\n\
+                 Try using a torrent with a different tracker.",
+                detail
+            )
+        }
+        TrackerError::TrackerTimeout => {
+            "Error: Tracker request timed out after 30 seconds.\n\
+             \n\
+             The tracker did not respond in time. This could mean:\n\
+             - The tracker server is down or overloaded\n\
+             - Your network connection is very slow\n\
+             \n\
+             Try again later.".to_string()
+        }
+    }
+}
+@
+
+\subsubsection{Disk Error Formatting}
+
+Disk errors often involve permissions. We extract the path from the error
+and suggest checking permissions or available disk space.
+
+<<format disk error>>=
+fn format_disk_error(error: &crate::disk::DiskError) -> String {
+    use crate::disk::DiskError;
+
+    match error {
+        DiskError::CreateDirectory { path, source } => {
+            let suggestion = if source.kind() == std::io::ErrorKind::PermissionDenied {
+                "Check that you have write permission for this location."
+            } else {
+                "Check that the path is valid and the parent directory exists."
+            };
+            format!(
+                "Error: Could not create directory '{}'.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 {}",
+                path.display(), source, suggestion
+            )
+        }
+        DiskError::CreateFile { path, source } => {
+            let suggestion = if source.kind() == std::io::ErrorKind::PermissionDenied {
+                "Check that you have write permission for this directory."
+            } else {
+                "Check that the parent directory exists and is writable."
+            };
+            format!(
+                "Error: Could not create file '{}'.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 {}",
+                path.display(), source, suggestion
+            )
+        }
+        DiskError::SetFileSize { path, source } => {
+            format!(
+                "Error: Could not allocate space for '{}'.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 Check that you have enough free disk space.",
+                path.display(), source
+            )
+        }
+        DiskError::Metadata { path, source } => {
+            format!(
+                "Error: Could not read file information for '{}'.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 Check that the file exists and you have read permission.",
+                path.display(), source
+            )
+        }
+        DiskError::SeekError { path, offset, source } => {
+            format!(
+                "Error: Could not seek in file '{}' to position {}.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 The file may be corrupt or inaccessible.",
+                path.display(), offset, source
+            )
+        }
+        DiskError::WriteError { path, offset, source } => {
+            let suggestion = if source.kind() == std::io::ErrorKind::PermissionDenied {
+                "Check that you have write permission for this file."
+            } else if source.to_string().to_lowercase().contains("space") {
+                "Check that you have enough free disk space."
+            } else {
+                "The file may be locked by another program."
+            };
+            format!(
+                "Error: Could not write to file '{}' at position {}.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 {}",
+                path.display(), offset, source, suggestion
+            )
+        }
+    }
+}
+@
+
+\subsubsection{Piece Error Formatting}
+
+Piece errors identify which piece failed. For hash mismatches, we note that
+the client will automatically re-download from a different peer.
+
+<<format piece error>>=
+fn format_piece_error(error: &crate::pieces::PieceError) -> String {
+    use crate::pieces::PieceError;
+
+    match error {
+        PieceError::PieceHashMismatch { piece_index, expected_hash, computed_hash } => {
+            format!(
+                "Error: Piece {} failed verification.\n\
+                 \n\
+                 Expected hash: {}\n\
+                 Computed hash: {}\n\
+                 \n\
+                 The downloaded data was corrupted. This piece will be\n\
+                 re-downloaded from a different peer.",
+                piece_index, expected_hash, computed_hash
+            )
+        }
+        PieceError::InvalidPieceIndex { index, num_pieces } => {
+            format!(
+                "Error: Internal error - invalid piece index {} (torrent has {} pieces).\n\
+                 \n\
+                 This is a bug in the client. Please report this issue.",
+                index, num_pieces
+            )
+        }
+        PieceError::InvalidBlockOffset { piece_index, offset, piece_size } => {
+            format!(
+                "Error: Internal error - invalid block offset {} in piece {} (size {}).\n\
+                 \n\
+                 This is a bug in the client. Please report this issue.",
+                offset, piece_index, piece_size
+            )
+        }
+        PieceError::DiskWriteError { path, byte_offset, source } => {
+            format!(
+                "Error: Could not write piece to '{}'.\n\
+                 \n\
+                 Failed at byte offset {}: {}\n\
+                 \n\
+                 Check disk space and file permissions.",
+                path.display(), byte_offset, source
+            )
+        }
+    }
+}
+@
+
+\subsubsection{Peer Error Formatting}
+
+Peer errors suggest network issues or incompatible peers. These are often
+transient---the client will try other peers.
+
+<<format peer error>>=
+fn format_peer_error(error: &crate::messages::PeerError) -> String {
+    use crate::messages::PeerError;
+
+    match error {
+        PeerError::HandshakeFailed(detail) => {
+            format!(
+                "Error: Peer handshake failed: {}\n\
+                 \n\
+                 Could not establish connection with a peer. The client will\n\
+                 try connecting to other peers.",
+                detail
+            )
+        }
+        PeerError::InvalidMessage(detail) => {
+            format!(
+                "Error: Received invalid message from peer: {}\n\
+                 \n\
+                 The peer may be using an incompatible protocol version.\n\
+                 Disconnecting from this peer.",
+                detail
+            )
+        }
+        PeerError::UnexpectedMessageId(id) => {
+            format!(
+                "Error: Peer sent unrecognized message type (ID: {}).\n\
+                 \n\
+                 The peer may be using protocol extensions we don't support.\n\
+                 Disconnecting from this peer.",
+                id
+            )
+        }
+        PeerError::MessageTooLarge(size) => {
+            format!(
+                "Error: Peer sent oversized message ({} bytes).\n\
+                 \n\
+                 This may indicate a malicious peer or protocol error.\n\
+                 Disconnecting from this peer.",
+                size
+            )
+        }
+        PeerError::BitfieldWrongLength { expected, actual } => {
+            format!(
+                "Error: Peer sent malformed bitfield (expected {} bytes, got {}).\n\
+                 \n\
+                 The peer may be confused about which torrent we're sharing.\n\
+                 Disconnecting from this peer.",
+                expected, actual
+            )
+        }
+        PeerError::ConnectionClosed => {
+            "Note: Peer closed the connection.\n\
+             \n\
+             This is normal - peers come and go. The client will connect\n\
+             to other available peers.".to_string()
+        }
+        PeerError::Timeout => {
+            "Error: Peer connection timed out.\n\
+             \n\
+             The peer stopped responding. The client will try other peers.\n\
+             This may indicate network issues.".to_string()
+        }
+        PeerError::AlreadyConnected => {
+            "Note: Already connected to this peer.\n\
+             \n\
+             Duplicate connection avoided. Continuing with existing connection.".to_string()
+        }
+        PeerError::IoError(e) => {
+            format!(
+                "Error: Network error with peer: {}\n\
+                 \n\
+                 Check your internet connection. The client will try\n\
+                 connecting to other peers.",
+                e
+            )
+        }
+    }
+}
+@
+
+\subsubsection{Client Initialization and I/O Error Formatting}
+
+These are catch-all formatters for client setup errors and generic I/O errors.
+
+<<format client init error>>=
+fn format_client_init_error(error: &crate::client::ClientError) -> String {
+    use crate::client::ClientError;
+
+    match error {
+        ClientError::PieceManagerError(e) => {
+            format!(
+                "Error: Could not initialize piece manager.\n\
+                 \n\
+                 Details: {}\n\
+                 \n\
+                 The torrent metadata may be invalid.",
+                e
+            )
+        }
+    }
+}
+
+fn format_io_error(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => {
+            format!(
+                "Error: File not found.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 Check that the file path is correct.",
+                error
+            )
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!(
+                "Error: Permission denied.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 Check that you have the necessary permissions to access this file.",
+                error
+            )
+        }
+        _ => {
+            format!(
+                "Error: I/O operation failed.\n\
+                 \n\
+                 System error: {}\n\
+                 \n\
+                 Check your disk and network connections.",
+                error
+            )
+        }
+    }
+}
+@
+
+\subsubsection{Exit with Error}
+
+Finally, we provide a convenience function that formats an error, prints it
+to stderr, and exits with a non-zero status code.
+
+<<exit with error>>=
+/// Prints a user-friendly error message to stderr and exits with code 1.
+///
+/// This function is designed for use in main() when a fatal error occurs.
+/// It formats the error for user consumption and ensures the process exits
+/// with a non-zero status code.
+///
+/// # Arguments
+///
+/// * `error` - The error that caused the failure
+///
+/// # Example
+///
+/// ```ignore
+/// fn main() {
+///     if let Err(e) = run() {
+///         exit_with_error(&e);
+///     }
+/// }
+/// ```
+pub fn exit_with_error(error: &ClientRunError) -> ! {
+    eprintln!("{}", format_user_error(error));
+    std::process::exit(1)
+}
+@
+
 \subsection{Module Structure}
 
 The CLI module exports the [[Args]] structure for argument parsing and the
@@ -597,7 +1189,8 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 //!
 //! This module defines the CLI using clap's derive macros, providing
 //! automatic argument parsing, validation, and help text generation.
-//! It also provides logging initialization via tracing-subscriber.
+//! It also provides logging initialization via tracing-subscriber and
+//! user-friendly error formatting via [`format_user_error`].
 //!
 //! # Usage
 //!
@@ -626,9 +1219,29 @@ The CLI module exports the [[Args]] structure for argument parsing and the
 
 <<cli logging>>
 
+<<client run error>>
+
+<<format user error>>
+
+<<format torrent error>>
+
+<<format tracker error>>
+
+<<format disk error>>
+
+<<format piece error>>
+
+<<format peer error>>
+
+<<format client init error>>
+
+<<exit with error>>
+
 <<cli tests>>
 
 <<cli validation tests>>
+
+<<error formatting tests>>
 @
 
 \subsection{Testing the CLI}
@@ -1469,6 +2082,248 @@ mod validation_tests {
         let result = ValidationResult { warnings: vec![] };
         let debug = format!("{:?}", result);
         assert!(debug.contains("ValidationResult"));
+    }
+}
+@
+
+\subsection{Error Formatting Tests}
+
+We test that each error type is formatted with user-friendly messages that
+include actionable guidance and relevant details.
+
+<<error formatting tests>>=
+#[cfg(test)]
+mod error_formatting_tests {
+    use super::*;
+
+    // ========================================================================
+    // Torrent error formatting tests
+    // ========================================================================
+
+    #[test]
+    fn torrent_missing_field_suggests_redownload() {
+        use crate::metainfo::MetainfoError;
+        let error = ClientRunError::TorrentParsing(MetainfoError::MissingField("announce"));
+        let msg = format_user_error(&error);
+
+        assert!(msg.contains("announce"), "should mention the missing field");
+        assert!(msg.contains("download") || msg.contains("obtain"),
+            "should suggest redownloading: {}", msg);
+    }
+
+    #[test]
+    fn torrent_invalid_piece_length_identifies_issue() {
+        use crate::metainfo::MetainfoError;
+        let error = ClientRunError::TorrentParsing(
+            MetainfoError::InvalidPieceLength("piece length must be positive".to_string())
+        );
+        let msg = format_user_error(&error);
+
+        assert!(msg.contains("piece"), "should mention piece: {}", msg);
+        assert!(msg.contains("corrupt") || msg.contains("invalid"),
+            "should indicate corruption: {}", msg);
+    }
+
+    // ========================================================================
+    // Tracker error formatting tests
+    // ========================================================================
+
+    #[test]
+    fn tracker_failure_reason_displayed_verbatim() {
+        use crate::tracker::TrackerError;
+        let error = ClientRunError::Tracker(
+            TrackerError::TrackerErrorResponse("torrent not registered with this tracker".to_string())
+        );
+        let msg = format_user_error(&error);
+
+        // AC#3: Tracker 'failure reason' responses are displayed verbatim
+        assert!(msg.contains("torrent not registered with this tracker"),
+            "should display tracker message verbatim: {}", msg);
+    }
+
+    #[test]
+    fn tracker_timeout_suggests_retry() {
+        use crate::tracker::TrackerError;
+        let error = ClientRunError::Tracker(TrackerError::TrackerTimeout);
+        let msg = format_user_error(&error);
+
+        assert!(msg.contains("30 seconds") || msg.contains("timed out"),
+            "should mention timeout: {}", msg);
+        assert!(msg.contains("Try") || msg.contains("again"),
+            "should suggest retry: {}", msg);
+    }
+
+    #[test]
+    fn tracker_network_error_suggests_connectivity() {
+        use crate::tracker::TrackerError;
+        // Create a mock network error message
+        let error = ClientRunError::Tracker(
+            TrackerError::TrackerInvalidResponse("connection failed".to_string())
+        );
+        let msg = format_user_error(&error);
+
+        // Should give some guidance about the network issue
+        assert!(msg.len() > 50, "should provide detailed message: {}", msg);
+    }
+
+    // ========================================================================
+    // Piece error formatting tests
+    // ========================================================================
+
+    #[test]
+    fn piece_hash_mismatch_identifies_piece() {
+        use crate::pieces::PieceError;
+        let error = ClientRunError::Piece(PieceError::PieceHashMismatch {
+            piece_index: 42,
+            expected_hash: "abc123".to_string(),
+            computed_hash: "def456".to_string(),
+        });
+        let msg = format_user_error(&error);
+
+        // AC#4: Piece hash mismatch errors identify which piece failed
+        assert!(msg.contains("42"), "should mention piece index: {}", msg);
+        assert!(msg.contains("abc123") || msg.contains("def456"),
+            "should include hash details: {}", msg);
+    }
+
+    #[test]
+    fn piece_hash_mismatch_mentions_redownload() {
+        use crate::pieces::PieceError;
+        let error = ClientRunError::Piece(PieceError::PieceHashMismatch {
+            piece_index: 0,
+            expected_hash: "expected".to_string(),
+            computed_hash: "computed".to_string(),
+        });
+        let msg = format_user_error(&error);
+
+        assert!(msg.to_lowercase().contains("re-download") ||
+                msg.to_lowercase().contains("redownload") ||
+                msg.to_lowercase().contains("different peer"),
+            "should mention re-download: {}", msg);
+    }
+
+    // ========================================================================
+    // Disk error formatting tests - Permission errors
+    // ========================================================================
+
+    #[test]
+    fn disk_permission_denied_suggests_check_permissions() {
+        use crate::disk::DiskError;
+        let error = ClientRunError::Disk(DiskError::CreateFile {
+            path: std::path::PathBuf::from("/protected/file.txt"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        });
+        let msg = format_user_error(&error);
+
+        // AC#5: Permission errors suggest checking file/directory permissions
+        assert!(msg.contains("/protected/file.txt"),
+            "should include file path: {}", msg);
+        assert!(msg.to_lowercase().contains("permission"),
+            "should mention permissions: {}", msg);
+    }
+
+    #[test]
+    fn disk_create_directory_permission_denied() {
+        use crate::disk::DiskError;
+        let error = ClientRunError::Disk(DiskError::CreateDirectory {
+            path: std::path::PathBuf::from("/root/downloads"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        });
+        let msg = format_user_error(&error);
+
+        assert!(msg.contains("/root/downloads"),
+            "should include directory path: {}", msg);
+        assert!(msg.to_lowercase().contains("permission"),
+            "should suggest checking permissions: {}", msg);
+    }
+
+    #[test]
+    fn disk_write_error_includes_path_and_offset() {
+        use crate::disk::DiskError;
+        let error = ClientRunError::Disk(DiskError::WriteError {
+            path: std::path::PathBuf::from("/downloads/ubuntu.iso"),
+            offset: 1048576,
+            source: std::io::Error::new(std::io::ErrorKind::Other, "disk full"),
+        });
+        let msg = format_user_error(&error);
+
+        assert!(msg.contains("/downloads/ubuntu.iso"),
+            "should include file path: {}", msg);
+        assert!(msg.contains("1048576"),
+            "should include offset: {}", msg);
+    }
+
+    // ========================================================================
+    // Error output destination test
+    // ========================================================================
+
+    #[test]
+    fn all_error_messages_start_with_error_or_note() {
+        use crate::metainfo::MetainfoError;
+        use crate::tracker::TrackerError;
+        use crate::pieces::PieceError;
+
+        let errors: Vec<ClientRunError> = vec![
+            ClientRunError::TorrentParsing(MetainfoError::MissingField("test")),
+            ClientRunError::Tracker(TrackerError::TrackerTimeout),
+            ClientRunError::Piece(PieceError::PieceHashMismatch {
+                piece_index: 0,
+                expected_hash: "a".to_string(),
+                computed_hash: "b".to_string(),
+            }),
+        ];
+
+        for error in errors {
+            let msg = format_user_error(&error);
+            assert!(msg.starts_with("Error:") || msg.starts_with("Note:"),
+                "Message should start with 'Error:' or 'Note:': {}", msg);
+        }
+    }
+
+    // ========================================================================
+    // ClientRunError implements required traits
+    // ========================================================================
+
+    #[test]
+    fn client_run_error_implements_std_error() {
+        fn assert_error<E: std::error::Error>() {}
+        assert_error::<ClientRunError>();
+    }
+
+    #[test]
+    fn client_run_error_implements_debug() {
+        use crate::metainfo::MetainfoError;
+        let error = ClientRunError::TorrentParsing(MetainfoError::MissingField("test"));
+        let debug = format!("{:?}", error);
+        assert!(!debug.is_empty());
+    }
+
+    // ========================================================================
+    // I/O error formatting
+    // ========================================================================
+
+    #[test]
+    fn io_not_found_error_formatted() {
+        let error = ClientRunError::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found")
+        );
+        let msg = format_user_error(&error);
+
+        assert!(msg.to_lowercase().contains("not found"),
+            "should mention not found: {}", msg);
+        assert!(msg.to_lowercase().contains("path") || msg.to_lowercase().contains("file"),
+            "should suggest checking path: {}", msg);
+    }
+
+    #[test]
+    fn io_permission_denied_formatted() {
+        let error = ClientRunError::Io(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied")
+        );
+        let msg = format_user_error(&error);
+
+        assert!(msg.to_lowercase().contains("permission"),
+            "should mention permission: {}", msg);
     }
 }
 @
