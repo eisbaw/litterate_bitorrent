@@ -1,9 +1,11 @@
 ---
 id: task-0075
 title: Review implementation chapters
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@claude'
 created_date: '2026-01-16 21:31'
+updated_date: '2026-01-18 01:18'
 labels: []
 dependencies:
   - task-0034
@@ -19,9 +21,21 @@ After Piece Management, Strategy, and Orchestration chapters are written, review
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Piece Management builds naturally on protocol knowledge from earlier chapters
-- [ ] #2 Strategy chapter explains rationale not just mechanics
-- [ ] #3 Orchestration chapter shows clear integration of all components
-- [ ] #4 Async/await patterns are explained for readers unfamiliar with async Rust
-- [ ] #5 Code walkthroughs highlight key decisions and tradeoffs
+- [x] #1 Piece Management builds naturally on protocol knowledge from earlier chapters
+- [x] #2 Strategy chapter explains rationale not just mechanics
+- [x] #3 Orchestration chapter shows clear integration of all components
+- [x] #4 Async/await patterns are explained for readers unfamiliar with async Rust
+- [x] #5 Code walkthroughs highlight key decisions and tradeoffs
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Reviewed Piece Management, Strategy, and Orchestration chapters:
+- Piece Management builds on earlier protocol chapters
+- Strategy explains rationale with why explanations
+- Orchestration clearly integrates all components
+- Async/await patterns well explained for beginners
+- Code walkthroughs highlight decisions and tradeoffs
+- All acceptance criteria pass, no issues found
+<!-- SECTION:NOTES:END -->
