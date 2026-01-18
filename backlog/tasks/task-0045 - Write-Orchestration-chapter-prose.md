@@ -5,7 +5,7 @@ status: Done
 assignee:
   - '@claude'
 created_date: '2026-01-16 21:29'
-updated_date: '2026-01-18 00:45'
+updated_date: '2026-01-18 00:50'
 labels: []
 dependencies: []
 ---
@@ -35,15 +35,12 @@ $1. Review existing prose in 07-client.nw\n2. Add comprehensive async/await patt
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Added comprehensive prose to nw/07-client.nw covering the orchestration layer:
-
-- Added async/await patterns section explaining tokio::select\!, biased keyword, and timer management strategies
-- Added peer connection state machine diagram showing lifecycle from DISCONNECTED through CONNECTING, HANDSHAKING, CONNECTED, to EXCHANGING
-- Added 4-bit choke/interest state tables showing message triggers and state transitions
-- Enhanced choking algorithm section with tit-for-tat explanation and comparison to simplified leecher-only strategy
-- Added completion detection flow diagram showing piece verification cascade
-- Added graceful shutdown sequence diagrams showing normal and force-exit paths
-- Added error handling section covering error classification (transient, peer-specific, fatal), graceful degradation strategies, retry logic with exponential backoff, and logging philosophy
-
-All code chunks remain unchanged. just tangle and just weave succeed. Pre-existing test failure in cli.rs is unrelated to these changes.
+Added comprehensive Orchestration chapter prose:
+- Async/await patterns with tokio::select\! explanation
+- Peer connection state machine with ASCII diagrams
+- Choking algorithm documentation
+- Completion detection flow diagram
+- Graceful shutdown sequence
+- Error handling and recovery strategies
+- Fixed test race condition with serial_test
 <!-- SECTION:NOTES:END -->

@@ -1487,3 +1487,329 @@ The tests cover each acceptance criterion:
 We also test edge cases like paths with spaces, options in different orders,
 and the [[Clone]] and [[Debug]] trait implementations that make the type
 convenient to use throughout the application.
+
+\subsection{Progress Display}
+
+While the download proceeds, users need feedback showing that progress is being
+made. A silent client leaves users wondering whether it's working, stuck, or
+crashed. We display progress updates every two seconds, balancing information
+density against terminal spam.
+
+\subsubsection{What the User Sees}
+
+During an active download, the client outputs lines like this to stderr:
+
+\begin{verbatim}
+2024-01-15T10:32:15  INFO 42/100 pieces (42.0%) - 1.5 MB/s - ETA: 3m 28s
+2024-01-15T10:32:17  INFO 44/100 pieces (44.0%) - 1.8 MB/s - ETA: 3m 12s
+2024-01-15T10:32:19  INFO 47/100 pieces (47.0%) - 2.1 MB/s - ETA: 2m 45s
+\end{verbatim}
+
+Each progress line contains four pieces of information:
+
+\begin{description}
+\item[Piece count] The number of verified pieces out of the total (e.g.,
+  [[42/100 pieces]]). This is the most reliable measure of progress because
+  pieces are only counted after SHA1 verification.
+
+\item[Percentage] The completion percentage, derived from the piece count.
+  For a 100-piece torrent at 42 verified pieces, this shows [[42.0\%]].
+
+\item[Download speed] The current download speed in human-readable units.
+  We show B/s, KB/s, MB/s, or GB/s depending on magnitude. This is calculated
+  from bytes downloaded since the last update, providing a responsive measure
+  of current performance rather than a sluggish average.
+
+\item[Estimated time remaining] A prediction of how long until completion,
+  based on current speed and remaining bytes. Displayed as [[5m 30s]] for
+  short durations, [[2h 15m 30s]] for longer ones, or [[calculating...]] when
+  speed data is insufficient.
+\end{description}
+
+\subsubsection{Implementation Strategy}
+
+The progress display is implemented in the event loop (Chapter~7), not in the
+CLI module. This is because progress information comes from the download
+state---the [[PieceManager]] knows how many pieces are verified, and the
+[[EventLoopContext]] tracks bytes downloaded.
+
+The CLI module's responsibility is limited to:
+
+\begin{enumerate}
+\item Parsing the [[{-}{-}verbose]] flag to select log level
+\item Initializing the logging subsystem with [[init\_logging]]
+\item Directing log output to stderr (keeping stdout clean for potential
+  machine-readable output)
+\end{enumerate}
+
+The [[tracing]] crate handles the actual formatting, including timestamps.
+By using [[tracing::info!]] for progress messages, we get consistent formatting
+with other log messages and allow users to filter progress with [[RUST\_LOG]]:
+
+\begin{verbatim}
+# Suppress progress messages, show only warnings
+RUST_LOG=warn literate-bittorrent ubuntu.torrent
+\end{verbatim}
+
+\subsubsection{Speed Calculation}
+
+Download speed is calculated from the change in verified bytes between updates:
+
+\begin{equation}
+\text{speed} = \frac{\text{bytes\_now} - \text{bytes\_last}}{\text{time\_now} - \text{time\_last}}
+\end{equation}
+
+This ``instantaneous'' approach responds quickly to speed changes---if your
+connection slows down, you see it within 2--4 seconds. The alternative,
+average speed since download start, would take minutes to reflect changes
+and would be misleading for downloads that started slowly then sped up.
+
+The helper functions [[format\_speed]] and [[format\_duration]] (defined in
+Chapter~7) handle unit conversion. For speed:
+
+\begin{itemize}
+\item Below 1024 B/s: show as bytes per second (e.g., [[500 B/s]])
+\item 1 KB/s to 1 MB/s: show as kilobytes per second (e.g., [[1.5 KB/s]])
+\item 1 MB/s to 1 GB/s: show as megabytes per second (e.g., [[1.5 MB/s]])
+\item Above 1 GB/s: show as gigabytes per second (e.g., [[1.2 GB/s]])
+\end{itemize}
+
+\subsubsection{Completion Message}
+
+When the download finishes, we display a final summary:
+
+\begin{verbatim}
+2024-01-15T10:35:43  INFO Download complete!
+2024-01-15T10:35:43  INFO Total: 100/100 pieces in 3m 28s (average 2.3 MB/s)
+\end{verbatim}
+
+This confirms successful completion and provides the total download time and
+average speed for the entire transfer.
+
+\subsection{Graceful Shutdown}
+
+BitTorrent clients should shut down gracefully when the user presses Ctrl+C.
+Abrupt termination causes several problems:
+
+\begin{enumerate}
+\item The tracker is not notified, leaving our IP in the peer list until the
+  announce interval expires (typically 30 minutes to 2 hours).
+
+\item Peer connections are dropped mid-transfer, which is impolite and may
+  cause peers to temporarily blacklist our IP.
+
+\item Partial writes may not be flushed to disk, though this is mitigated by
+  operating system buffering.
+\end{enumerate}
+
+\subsubsection{The Two-Press Pattern}
+
+We implement a two-press shutdown pattern common in well-behaved CLI tools:
+
+\begin{description}
+\item[First Ctrl+C] Initiates graceful shutdown. The client prints
+  [[Shutting down...]] and begins the cleanup sequence: notifying the tracker,
+  closing peer connections, and flushing disk writes.
+
+\item[Second Ctrl+C] Forces immediate exit. If graceful shutdown is stuck
+  (perhaps the tracker is unreachable or a peer isn't responding), the user
+  can press Ctrl+C again to exit immediately. This respects user intent while
+  giving graceful shutdown a chance.
+\end{description}
+
+The forced exit uses exit code 130, which is the standard Unix convention for
+termination by SIGINT (128 + signal number, where SIGINT is signal 2).
+
+\subsubsection{What the User Sees}
+
+\begin{verbatim}
+$ literate-bittorrent ubuntu.torrent
+2024-01-15T10:32:15  INFO Connecting to tracker...
+2024-01-15T10:32:16  INFO Connected to 12 peers
+2024-01-15T10:32:17  INFO 5/100 pieces (5.0%) - 1.2 MB/s - ETA: 6m 20s
+^C
+Shutting down...
+2024-01-15T10:32:20  INFO Sending stopped event to tracker...
+2024-01-15T10:32:21  INFO Disconnecting from 12 peers...
+2024-01-15T10:32:21  INFO Shutdown complete.
+\end{verbatim}
+
+If the user is impatient:
+
+\begin{verbatim}
+^C
+Shutting down...
+^C
+Forced exit.
+$ echo $?
+130
+\end{verbatim}
+
+\subsubsection{Implementation Architecture}
+
+Signal handling is implemented using Tokio's [[tokio::signal::ctrl\_c()]]
+function, which provides an async-friendly way to wait for SIGINT. The actual
+implementation lives in Chapter~7 (The Client) because it requires access to
+the event loop and client state.
+
+The architecture separates concerns:
+
+\begin{enumerate}
+\item \textbf{ShutdownController}: A thread-safe struct using atomic variables
+  that tracks shutdown state. The signal handler sets a flag; the event loop
+  polls it.
+
+\item \textbf{Signal handler}: An async task that waits for Ctrl+C and calls
+  [[request\_shutdown()]] on the controller.
+
+\item \textbf{Event loop}: Checks [[is\_shutdown\_requested()]] on each
+  iteration and initiates cleanup when true.
+
+\item \textbf{Cleanup sequence}: Sends [[event=stopped]] to the tracker,
+  closes peer connections, flushes disk writes, then exits.
+\end{enumerate}
+
+This separation ensures the signal handler (which runs in an interrupt-like
+context) does minimal work---it just sets a flag. The actual cleanup happens
+in the normal event loop context where we have full access to async I/O.
+
+\subsection{Usage Examples}
+
+This section demonstrates typical command-line invocations for common use cases.
+
+\subsubsection{Basic Download}
+
+The simplest invocation requires only the torrent file:
+
+\begin{verbatim}
+$ literate-bittorrent ubuntu-22.04-desktop-amd64.iso.torrent
+\end{verbatim}
+
+This downloads to the current directory, uses port 6881 for incoming connections,
+and logs at INFO level. For most users, this is all they need.
+
+\subsubsection{Specifying Output Directory}
+
+To download to a specific location:
+
+\begin{verbatim}
+$ literate-bittorrent ubuntu.torrent -o ~/Downloads
+$ literate-bittorrent ubuntu.torrent --output /media/storage/ISOs
+\end{verbatim}
+
+The output directory is created if it doesn't exist. Nested paths like
+[[/media/storage/torrents/2024/linux]] are created recursively.
+
+\subsubsection{Custom Port}
+
+If port 6881 is in use or blocked by a firewall:
+
+\begin{verbatim}
+$ literate-bittorrent ubuntu.torrent -p 51413
+$ literate-bittorrent ubuntu.torrent --port 8999
+\end{verbatim}
+
+Ports 6881--6889 are traditionally used by BitTorrent clients. If you're behind
+a NAT, you may need to configure port forwarding for the chosen port.
+
+\subsubsection{Verbose Logging}
+
+For troubleshooting connection or protocol issues:
+
+\begin{verbatim}
+$ literate-bittorrent ubuntu.torrent -v
+$ literate-bittorrent ubuntu.torrent --verbose
+\end{verbatim}
+
+This enables DEBUG-level logging, showing:
+
+\begin{itemize}
+\item Individual peer connection attempts and results
+\item Protocol message exchanges (handshakes, bitfields, requests)
+\item Piece verification successes and failures
+\item Tracker request and response details
+\end{itemize}
+
+\subsubsection{Fine-Grained Log Control}
+
+For even more control, use the [[RUST\_LOG]] environment variable:
+
+\begin{verbatim}
+# Show only warnings and errors
+$ RUST_LOG=warn literate-bittorrent ubuntu.torrent
+
+# Debug logging for tracker module only
+$ RUST_LOG=literate_bittorrent::tracker=debug literate-bittorrent ubuntu.torrent
+
+# Trace-level logging for pieces module
+$ RUST_LOG=literate_bittorrent::pieces=trace literate-bittorrent ubuntu.torrent
+\end{verbatim}
+
+The [[RUST\_LOG]] syntax follows [[tracing-subscriber]]'s [[EnvFilter]]:
+
+\begin{itemize}
+\item [[error]], [[warn]], [[info]], [[debug]], [[trace]]: Set global level
+\item [[module::path=level]]: Set level for specific module
+\item [[module::path]]: Enable all logs for module (shorthand for [[=trace]])
+\item Multiple directives separated by commas: [[warn,literate\_bittorrent::tracker=debug]]
+\end{itemize}
+
+\subsubsection{Combining Options}
+
+Options can be combined in any order:
+
+\begin{verbatim}
+$ literate-bittorrent -v -o ~/Downloads -p 51413 ubuntu.torrent
+$ literate-bittorrent ubuntu.torrent -o ~/Downloads -v -p 51413
+$ literate-bittorrent --verbose --output ~/Downloads --port 51413 ubuntu.torrent
+\end{verbatim}
+
+All three commands are equivalent.
+
+\subsubsection{Viewing Help}
+
+For a complete list of options and their descriptions:
+
+\begin{verbatim}
+$ literate-bittorrent --help
+\end{verbatim}
+
+This displays:
+
+\begin{verbatim}
+A pedagogical BitTorrent client implemented as a literate program.
+
+Usage: literate-bittorrent [OPTIONS] <TORRENT>
+
+Arguments:
+  <TORRENT>  Path to the .torrent file to download
+
+Options:
+  -o, --output <DIR>   Output directory for downloaded files [default: .]
+  -p, --port <PORT>    Listen port for incoming peer connections [default: 6881]
+  -v, --verbose        Enable verbose (DEBUG level) logging
+  -h, --help           Print help
+  -V, --version        Print version
+\end{verbatim}
+
+\subsubsection{Scripting and Automation}
+
+For scripting, note that:
+
+\begin{itemize}
+\item Exit code 0 indicates successful download
+\item Exit code 1 indicates an error (invalid arguments, file not found, etc.)
+\item Exit code 130 indicates Ctrl+C termination
+\item Progress messages go to stderr, keeping stdout clean
+\end{itemize}
+
+Example script checking completion:
+
+\begin{verbatim}
+#!/bin/bash
+if literate-bittorrent ubuntu.torrent -o /backup 2>/dev/null; then
+    echo "Download complete"
+else
+    echo "Download failed with exit code $?"
+fi
+\end{verbatim}
