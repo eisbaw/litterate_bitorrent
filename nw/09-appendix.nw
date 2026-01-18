@@ -3,13 +3,610 @@
 
 \appendix
 
+\section{BEP Reference}
+\label{sec:bep-reference}
+
+The BitTorrent protocol is specified through a series of BitTorrent Enhancement
+Proposals (BEPs). This appendix provides a reference to the BEPs most relevant
+to this implementation, along with brief descriptions of their content.
+
+\subsection{Core Protocol BEPs}
+
+\begin{description}
+
+\item[BEP 3: The BitTorrent Protocol Specification]
+The foundational specification defining the core protocol. Covers the metainfo
+file format (bencoding, info dictionary structure), tracker HTTP protocol
+(announce requests and responses), and peer wire protocol (handshake, messages,
+piece exchange). This document implements BEP 3 as its primary reference.
+
+\item[BEP 20: Peer ID Conventions]
+Defines the standard format for peer IDs, which are 20-byte identifiers sent
+in tracker announces and peer handshakes. The Azureus-style format uses
+\texttt{-XX0000-} where \texttt{XX} is a two-character client ID and
+\texttt{0000} is a version number, followed by random bytes. Shadow-style
+uses a single character followed by version numbers. Our client uses an
+Azureus-style peer ID with the prefix \texttt{-LB0001-} (Literate BitTorrent,
+version 0.0.0.1).
+
+\item[BEP 23: Tracker Returns Compact Peer Lists]
+Specifies the compact representation of peer lists in tracker responses.
+Instead of a list of dictionaries with \texttt{peer id}, \texttt{ip}, and
+\texttt{port} keys, peers are encoded as a concatenated byte string with
+6 bytes per peer: 4 bytes for the IPv4 address and 2 bytes for the port
+(both in network byte order). This reduces response size significantly.
+Our implementation supports both compact and dictionary formats.
+
+\item[BEP 10: Extension Protocol]
+Defines a mechanism for extending the peer protocol without breaking
+backwards compatibility. Extensions are negotiated in the handshake through
+the reserved bytes (specifically bit 20 of the reserved field). The extension
+handshake message (id 20) allows peers to exchange supported extensions.
+Not implemented in this client, but required for many modern extensions.
+
+\end{description}
+
+\subsection{Tracker Protocol BEPs}
+
+\begin{description}
+
+\item[BEP 7: IPv6 Tracker Extension]
+Extends BEP 3 to support IPv6 peer addresses. Trackers may return an
+\texttt{peers6} key containing compact IPv6 peer addresses (18 bytes each:
+16 for the address, 2 for the port). Not implemented in this client.
+
+\item[BEP 15: UDP Tracker Protocol]
+Defines a binary UDP-based tracker protocol as an alternative to the
+HTTP-based protocol in BEP 3. UDP trackers have lower overhead and can
+handle more simultaneous requests. The protocol uses a connect-announce
+model with 64-bit connection IDs for security. Not implemented in this
+client, which uses HTTP trackers only.
+
+\item[Scrape Protocol (Unofficial Specification)]
+The scrape extension (not formally a BEP) allows clients to query aggregate
+statistics about torrents (number of seeders, leechers, and completed
+downloads) without affecting announce state. Documented in the unofficial
+BitTorrent specification. Not implemented in this client.
+
+\end{description}
+
+\subsection{Peer Protocol Extensions}
+
+\begin{description}
+
+\item[BEP 5: DHT Protocol]
+Specifies a distributed hash table for decentralized peer discovery,
+eliminating dependence on centralized trackers. Peers store and retrieve
+contact information using the Kademlia algorithm. The DHT is bootstrapped
+through well-known nodes or peers that advertise DHT support in the handshake.
+See Section~\ref{sec:future-dht} for discussion.
+
+\item[BEP 6: Fast Extension]
+Adds messages for faster piece exchange: \texttt{Have All}, \texttt{Have None}
+(replacing large bitfields), \texttt{Suggest Piece}, \texttt{Reject Request},
+and \texttt{Allowed Fast}. These optimize initial connection setup and
+improve behavior under choking. Negotiated through bit 2 of the reserved
+bytes. Not implemented in this client.
+
+\item[BEP 9: Extension for Peers to Send Metadata Files]
+Enables peers to exchange the metainfo (info dictionary) directly, supporting
+magnet links that contain only the info hash. Peers request metadata pieces
+and verify the assembled result against the info hash. Requires BEP 10.
+See Section~\ref{sec:future-magnet} for discussion.
+
+\item[BEP 11: Peer Exchange (PEX)]
+Allows peers to share information about other peers they know, reducing
+tracker load and improving swarm connectivity. PEX messages contain added
+and dropped peer lists, with flags indicating peer capabilities. Requires
+BEP 10. See Section~\ref{sec:future-pex} for discussion.
+
+\item[BEP 29: uTorrent Transport Protocol (uTP)]
+Specifies a reliable transport protocol over UDP with built-in congestion
+control. uTP achieves better network friendliness than TCP by using
+LEDBAT (Low Extra Delay Background Transport), which backs off when latency
+increases. See Section~\ref{sec:future-utp} for discussion.
+
+\end{description}
+
+\subsection{Metainfo Extensions}
+
+\begin{description}
+
+\item[BEP 12: Multitracker Metadata Extension]
+Adds an \texttt{announce-list} key to the metainfo file, containing tiers
+of tracker URLs. Clients try trackers in each tier randomly, falling back
+to the next tier on failure. This provides redundancy and load distribution.
+Partially implemented in this client (announce-list is parsed but only the
+primary tracker is used).
+
+\item[BEP 17: HTTP Seeding (Hoffman-style)]
+Enables HTTP/HTTPS servers to act as sources for piece data, useful when
+a web server hosts the same content that is being distributed via BitTorrent.
+The \texttt{httpseeds} key in the metainfo lists seed URLs. Not implemented.
+
+\item[BEP 19: WebSeed - HTTP/FTP Seeding (GetRight-style)]
+Similar to BEP 17 but with a different URL scheme (\texttt{url-list}) and
+different byte-range semantics. Allows HTTP and FTP servers to supplement
+the BitTorrent swarm. Not implemented in this client.
+
+\item[BEP 27: Private Torrents]
+Defines the \texttt{private} flag in the info dictionary. When set to 1,
+clients must not use DHT or PEX, obtaining peers only from the tracker.
+This supports private trackers that require authentication. Our client
+respects the private flag (by not implementing DHT or PEX at all).
+
+\item[BEP 47: Padding Files and Extended File Attributes]
+Enables piece-aligned files within a torrent, improving piece boundary
+alignment for multi-file torrents. Also adds support for symbolic links
+and extended file attributes. Useful for efficient piece storage but not
+implemented in this client.
+
+\end{description}
+
+
+\section{Test Vectors}
+\label{sec:test-vectors}
+
+This appendix provides test vectors for validating bencode implementations
+and info hash computations. Each example shows the raw bencoded bytes,
+their hexadecimal representation, and the decoded value.
+
+\subsection{Bencode Examples}
+
+\subsubsection{Integers}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Bencoded} & \textbf{Hex} & \textbf{Value} \\
+\midrule
+\texttt{i0e} & \texttt{69 30 65} & 0 \\
+\texttt{i42e} & \texttt{69 34 32 65} & 42 \\
+\texttt{i-3e} & \texttt{69 2d 33 65} & $-3$ \\
+\texttt{i1234567890e} & \texttt{69 31 32 33 34 35 36 37 38 39 30 65} & 1234567890 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Invalid integer encodings (should be rejected):
+\begin{itemize}
+\item \texttt{i-0e} --- negative zero is forbidden
+\item \texttt{i03e} --- leading zeros are forbidden
+\item \texttt{i+5e} --- explicit positive sign is forbidden
+\item \texttt{ie} --- empty integer is invalid
+\end{itemize}
+
+\subsubsection{Byte Strings}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Bencoded} & \textbf{Hex} & \textbf{Value} \\
+\midrule
+\texttt{0:} & \texttt{30 3a} & (empty string) \\
+\texttt{4:spam} & \texttt{34 3a 73 70 61 6d} & ``spam'' \\
+\texttt{3:cow} & \texttt{33 3a 63 6f 77} & ``cow'' \\
+\texttt{12:Hello World!} & \texttt{31 32 3a 48 65 6c 6c 6f 20 57 6f 72 6c 64 21} & ``Hello World!'' \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Binary strings (containing non-printable bytes):
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Bencoded (hex)} & \textbf{Value} \\
+\midrule
+\texttt{34 3a 00 01 02 03} & 4 bytes: 0x00, 0x01, 0x02, 0x03 \\
+\texttt{32 30 3a} + 20 SHA1 bytes & 20-byte hash (typical piece hash) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Lists}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Bencoded} & \textbf{Value} \\
+\midrule
+\texttt{le} & Empty list: \texttt{[]} \\
+\texttt{l4:spami42ee} & \texttt{["spam", 42]} \\
+\texttt{li1ei2ei3ee} & \texttt{[1, 2, 3]} \\
+\texttt{l4:spam4:eggse} & \texttt{["spam", "eggs"]} \\
+\texttt{ll4:spamee} & Nested: \texttt{[["spam"]]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Dictionaries}
+
+Dictionaries require keys in sorted lexicographic order by raw bytes:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Bencoded} & \textbf{Value} \\
+\midrule
+\texttt{de} & Empty dict: \texttt{\{\}} \\
+\texttt{d3:cow3:moo4:spam4:eggse} & \texttt{\{"cow": "moo", "spam": "eggs"\}} \\
+\texttt{d4:spaml1:a1:bee} & \texttt{\{"spam": ["a", "b"]\}} \\
+\texttt{d9:publisher3:bob17:publisher-webpage15:www.example.come} & Longer keys example \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent Key ordering example. The following dictionary:
+\begin{verbatim}
+{"a": 1, "b": 2, "aa": 3}
+\end{verbatim}
+\noindent Must be encoded with keys in byte order: \texttt{a} (0x61), \texttt{aa} (0x61 0x61), \texttt{b} (0x62):
+\begin{verbatim}
+d1:ai1e2:aai3e1:bi2ee
+\end{verbatim}
+
+\subsection{Info Hash Examples}
+\label{sec:info-hash-examples}
+
+The info hash is computed by taking the SHA1 hash of the bencoded \texttt{info}
+dictionary. The following examples use well-known torrents whose info hashes
+have been verified across multiple clients.
+
+\subsubsection{Example: Minimal Single-File Torrent}
+
+Consider a minimal info dictionary for a single file:
+
+\begin{verbatim}
+{
+  "length": 65536,
+  "name": "test.txt",
+  "piece length": 16384,
+  "pieces": <80 bytes: 4 SHA1 hashes>
+}
+\end{verbatim}
+
+\noindent Bencoded (hex representation, with \texttt{<pieces>} as placeholder):
+\begin{verbatim}
+d6:lengthi65536e4:name8:test.txt12:piece lengthi16384e
+6:pieces80:<80 bytes>e
+\end{verbatim}
+
+\noindent The info hash is \texttt{SHA1(bencoded\_info\_dict)}.
+
+\subsubsection{Example: Known Public Torrent}
+
+The ``Big Buck Bunny'' video (480p version from archive.org) is a commonly
+used test torrent. Its info hash is:
+
+\begin{verbatim}
+dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c
+\end{verbatim}
+
+\noindent For tracker announces, this hash is URL-encoded. Each byte becomes
+\texttt{\%XX} except for unreserved characters (alphanumerics, hyphen, period,
+underscore, tilde). Our \texttt{url\_encode} function in the tracker module
+handles this conversion.
+
+\subsubsection{Example: Ubuntu ISO}
+
+Ubuntu Linux ISOs are distributed via BitTorrent. The Ubuntu 22.04 LTS
+desktop ISO (ubuntu-22.04-desktop-amd64.iso) has info hash:
+
+\begin{verbatim}
+3b245504cf5f11bbdbe1201cea6a6bf45aee1bc0
+\end{verbatim}
+
+\subsubsection{Computing Info Hashes}
+
+To verify your implementation:
+
+\begin{enumerate}
+\item Download a known \texttt{.torrent} file
+\item Parse it and extract the \texttt{info} dictionary
+\item Re-encode the info dictionary to canonical bencode
+\item Compute SHA1 of the bencoded bytes
+\item Compare with the expected hash
+\end{enumerate}
+
+\noindent Common mistakes that produce incorrect info hashes:
+\begin{itemize}
+\item Not sorting dictionary keys lexicographically by raw bytes
+\item Modifying the info dictionary after parsing (changing piece boundaries)
+\item Encoding integers with leading zeros
+\item Using UTF-8 string comparison instead of byte comparison for key ordering
+\end{itemize}
+
+
+\section{Future Work}
+\label{sec:future-work}
+
+This implementation covers the core BitTorrent protocol as specified in BEP 3,
+sufficient for downloading torrents from HTTP trackers. However, modern
+BitTorrent clients implement numerous extensions that improve performance,
+reliability, and functionality. This section discusses the most important
+extensions not implemented in this client.
+
+\subsection{Distributed Hash Table (DHT)}
+\label{sec:future-dht}
+
+The Distributed Hash Table (BEP 5) enables decentralized peer discovery,
+eliminating dependence on centralized trackers. This is perhaps the most
+significant extension to the BitTorrent ecosystem.
+
+\paragraph{How DHT Works.}
+DHT uses the Kademlia algorithm, where each node has a 160-bit identifier
+(typically derived from the peer's key pair). Nodes maintain routing tables
+organized by XOR distance from their own ID. The info hash serves as the
+key for looking up peers sharing a particular torrent.
+
+To find peers for a torrent:
+\begin{enumerate}
+\item Compute the XOR distance between the info hash and known nodes
+\item Query the closest nodes for even closer nodes
+\item Iterate until finding nodes that have announced the torrent
+\item Retrieve the list of peers from those nodes
+\end{enumerate}
+
+\paragraph{Implementation Considerations.}
+Adding DHT to this client would require:
+\begin{itemize}
+\item A UDP socket for DHT messages (separate from TCP peer connections)
+\item A Kademlia routing table with bucket refresh logic
+\item KRPC message encoding (bencode over UDP)
+\item Bootstrap logic to join the DHT network
+\item Announce and lookup operations
+\item Respecting the \texttt{private} flag (no DHT for private torrents)
+\end{itemize}
+
+\paragraph{Benefits.}
+DHT provides resilience against tracker failures and enables magnet links
+(which contain only the info hash). Most public torrents can be downloaded
+using DHT alone, without any tracker.
+
+\subsection{Micro Transport Protocol (uTP)}
+\label{sec:future-utp}
+
+uTP (BEP 29) is a reliable transport protocol over UDP that provides
+congestion control designed to minimize impact on other network traffic.
+
+\paragraph{Why uTP Matters.}
+TCP's congestion control can cause latency spikes for other applications
+(gaming, VoIP) when BitTorrent saturates the connection. uTP uses LEDBAT
+(Low Extra Delay Background Transport), which monitors one-way delay and
+backs off when latency increases. This makes BitTorrent traffic less
+disruptive to other applications sharing the same connection.
+
+\paragraph{Implementation Considerations.}
+Adding uTP would require:
+\begin{itemize}
+\item A UDP socket multiplexing multiple virtual connections
+\item Reliable delivery with selective acknowledgments
+\item LEDBAT congestion control with delay measurements
+\item Connection state machines for each virtual connection
+\item Integration with the existing peer protocol (same messages, different transport)
+\end{itemize}
+
+\paragraph{Benefits.}
+uTP enables connections through some NAT configurations that block TCP,
+and provides network-friendly congestion control. Most modern clients
+prefer uTP over TCP when both are available.
+
+\subsection{Peer Exchange (PEX)}
+\label{sec:future-pex}
+
+Peer Exchange (BEP 11) allows connected peers to share information about
+other peers they know, supplementing tracker and DHT discovery.
+
+\paragraph{How PEX Works.}
+Peers periodically send PEX messages containing:
+\begin{itemize}
+\item \texttt{added}: compact list of new peers discovered since last PEX
+\item \texttt{added.f}: flags for each added peer (supports encryption, seeder, etc.)
+\item \texttt{dropped}: compact list of peers no longer connected
+\end{itemize}
+
+PEX is negotiated through the extension protocol (BEP 10) during handshake.
+
+\paragraph{Implementation Considerations.}
+Adding PEX would require:
+\begin{itemize}
+\item BEP 10 extension protocol support in the handshake
+\item Tracking peer connectivity changes
+\item Rate limiting PEX messages (typically every 60 seconds)
+\item Respecting the \texttt{private} flag (no PEX for private torrents)
+\end{itemize}
+
+\paragraph{Benefits.}
+PEX provides rapid peer discovery once connected to the swarm, often faster
+than tracker announces. It also reduces tracker load.
+
+\subsection{Magnet Links}
+\label{sec:future-magnet}
+
+Magnet links (BEP 9) allow downloading torrents using only the info hash,
+without a separate \texttt{.torrent} file.
+
+\paragraph{Magnet Link Format.}
+A typical magnet link looks like:
+\begin{verbatim}
+magnet:?xt=urn:btih:<info-hash>&dn=<display-name>&tr=<tracker-url>
+\end{verbatim}
+
+The \texttt{xt} (exact topic) parameter contains the info hash. Optional
+parameters include display name (\texttt{dn}) and tracker URLs (\texttt{tr}).
+
+\paragraph{How Magnet Downloads Work.}
+\begin{enumerate}
+\item Parse the info hash from the magnet link
+\item Find peers via DHT or provided tracker
+\item Request metadata from peers using the extension protocol (BEP 9)
+\item Verify the assembled metadata matches the info hash
+\item Proceed with normal piece download
+\end{enumerate}
+
+\paragraph{Implementation Considerations.}
+Supporting magnet links would require:
+\begin{itemize}
+\item Magnet URI parser
+\item DHT support (for peer discovery without tracker)
+\item BEP 10 extension protocol
+\item Metadata exchange messages (request, data, reject)
+\item Ability to start download with only info hash
+\end{itemize}
+
+\subsection{Other Notable Extensions}
+
+Several other extensions merit mention:
+
+\paragraph{BEP 6: Fast Extension.}
+Adds \texttt{Have All}, \texttt{Have None}, \texttt{Suggest Piece},
+\texttt{Reject Request}, and \texttt{Allowed Fast} messages. These optimize
+connection startup (no need to send large bitfields) and improve behavior
+under choking (explicitly reject pending requests rather than leaving them
+hanging).
+
+\paragraph{BEP 14: Local Service Discovery.}
+Allows discovering peers on the local network via multicast, useful for
+LAN-only sharing or supplementing Internet swarms with fast local peers.
+
+\paragraph{BEP 40: Canonical Peer Priority.}
+Defines a deterministic ordering for peer preference, ensuring that peers
+in a swarm converge on similar connection graphs. This improves piece
+availability without explicit coordination.
+
+\paragraph{Message Stream Encryption (MSE/PE).}
+Obfuscates BitTorrent traffic to avoid detection and throttling by ISPs.
+Uses RC4 encryption with keys derived from the info hash. MSE was developed
+by Azureus/Vuze but never formally standardized as a BEP.
+
+\subsection{Recommendations for Extension}
+
+For those wishing to extend this client, we suggest the following order:
+
+\begin{enumerate}
+\item \textbf{BEP 10 Extension Protocol}: Foundation for most modern extensions
+\item \textbf{BEP 6 Fast Extension}: Simple to implement, improves performance
+\item \textbf{BEP 11 PEX}: Improves peer discovery with minimal complexity
+\item \textbf{BEP 5 DHT}: Significant undertaking, but enables magnet links
+\item \textbf{BEP 9 Metadata Exchange}: Enables magnet links once DHT works
+\item \textbf{BEP 29 uTP}: Complex but worthwhile for network friendliness
+\end{enumerate}
+
+Each extension builds on previous ones, and the core protocol implemented
+in this document provides a solid foundation for all of them.
+
+
+\section{Glossary}
+\label{sec:glossary}
+
+\begin{description}
+
+\item[Announce] An HTTP request to the tracker indicating the client's
+  presence in the swarm and current download/upload statistics.
+
+\item[Bencode] The encoding format used throughout BitTorrent for torrent
+  files and tracker responses. Supports integers, byte strings, lists,
+  and dictionaries.
+
+\item[Bitfield] A bitmap indicating which pieces a peer has. Sent immediately
+  after the handshake to establish initial piece availability.
+
+\item[Block] A sub-piece unit, typically 16 KB (16384 bytes). Pieces are
+  requested and transferred as blocks.
+
+\item[Choke] A state where a peer refuses to upload to us. Peers choke
+  connections they are not willing to serve, typically due to low reciprocity.
+
+\item[DHT] Distributed Hash Table. A decentralized peer discovery mechanism
+  using the Kademlia algorithm.
+
+\item[Handshake] The initial message exchange when two peers connect,
+  verifying they share the same protocol and info hash.
+
+\item[Info Dictionary] The portion of the metainfo file describing the
+  content: file names, sizes, piece length, and piece hashes.
+
+\item[Info Hash] The SHA1 hash of the bencoded info dictionary. Uniquely
+  identifies a torrent across the network.
+
+\item[Interested] A state indicating that we want pieces from a peer.
+  Peers will only upload to interested connections.
+
+\item[Leecher] A peer that is still downloading and has an incomplete copy
+  of the content.
+
+\item[Magnet Link] A URI containing an info hash, allowing downloads without
+  a separate torrent file.
+
+\item[Metainfo File] A \texttt{.torrent} file containing tracker URLs, the
+  info dictionary, and optional metadata.
+
+\item[Peer] Another BitTorrent client connected to the same swarm.
+
+\item[Peer ID] A 20-byte identifier uniquely identifying a client instance.
+  Sent in tracker announces and peer handshakes.
+
+\item[Piece] A fixed-size chunk of the content, typically 256 KB to 4 MB.
+  Each piece is verified independently using its SHA1 hash.
+
+\item[Scrape] A tracker request returning aggregate statistics about a
+  torrent without affecting announce state.
+
+\item[Seeder] A peer that has the complete file and only uploads.
+
+\item[Swarm] All peers sharing a particular torrent, identified by its
+  info hash.
+
+\item[Tracker] A server that maintains a list of peers for each torrent
+  and responds to announce requests.
+
+\item[Unchoke] The opposite of choke; a state where a peer is willing to
+  upload to us.
+
+\item[uTP] Micro Transport Protocol. A reliable UDP-based transport with
+  LEDBAT congestion control.
+
+\end{description}
+
+
 \section{References}
+\label{sec:references}
+
+\subsection{Primary Sources}
 
 \begin{itemize}
-\item BEP 3: The BitTorrent Protocol Specification
-\item BEP 20: Peer ID Conventions
-\item BEP 23: Tracker Returns Compact Peer Lists
-\item Unofficial BitTorrent Specification (wiki.theory.org)
+\item \textbf{BEP Index}: \texttt{https://www.bittorrent.org/beps/bep\_0000.html}
+  --- Official list of all BitTorrent Enhancement Proposals
+
+\item \textbf{BEP 3}: \texttt{https://www.bittorrent.org/beps/bep\_0003.html}
+  --- The BitTorrent Protocol Specification
+
+\item \textbf{BEP 5}: \texttt{https://www.bittorrent.org/beps/bep\_0005.html}
+  --- DHT Protocol
+
+\item \textbf{BEP 10}: \texttt{https://www.bittorrent.org/beps/bep\_0010.html}
+  --- Extension Protocol
+
+\item \textbf{BEP 20}: \texttt{https://www.bittorrent.org/beps/bep\_0020.html}
+  --- Peer ID Conventions
+
+\item \textbf{BEP 23}: \texttt{https://www.bittorrent.org/beps/bep\_0023.html}
+  --- Tracker Returns Compact Peer Lists
+\end{itemize}
+
+\subsection{Secondary Sources}
+
+\begin{itemize}
+\item \textbf{Unofficial BitTorrent Specification}:
+  \texttt{https://wiki.theory.org/BitTorrentSpecification}
+  --- Comprehensive community-maintained reference
+
+\item \textbf{Kademlia Paper}: Maymounkov, P. and Mazieres, D. (2002).
+  ``Kademlia: A Peer-to-peer Information System Based on the XOR Metric.''
+  \emph{IPTPS}.
+
+\item \textbf{LEDBAT RFC}: RFC 6817 --- Low Extra Delay Background Transport
 \end{itemize}
 
 % Note: Chunk index omitted - requires special handling with multi-file noweave
